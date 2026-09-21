@@ -260,7 +260,7 @@ TurnFinished {
 }
 ```
 
-- `error` 在 failed 时必填，并携带有效 `diagnosticRef`。
+- `error` 在 failed 时必填；诊断成功落盘时携带有效 `diagnosticRef`，写失败时省略引用并回退 stderr。
 - token 可以为空；`elapsedMs` 用 daemon 单调时钟计算，不依赖 vendor 是否提供耗时。
 - 每个已接受的 turn 必须且只能收到一个 TurnFinished；之后不得再有该 turn 事件。
 - `nextState=ready` 表示发出前已经清空 turn-local buffer、server-request route 和 cancel
@@ -369,8 +369,8 @@ cleanup failure 不能伪装成可恢复状态：
 - 一旦无法确认 direct child 已回收、进程组已消失、pump 已停止或所有权已释放，立即进入 Poisoned。
 - 先停止 daemon intake，拒绝所有新 SessionStart/TurnStart；绝不回 Ready 或 Idle。
 - 若仍有 in-flight turn，先给它一个 failed TurnFinished。
-- 发 `SessionClosed(outcome=failed, error=codex-cleanup-failed)`，error 必须带
-  diagnosticRef。
+- 发 `SessionClosed(outcome=failed, error=codex-cleanup-failed)`，error 在诊断成功落盘时带
+  diagnosticRef；写失败时省略引用并回退 stderr。
 - 随后 daemon 退出；不能继续服务另一个 session。
 
 完成、取消和 close 的竞态由单一 owner 串行决定：先进入 FinishingTurn/Stopping 的
@@ -478,9 +478,9 @@ M0 必须接通已有基础设施，不新增 record/diagnostic schema：
   initialize/initialized/thread/turn request、interrupt、child exit/wait、turn outcome、
   session outcome 和 cleanup 结果。
 - 复用现有 DiagnosticEvent 字段；PID 等放已有 detail，不扩日志 schema。
-- session/turn failure 的 ProtocolError 必须设置 diagnosticRef。引用可由现有 runId +
+- session/turn failure 的 ProtocolError 在诊断成功落盘时设置 diagnosticRef。引用可由现有 runId +
   eventSeq 组成，能在 diagnostic report 中定位同一条事件；desktop 不解析自由文本。
-- diagnostic 写失败沿用现有 stderr fallback，不把观测系统失败升级成 vendor session
+- diagnostic 写失败时省略 diagnosticRef，沿用现有 stderr fallback，不把观测系统失败升级成 vendor session
   failure。
 
 ## 测试与验收
@@ -546,7 +546,7 @@ RuntimeHub focused 测试覆盖。下面列表仍是完整 M0 验收要求。
 - 两轮确定性集成测试断言 child PID、sessionId、threadId 相同而 turnId 不同；第二轮前
   没有 spawn。
 - run record 测试断言一个文件包含两轮有序事件和一个 footer；record 写失败有可见
-  Error 与 diagnosticRef，session 仍可继续。
+  Error，诊断成功落盘时有 diagnosticRef，session 仍可继续。
 - lifecycle diagnostic 测试断言成功、cancel、close、Poisoned 都能按 session/turn id
   关联；Poisoned 后没有新 intake。
 - RuntimeHub 在 turn 运行时仍能处理 Ping、TurnCancel 和 SessionClose。
@@ -610,8 +610,8 @@ scripts/verify-agent-docs.sh
   完成下一轮。
 - SessionClose 有 direct child wait 和 Unix 进程组消失证据；cleanup failure 测试证明
   信号、探测或等待失败只会 Poisoned → failed SessionClosed → daemon exit，不会回 Ready/Idle。
-- run record 和 lifecycle diagnostics 已接线，失败 ProtocolError 有可定位的
-  diagnosticRef。
+- run record 和 lifecycle diagnostics 已接线，失败 ProtocolError 在诊断成功落盘时有可定位的
+  diagnosticRef；写失败时省略引用并回退 stderr。
 - capabilities 只声明已验收能力，`agentdeckd` 功能完整度文档把 M0 标为已验收并链接
   实际证据。
 

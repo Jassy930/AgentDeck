@@ -600,20 +600,31 @@ fn permission_mode_is_stamped_on_action_request() {
 
 #[test]
 fn tool_snapshots_preserve_their_identity_until_completion() {
-    let mut translator = tr();
-    let running = translator.translate_line(&json!({
-        "type":"assistant", "message":{"content":[{"type":"tool_use", "id":"tool-1", "name":"Bash", "input":{"command":"true"}}]}
-    }).to_string());
-    let completed = translator.translate_line(&json!({
-        "type":"user", "message":{"content":[{"type":"tool_result", "tool_use_id":"tool-1", "content":""}]}
-    }).to_string());
-    for (events, expected) in [
-        (running.events, AgentItemState::Streaming),
-        (completed.events, AgentItemState::Completed),
+    for (name, input) in [
+        ("Bash", json!({"command":"true"})),
+        (
+            "Edit",
+            json!({"file_path":"/tmp/a", "old_string":"a", "new_string":"b"}),
+        ),
+        ("Write", json!({"file_path":"/tmp/a", "content":"a"})),
+        ("MultiEdit", json!({"file_path":"/tmp/a", "edits":[]})),
     ] {
-        assert!(
-            matches!(&events[..], [ServerEvent::AgentItem { item_id, turn_id, state, .. }]
-            if item_id == "tool-1" && turn_id.0 == "client-turn-1" && *state == expected)
-        );
+        let mut translator = tr();
+        let running = translator.translate_line(&json!({
+            "type":"assistant", "message":{"content":[{"type":"tool_use", "id":"tool-1", "name":name, "input":input}]}
+        }).to_string());
+        let completed = translator.translate_line(&json!({
+            "type":"user", "message":{"content":[{"type":"tool_result", "tool_use_id":"tool-1", "content":""}]}
+        }).to_string());
+        for (events, expected) in [
+            (running.events, AgentItemState::Streaming),
+            (completed.events, AgentItemState::Completed),
+        ] {
+            assert!(
+                matches!(&events[..], [ServerEvent::AgentItem { item_id, turn_id, state, .. }]
+                if item_id == "tool-1" && turn_id.0 == "client-turn-1" && *state == expected),
+                "{name} should preserve identity through {expected:?}"
+            );
+        }
     }
 }

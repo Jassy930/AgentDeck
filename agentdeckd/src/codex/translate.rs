@@ -82,7 +82,7 @@ pub struct RpcRouteHint {
 }
 
 /// Per-session Codex translator. Owns the in-flight item accumulators and
-/// a monotonic counter for synthetic request ids.
+/// a monotonic counter for synthetic request and raw item ids.
 #[derive(Debug)]
 pub struct CodexTranslator {
     session_id: SessionId,
@@ -90,10 +90,7 @@ pub struct CodexTranslator {
     /// In-flight cumulative snapshots keyed by the official item id.
     in_flight: HashMap<String, InFlightItem>,
     completed_items: HashSet<String>,
-    /// Codex sometimes omits an approval id on `item/permissions/...`
-    /// requests; we synthesize one off this counter so the daemon can
-    /// route the matching decision back.
-    next_request_id: u64,
+    next_synthetic_id: u64,
     /// Snapshot of the session-level approval policy + sandbox the adapter
     /// negotiated at `newSession`. These are stamped into every
     /// `ActionRequest.vendor` so the UI can render the "at decision time"
@@ -164,7 +161,7 @@ impl CodexTranslator {
             thread_id,
             in_flight: HashMap::new(),
             completed_items: HashSet::new(),
-            next_request_id: 1,
+            next_synthetic_id: 1,
             approval_policy,
             sandbox,
             persist_supported,
@@ -484,8 +481,8 @@ impl CodexTranslator {
                     "completed assistant text retracted streamed text".into(),
                 )];
             }
-            self.completed_items.insert(id.to_string());
         }
+        self.completed_items.insert(id.to_string());
         vec![self.agent_item_event(agent_item, params, AgentItemState::Completed)]
     }
 
@@ -684,8 +681,8 @@ impl CodexTranslator {
             .or_else(|| id_hint.and_then(|v| v.as_str().map(str::to_string)))
             .or_else(|| id_hint.and_then(|v| v.as_u64().map(|n| n.to_string())))
             .unwrap_or_else(|| {
-                let n = self.next_request_id;
-                self.next_request_id += 1;
+                let n = self.next_synthetic_id;
+                self.next_synthetic_id += 1;
                 format!("codex-req-{n}")
             });
 
@@ -730,9 +727,9 @@ impl CodexTranslator {
         }
     }
 
-    fn raw_event_for_unknown_method(&self, method: &str, frame: &Value) -> ServerEvent {
+    fn raw_event_for_unknown_method(&mut self, method: &str, frame: &Value) -> ServerEvent {
         let params = frame.get("params").unwrap_or(frame);
-        self.agent_item_event(
+        let mut event = self.agent_item_event(
             AgentItem::Raw {
                 raw_kind: safe_vendor_identifier(method),
                 raw_payload: WITHHELD_VENDOR_RAW_PAYLOAD.into(),
@@ -740,7 +737,14 @@ impl CodexTranslator {
             },
             params,
             AgentItemState::Completed,
-        )
+        );
+        if let ServerEvent::AgentItem { item_id, .. } = &mut event
+            && item_id.is_empty()
+        {
+            *item_id = format!("codex-raw-{}", self.next_synthetic_id);
+            self.next_synthetic_id += 1;
+        }
+        event
     }
 }
 

@@ -36,10 +36,10 @@ final class FixtureSessionSourceTests: XCTestCase {
             return false
         }
         let first = await collect(source.events(sessionID: "sess-codex-01"), until: isTurnComplete)
-        XCTAssertEqual(first.count, 9)
+        XCTAssertEqual(first.count, 10)
         // 二次订阅（模拟切屏返回）应立刻拿到完整 transcript。
         let second = await collect(source.events(sessionID: "sess-codex-01"), until: isTurnComplete)
-        XCTAssertEqual(second.count, 9)
+        XCTAssertEqual(second.count, 10)
     }
 
     func testApprovalGatePausesUntilResolved() async {

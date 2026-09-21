@@ -54,6 +54,61 @@ fn fixture_replay_assistant_stream_has_stable_identity_and_cumulative_text() {
 }
 
 #[test]
+fn duplicate_sparse_reasoning_completion_does_not_erase_accumulated_text() {
+    let mut translator = new_translator();
+    translator.translate_line(
+        r#"{"method":"item/reasoning/textDelta","params":{"itemId":"r1","contentIndex":0,"delta":"Thinking","threadId":"thread-1","turnId":"turn-1"}}"#,
+    );
+    let completed = r#"{"method":"item/completed","params":{"item":{"id":"r1","type":"reasoning"},"completedAtMs":1,"threadId":"thread-1","turnId":"turn-1"}}"#;
+    let events = translator.translate_line(completed);
+    assert!(matches!(&events[..], [ServerEvent::AgentItem {
+        item_id, state: AgentItemState::Completed,
+        item: AgentItem::Reasoning { text, .. }, ..
+    }] if item_id == "r1" && text == "Thinking"));
+    assert!(translator.translate_line(completed).is_empty());
+}
+
+#[test]
+fn raw_requests_without_item_ids_get_distinct_ids_and_keep_vendor_item_ids() {
+    let mut translator = new_translator();
+    let mut generated_ids = Vec::new();
+    for id in [1, 2] {
+        let events = translator.translate_value(&serde_json::json!({
+            "id": id, "method": "item/tool/call",
+            "params": {
+                "callId": format!("call-{id}"), "tool": "lookup", "arguments": {},
+                "threadId": "thread-1", "turnId": "turn-1"
+            }
+        }));
+        let [
+            ServerEvent::AgentItem {
+                item_id,
+                item: AgentItem::Raw { .. },
+                ..
+            },
+        ] = &events[..]
+        else {
+            panic!("expected raw item: {events:?}");
+        };
+        assert!(!item_id.is_empty());
+        generated_ids.push(item_id.clone());
+    }
+    assert_ne!(generated_ids[0], generated_ids[1]);
+
+    for params in [
+        serde_json::json!({"itemId": "vendor-item"}),
+        serde_json::json!({"item": {"id": "vendor-item"}}),
+    ] {
+        let events = translator.translate_value(&serde_json::json!({
+            "method": "item/future/progress", "params": params
+        }));
+        assert!(
+            matches!(&events[..], [ServerEvent::AgentItem { item_id, .. }] if item_id == "vendor-item")
+        );
+    }
+}
+
+#[test]
 fn fixture_replay_full_shell_turn() {
     let mut t = new_translator();
     let lines = vec![

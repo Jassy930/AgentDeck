@@ -2,7 +2,7 @@ import AgentDeckMobileCore
 import Foundation
 import XCTest
 
-/// Verifies the v3 wire shapes decode correctly on the Swift side. These
+/// Verifies the v4 wire shapes decode correctly on the Swift side. These
 /// are guardrails for the cross-language IPC seam — daemon emits Rust
 /// `serde_json` output, Swift decodes via `JSONDecoder`; both must agree
 /// on field names, tag discriminators, and enum value renames.

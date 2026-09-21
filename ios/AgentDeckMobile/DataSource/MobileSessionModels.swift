@@ -34,7 +34,6 @@ struct InboxItem: Identifiable, Equatable {
 }
 
 struct SessionStreamElement: Sendable {
-    let itemId: String?
     let event: ServerEvent
 }
 

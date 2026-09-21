@@ -34,15 +34,18 @@ cargo run -p agentdeckd -- --diagnostics-report
 同一个 `runId` 内用 `eventSeq` 排序。
 没有 `runId` 的诊断只作为进程级问题处理。
 
-生产会话使用 `runId=sessionId`，同一个 run record 包含多轮事件、`SessionClosed` 和
-一个 footer。`diagnosticRef` 为 `runId:eventSeq`，按这两个字段可在 `diagnostic.log`
+生产会话使用 `runId=sessionId`；Codex 的同一个 run record 包含多轮事件、
+`SessionClosed` 和一个 footer。CC 仍使用 one-shot `TurnComplete` 收尾；启动失败或
+legacy EOF/cancel 缺少终态时，writer 排空全部事件后补 footer，连接保持期间暂不关闭记录。`diagnosticRef` 为 `runId:eventSeq`，按这两个字段可在 `diagnostic.log`
 定位实际条目；report 默认只返回最近 20 条，较早引用需读取日志文件。
 `codex_child_spawned` / `codex_turn_started` 的 detail JSON 包含 `childPid`，
 `codex_cleanup_completed` 包含 child wait 与进程组清理结果。自由文本 prompt、vendor
 frame 和 stderr 不写入生命周期诊断。
 
 记录 open/append/close 失败会发非 terminal `record_write_failed`，CLI 显示告警并继续
-等待真实 turn/session terminal。诊断写入失败使用 stderr fallback，不改变会话结果。
+等待真实 turn/session terminal；连续 append 失败仅首次告警，终态写入仍失败时再告警。
+iOS fixture 消费方同样保留 warning 后的 streaming 和会话状态。诊断写入失败使用
+stderr fallback，省略 `diagnosticRef`，不返回无法定位的引用，也不改变会话结果。
 
 ## 标准自查流程
 

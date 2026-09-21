@@ -823,10 +823,7 @@ impl RunningOwner {
                             }
                             mut event => {
                                 if let ServerEvent::AgentItem {
-                                    turn_id,
-                                    thread_id,
-                                    item,
-                                    ..
+                                    turn_id, thread_id, ..
                                 } = &mut event
                                 {
                                     let Some(active) = &self.turn else {
@@ -839,16 +836,11 @@ impl RunningOwner {
                                         );
                                     };
                                     if self.thread_id.as_ref() != Some(thread_id)
-                                        || (turn_id.0.is_empty()
-                                            && matches!(
-                                                item,
-                                                agentdeck_protocol::AgentItem::AssistantMessage { .. }
-                                            ))
-                                        || (!turn_id.0.is_empty()
-                                            && active
-                                                .vendor_id
-                                                .as_ref()
-                                                .is_some_and(|id| id != &turn_id.0))
+                                        || turn_id.0.is_empty()
+                                        || active
+                                            .vendor_id
+                                            .as_ref()
+                                            .is_some_and(|id| id != &turn_id.0)
                                     {
                                         return Some(
                                             self.fatal(self.error(
@@ -944,10 +936,12 @@ impl RunningOwner {
             {
                 return self.finish_vendor_turn(terminal).await;
             }
-            let error = self.error(
-                "codex-protocol-error",
-                format!("Codex rejected {}", pending.kind.method()),
-            );
+            let rejected_request = || {
+                self.error(
+                    "codex-protocol-error",
+                    format!("Codex rejected {}", pending.kind.method()),
+                )
+            };
             return match pending.kind {
                 PendingKind::TurnStart => {
                     let closing = self.turn.as_ref().is_some_and(|turn| turn.close_requested);
@@ -955,7 +949,7 @@ impl RunningOwner {
                         .turn
                         .as_ref()
                         .and_then(|turn| turn.failure_override.clone())
-                        .unwrap_or(error);
+                        .unwrap_or_else(rejected_request);
                     self.finish_turn(
                         TurnOutcome::Failed,
                         if closing {
@@ -972,7 +966,7 @@ impl RunningOwner {
                         error: None,
                     })
                 }
-                _ => Some(self.fatal(error).await),
+                _ => Some(self.fatal(rejected_request()).await),
             };
         }
         let result = frame.get("result").cloned().unwrap_or(Value::Null);
@@ -1633,12 +1627,12 @@ impl RunningOwner {
     fn correlate_error(&self, mut error: ProtocolError) -> ProtocolError {
         if error.diagnostic_ref.is_none() {
             error.diagnostic_ref =
-                Some(self.diagnostic("codex_session_error", json!({"failureCode": error.code})));
+                self.diagnostic("codex_session_error", json!({"failureCode": error.code}));
         }
         error
     }
 
-    fn diagnostic(&self, event: &str, mut detail: Value) -> String {
+    fn diagnostic(&self, event: &str, mut detail: Value) -> Option<String> {
         detail["childPid"] = json!(self.child_pid);
         detail["state"] = json!(format!("{:?}", self.state));
         if let Some(turn) = &self.turn {
@@ -1678,14 +1672,14 @@ fn is_command_rejection(error: &ProtocolError) -> bool {
 
 fn with_diagnostic_ref(mut error: ProtocolError, session_id: &SessionId) -> ProtocolError {
     if error.diagnostic_ref.is_none() {
-        error.diagnostic_ref = Some(diag::log_session(
+        error.diagnostic_ref = diag::log_session(
             &session_id.0,
             DiagnosticEvent::new("codex_session_error")
                 .level("error")
                 .code(&error.code)
                 .agent_kind(AgentKind::Codex)
                 .detail(json!({"failureCode": error.code}).to_string()),
-        ));
+        );
     }
     error
 }
@@ -2280,12 +2274,28 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_item_correlation_or_translation_fails_the_active_turn() {
-        for params in [
+        let invalid_deltas = [
             json!({"threadId":"thread-1", "turnId":"wrong-turn", "itemId":"m", "delta":"hello"}),
             json!({"threadId":"wrong-thread", "turnId":"vendor-1", "itemId":"m", "delta":"hello"}),
             json!({"threadId":"thread-1", "itemId":"m", "delta":"hello"}),
             json!({"threadId":"thread-1", "turnId":"vendor-1", "delta":"hello"}),
-        ] {
+        ]
+        .map(|params| ("item/agentMessage/delta", params));
+        let invalid_other_items = [
+            (
+                "item/started",
+                json!({"threadId":"thread-1", "item":{"id":"shell", "type":"commandExecution", "command":"pwd"}}),
+            ),
+            (
+                "item/completed",
+                json!({"threadId":"thread-1", "turnId":"", "item":{"id":"reasoning", "type":"reasoning", "summary":[]}}),
+            ),
+            (
+                "item/completed",
+                json!({"threadId":"thread-1", "turnId":"wrong-turn", "item":{"id":"reasoning", "type":"reasoning", "summary":[]}}),
+            ),
+        ];
+        for (method, params) in invalid_deltas.into_iter().chain(invalid_other_items) {
             let (events_tx, mut events_rx) = mpsc::channel(4);
             let (_commands_tx, commands_rx) = mpsc::channel(2);
             let mut owner = RunningOwner::new(
@@ -2319,7 +2329,7 @@ mod tests {
                 .handle_frame(
                     &mut connection,
                     json!({
-                        "method": "item/agentMessage/delta", "params": params,
+                        "method": method, "params": params,
                     }),
                 )
                 .await

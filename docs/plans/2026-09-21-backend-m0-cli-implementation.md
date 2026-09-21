@@ -1,7 +1,7 @@
 # 后端 M0 与持久 CLI 实施记录
 
 日期：2026-09-21
-基线：`32f10e6`，以下为 2026-09-21 本次变更的本地验证回执；远端 CI 结果另列。
+基线：`32f10e6`；首版验证对应 `5d2e734`，PR 审阅修复后的回归另列于文末。远端 CI 结果独立记录。
 
 ## Goal
 
@@ -24,7 +24,7 @@
 
 沿用 Rust/Tokio、现有 serde/schemars 协议及 Swift/UIKit 模型，不增加依赖。
 
-## 本地验证
+## 首版本地验证
 
 | 验证 | 结果与证据边界 |
 | --- | --- |
@@ -94,3 +94,37 @@ selfcheck、one-shot run 和 continue 通过；history list 首轮超过 30 秒�
 当前只证明上述临时配置环境下的 M0，默认本机配置仍不兼容。真实 failed 模型 turn、
 history read/管理、Claude Code partial streaming/审批、远程能力和 GPUI desktop 接入
 仍是独立后续工作；iOS 设备测试缺口见上表。
+
+
+## PR 审阅修复与回归
+
+- 诊断成功落盘后才返回 `diagnosticRef`；写失败保留 stderr fallback。CLI 回归同时覆盖
+  非终态 record warning 和真实 CLI/fake vendor 的版本拒绝路径，均不返回虚假引用。
+- 启动失败保留排队事件和 hub error，writer drain 后写 footer；legacy EOF/cancel
+  没有终态时也收尾。失败启动的 session ID 保留到连接结束，避免重试覆盖记录。
+  CC 仍采用 one-shot TurnComplete；这不等同于完成 CC SessionClosed 生命周期迁移。
+- Codex 所有 item 拒绝空 turnId，completed 去重覆盖 reasoning 等类型；无 vendor ID
+  的 Raw 事件使用单调 ID。CC Diff 在 tool_use 为 streaming，tool_result 为 completed。
+- 连续 record append 失败仅首次及终态告警，iOS 不因该告警结束 streaming 或标记失败。
+  fixture 只保留事件内 itemId；daemon 单测的 record/diagnostic 写入隔离临时目录，
+  不再修改进程全局 HOME/AGENTDECK_DATA_DIR。
+
+| 修复后验证 | 结果 |
+| --- | --- |
+| `scripts/verify-offline-tests.sh` | 通过；unset/0 完整 workspace 与全部非 1 gated targets 通过，vendor marker 未执行。daemon lib 166 项通过。 |
+| 实际 CLI / fake Codex | 8 项通过，新增诊断不可写时健康会话继续、失败启动不生成虚假引用；持续写失败准确产生首次与终态两条告警。 |
+| 聚焦回归 | record 16、runtime 25、Codex translator 12、CC translator 19 项通过；item 空/过期 turnId 的 owner 回归通过。 |
+| 当前 checkout daemon/CLI | build、selfcheck（protocolVersion=4）、schema diff、diagnostics report 通过。 |
+| Swift Core | `swift test` 通过：72 项 XCTest 与 31 项 Swift Testing。 |
+| iOS | XcodeGen + iPhone 17 Simulator test 通过，21 项、0 失败，包括 warning 不中断流的新增回归；此前 runtime 阻断已解除。 |
+| 文档与格式 | `scripts/verify-agent-docs.sh`、`cargo fmt --all -- --check`、`git diff --check` 通过。 |
+| 真实 Codex 四轮复验 | 同一临时 launcher / 0.145.0 / 当前 daemon 下通过（50.40 秒），succeeded / succeeded / canceled / succeeded，同 PID `80010`，唯一 SessionClosed、完整记录、进程组回收断言通过。 |
+
+本轮日志：`/tmp/agentdeck-pr14-offline.log`、`/tmp/agentdeck-pr14-live.log`、
+`/tmp/agentdeck-pr14-swift.log`、`/tmp/agentdeck-pr14-ios-test.log`；CLI 自检与诊断回执为
+`/tmp/agentdeck-pr14-selfcheck.json`、`/tmp/agentdeck-pr14-diagnostics.json`。
+
+真实复验日志：`/tmp/agentdeck-pr14-real-codex.log`；诊断读回：
+`/tmp/agentdeck-pr14-real-diagnostics.json`；原始 record/diagnostic：
+`/var/folders/zy/fn4lmxbx1cd5flcp81mk2xx80000gn/T/agentdeck-codex-live-e2e-80002-1789972108355846000/`。
+本轮未重复真实 history 扫描；首版的默认配置不兼容和历史列表时延风险继续保留。

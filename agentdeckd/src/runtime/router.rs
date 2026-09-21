@@ -93,12 +93,8 @@ impl AgentRouter {
             Ok(handle) => Ok(handle),
             Err(error) => {
                 self.unregister_session(&session_id).await;
-                let record = self.records.lock().await.remove(&session_id);
-                if let Some(record) = record
-                    && let Err(reason) = record.close()
-                {
-                    let _ = events.send(record_warning(&session_id, reason)).await;
-                }
+                // The writer must consume queued startup events and the hub's
+                // failure event before it closes this record during drain.
                 Err(error)
             }
         }
@@ -406,7 +402,7 @@ pub(super) fn record_warning(
         error: ProtocolError {
             code: "record_write_failed".into(),
             message: "run record could not be written; the session can continue".into(),
-            diagnostic_ref: Some(diagnostic_ref),
+            diagnostic_ref,
         },
     }
 }

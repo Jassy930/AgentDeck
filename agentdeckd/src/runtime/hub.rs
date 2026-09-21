@@ -502,8 +502,21 @@ async fn lifecycle_worker(
                         .await;
                     }
                     Err(error) => {
-                        send_lifecycle_error(&events_tx, &retiring_sessions, session_id, error)
-                            .await;
+                        send_lifecycle_error(
+                            &events_tx,
+                            &retiring_sessions,
+                            session_id.clone(),
+                            error,
+                        )
+                        .await;
+                        if !sessions.lock().await.contains_key(&session_id)
+                            && router.records.lock().await.contains_key(&session_id)
+                        {
+                            // Keep the failed run's ID reserved until its queued
+                            // events and footer are written. Duplicate starts of
+                            // a retained session must not retire that session.
+                            retiring_sessions.lock().await.insert(session_id);
+                        }
                     }
                 }
             }
@@ -748,6 +761,7 @@ async fn writer_task<W>(
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let mut record_warnings = HashSet::new();
     let result = async {
         loop {
             tokio::select! {
@@ -762,7 +776,7 @@ where
                             // admin channel closed; keep draining events
                             // until that side also closes.
                             while let Some(event) = events_rx.recv().await {
-                                write_event(&mut stdout, &router, event).await?;
+                                write_event(&mut stdout, &router, &mut record_warnings, event).await?;
                             }
                             break;
                         }
@@ -771,7 +785,7 @@ where
                 maybe_event = events_rx.recv() => {
                     match maybe_event {
                         Some(event) => {
-                            write_event(&mut stdout, &router, event).await?;
+                            write_event(&mut stdout, &router, &mut record_warnings, event).await?;
                         }
                         None => {
                             // events channel closed; keep draining admin
@@ -785,6 +799,7 @@ where
                 }
             }
         }
+        close_remaining_records(&mut stdout, &router, &mut record_warnings).await?;
         stdout.flush().await
     }
     .await;
@@ -795,8 +810,9 @@ where
         drop(admin_rx);
         let mut sink = tokio::io::sink();
         while let Some(event) = events_rx.recv().await {
-            let _ = write_event(&mut sink, &router, event).await;
+            let _ = write_event(&mut sink, &router, &mut record_warnings, event).await;
         }
+        let _ = close_remaining_records(&mut sink, &router, &mut record_warnings).await;
     }
     result
 }
@@ -810,6 +826,7 @@ async fn write_line<W: AsyncWrite + Unpin>(stdout: &mut W, body: &[u8]) -> io::R
 async fn write_event<W: AsyncWrite + Unpin>(
     stdout: &mut W,
     router: &AgentRouter,
+    record_warnings: &mut HashSet<SessionId>,
     mut event: ServerEvent,
 ) -> io::Result<()> {
     let session_id = match &event {
@@ -834,10 +851,10 @@ async fn write_event<W: AsyncWrite + Unpin>(
         };
         if let Some(error) = error {
             if error.diagnostic_ref.is_none() {
-                error.diagnostic_ref = Some(diag::log_session(
+                error.diagnostic_ref = diag::log_session(
                     &session_id.0,
                     DiagnosticEvent::new(name).level("error").code(&error.code),
-                ));
+                );
             }
         }
         if let ServerEvent::SessionClosed {
@@ -872,7 +889,13 @@ async fn write_event<W: AsyncWrite + Unpin>(
             };
             append_error.or(close_error)
         };
-        if let Some(reason) = failure {
+        if let Some(reason) = failure
+            && (record_warnings.insert(session_id.clone())
+                || matches!(
+                    event,
+                    ServerEvent::SessionClosed { .. } | ServerEvent::TurnComplete { .. }
+                ))
+        {
             // A terminal must remain the final wire event for its session.
             let warning = crate::runtime::router::record_warning(&session_id, reason);
             let line = serde_json::to_vec(&warning).map_err(io::Error::other)?;
@@ -881,6 +904,31 @@ async fn write_event<W: AsyncWrite + Unpin>(
     }
     let line = serde_json::to_vec(&event).map_err(io::Error::other)?;
     write_line(stdout, &line).await
+}
+
+async fn close_remaining_records<W: AsyncWrite + Unpin>(
+    stdout: &mut W,
+    router: &AgentRouter,
+    record_warnings: &mut HashSet<SessionId>,
+) -> io::Result<()> {
+    // Startup failures and legacy cancellation have no session terminal. Only
+    // channel drain proves all their queued events have reached the record.
+    let records = std::mem::take(&mut *router.records.lock().await);
+    let warnings = records
+        .into_iter()
+        .filter_map(|(session_id, record)| {
+            record.close().err().and_then(|reason| {
+                record_warnings
+                    .insert(session_id.clone())
+                    .then(|| crate::runtime::router::record_warning(&session_id, reason))
+            })
+        })
+        .collect::<Vec<_>>();
+    for warning in warnings {
+        let line = serde_json::to_vec(&warning).map_err(io::Error::other)?;
+        write_line(stdout, &line).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -903,6 +951,14 @@ mod tests {
 
     struct FailingWriter {
         write_failure: Arc<Notify>,
+    }
+
+    #[derive(Default)]
+    struct LegacyRecordStub {
+        fail_start: bool,
+        start_calls: AtomicUsize,
+        cancel_calls: AtomicUsize,
+        pump: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     }
 
     struct SpontaneousFailureStub {
@@ -937,6 +993,102 @@ mod tests {
             _: &mut std::task::Context<'_>,
         ) -> std::task::Poll<io::Result<()>> {
             std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Agent for LegacyRecordStub {
+        fn kind(&self) -> AgentKind {
+            AgentKind::Codex
+        }
+
+        fn capabilities(&self) -> SessionCapabilities {
+            SessionCapabilities {
+                agent_kind: self.kind(),
+                agent_version: "legacy-record-stub".into(),
+                features: Default::default(),
+                vendor: VendorCapabilities::Codex(Default::default()),
+            }
+        }
+
+        async fn start_session(
+            &self,
+            start: SessionStart,
+            events: AgentEventSender,
+        ) -> Result<AgentSessionHandle, ProtocolError> {
+            self.start_calls.fetch_add(1, Ordering::SeqCst);
+            events
+                .send(ServerEvent::SessionStarted {
+                    session_id: start.session_id.clone(),
+                    thread_id: None,
+                    agent_kind: self.kind(),
+                })
+                .await
+                .unwrap();
+            events
+                .send(ServerEvent::SessionCapabilities {
+                    session_id: start.session_id.clone(),
+                    agent_kind: self.kind(),
+                    capabilities: self.capabilities(),
+                })
+                .await
+                .unwrap();
+            if self.fail_start {
+                return Err(ProtocolError {
+                    code: "stub-start-failed".into(),
+                    message: "startup failed after queueing initial events".into(),
+                    diagnostic_ref: None,
+                });
+            }
+            let pump = tokio::spawn(async move {
+                let _events = events;
+                std::future::pending::<()>().await;
+            });
+            let abort_handle = pump.abort_handle();
+            *self.pump.lock().unwrap() = Some(pump);
+            Ok(AgentSessionHandle {
+                session_id: start.session_id,
+                thread_id: None,
+                agent_kind: self.kind(),
+                abort_handle,
+                exit: None,
+            })
+        }
+
+        async fn continue_thread(
+            &self,
+            _: ThreadId,
+            _: std::path::PathBuf,
+            _: String,
+            _: AgentEventSender,
+        ) -> Result<AgentSessionHandle, ProtocolError> {
+            unimplemented!("continue is outside these recording tests")
+        }
+
+        async fn submit_decision(
+            &self,
+            _: &SessionId,
+            _: ActionDecision,
+        ) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+
+        async fn submit_vendor_control(
+            &self,
+            _: &SessionId,
+            _: VendorControlPayload,
+        ) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+
+        async fn cancel(&self, _: &SessionId) -> Result<(), ProtocolError> {
+            self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+            let pump = self.pump.lock().unwrap().take();
+            if let Some(pump) = pump {
+                pump.abort();
+                let _ = pump.await;
+            }
+            Ok(())
         }
     }
 
@@ -1313,6 +1465,117 @@ mod tests {
             })
         ));
         assert_eq!(stub.close_calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn read_run_record(session_id: &SessionId) -> Vec<serde_json::Value> {
+        let path = crate::record::record_dir()
+            .unwrap()
+            .join(format!("{}.jsonl", session_id.0));
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn failed_start_record_preserves_queued_events_and_rejects_same_id_retry() {
+        let session_id = SessionId(format!("failed-record-{}", uuid::Uuid::new_v4()));
+        let stub = Arc::new(LegacyRecordStub {
+            fail_start: true,
+            ..Default::default()
+        });
+        let mut router = AgentRouter::new();
+        router.register(stub.clone());
+        let router = Arc::new(router);
+        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let (events_tx, events_rx) = mpsc::channel(8);
+        let (poison_tx, poison_rx) = watch::channel(false);
+        let retiring_sessions = Arc::new(Mutex::new(HashSet::new()));
+
+        commands_tx.send(eof_session_start(&session_id.0)).unwrap();
+        commands_tx.send(eof_session_start(&session_id.0)).unwrap();
+        drop(commands_tx);
+        // Do not start the writer until startup has returned its error. This
+        // forces the queueing order that used to close and lose the record.
+        lifecycle_worker(
+            Arc::clone(&router),
+            Arc::new(Mutex::new(HashMap::new())),
+            commands_rx,
+            events_tx,
+            poison_tx.clone(),
+            poison_rx,
+            Arc::new(Notify::new()),
+            Arc::clone(&retiring_sessions),
+            Arc::new(Mutex::new(())),
+        )
+        .await;
+        assert_eq!(stub.start_calls.load(Ordering::SeqCst), 1);
+        assert!(retiring_sessions.lock().await.contains(&session_id));
+        assert!(router.records.lock().await.contains_key(&session_id));
+        let before_drain = read_run_record(&session_id);
+        assert_eq!(before_drain.len(), 1);
+        assert_eq!(before_drain[0]["kind"], "runHeader");
+
+        let (admin_tx, admin_rx) = mpsc::channel(1);
+        drop(admin_tx);
+        let (stdout, mut client) = duplex(16384);
+        writer_task(stdout, events_rx, admin_rx, poison_tx, Arc::clone(&router))
+            .await
+            .unwrap();
+        let mut wire = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut client, &mut wire)
+            .await
+            .unwrap();
+        let events: Vec<serde_json::Value> = wire
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["type"], "sessionStarted");
+        assert_eq!(events[1]["type"], "sessionCapabilities");
+        assert_eq!(events[2]["error"]["code"], "stub-start-failed");
+        let record = read_run_record(&session_id);
+        assert_eq!(record.len(), events.len() + 2);
+        assert_eq!(record[1..record.len() - 1], events);
+        assert_eq!(record.last().unwrap()["kind"], "runFooter");
+        assert!(router.records.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_eof_without_terminal_closes_record_after_draining_events() {
+        let session_id = SessionId(format!("legacy-record-{}", uuid::Uuid::new_v4()));
+        let stub = Arc::new(LegacyRecordStub::default());
+        let mut router = AgentRouter::new();
+        router.register(stub.clone());
+        let router = Arc::new(router);
+        let hub = RuntimeHub::new(Arc::clone(&router));
+        let (mut client_to_daemon, stdin) = duplex(4096);
+        let (stdout, mut client_from_daemon) = duplex(16384);
+        write_command(&mut client_to_daemon, &eof_session_start(&session_id.0)).await;
+        client_to_daemon.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), hub.run(stdin, stdout))
+            .await
+            .expect("legacy EOF must cancel its pump and finish draining")
+            .unwrap();
+
+        let mut wire = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut client_from_daemon, &mut wire)
+            .await
+            .unwrap();
+        let events: Vec<serde_json::Value> = wire
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(stub.cancel_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"], "sessionStarted");
+        assert_eq!(events[1]["type"], "sessionCapabilities");
+        let record = read_run_record(&session_id);
+        assert_eq!(record.len(), events.len() + 2);
+        assert_eq!(record[1..record.len() - 1], events);
+        assert_eq!(record.last().unwrap()["kind"], "runFooter");
+        assert!(router.records.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -1851,7 +2114,9 @@ mod tests {
         );
         assert!(!sessions.lock().await.contains_key(&session_id));
         let (mut output, input) = duplex(4096);
-        write_event(&mut output, &router, terminal).await.unwrap();
+        write_event(&mut output, &router, &mut HashSet::new(), terminal)
+            .await
+            .unwrap();
         let terminal = read_server_event(&mut BufReader::new(input)).await;
         assert!(matches!(
             terminal,

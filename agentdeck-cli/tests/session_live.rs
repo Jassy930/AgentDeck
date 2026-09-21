@@ -54,11 +54,51 @@ fn cli_live_reuses_child_streams_cancels_recovers_and_records() {
 
 #[test]
 fn cli_live_eof_closes_session_and_record_failure_is_nonterminal() {
+    assert_record_failure_is_nonterminal(true);
+}
+
+#[test]
+fn cli_live_unwritable_diagnostics_omit_reference_and_preserve_session() {
+    assert_record_failure_is_nonterminal(false);
+}
+
+#[test]
+fn cli_live_failed_start_with_unwritable_diagnostics_has_no_reference() {
+    if !daemon_bound() {
+        return;
+    }
+    let root = temp_root("cli-live-start-diagnostic-failure");
+    std::fs::create_dir(root.join("diagnostic.log")).unwrap();
+    let mut command = fixture_command(&root, &["session", "live"]);
+    command.env("AGENTDECK_FIXTURE_VERSION", "codex-cli 0.0.0");
+    let mut cli = LiveCli::spawn(command, Duration::from_secs(20));
+    cli.send(session_start(&root));
+    loop {
+        let event = cli.next();
+        assert_ne!(
+            event["type"], "sessionStarted",
+            "invalid version must not start"
+        );
+        if event["type"] == "sessionClosed" {
+            assert_eq!(event["outcome"], "failed");
+            assert_eq!(event["error"]["code"], "codex-version-unsupported");
+            assert!(event["error"]["diagnosticRef"].is_null());
+            break;
+        }
+    }
+    assert!(!cli.finish().success());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn assert_record_failure_is_nonterminal(diagnostics_writable: bool) {
     if !daemon_bound() {
         return;
     }
     let root = temp_root("cli-live-record-failure");
     std::fs::write(root.join("runs"), "cannot create a record directory here").unwrap();
+    if !diagnostics_writable {
+        std::fs::create_dir(root.join("diagnostic.log")).unwrap();
+    }
     let mut cli = LiveCli::spawn(
         fixture_command(&root, &["session", "live"]),
         Duration::from_secs(20),
@@ -82,16 +122,20 @@ fn cli_live_eof_closes_session_and_record_failure_is_nonterminal() {
         .iter()
         .find(|v| v["error"]["code"] == "record_write_failed")
         .unwrap();
-    let reference = warning["error"]["diagnosticRef"].as_str().unwrap();
-    let (run_id, sequence) = reference.rsplit_once(':').unwrap();
-    let diagnostics = std::fs::read_to_string(root.join("diagnostic.log")).unwrap();
-    assert!(
-        diagnostics
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .any(|event| event["runId"] == run_id
-                && event["eventSeq"] == sequence.parse::<u64>().unwrap())
-    );
+    if diagnostics_writable {
+        let reference = warning["error"]["diagnosticRef"].as_str().unwrap();
+        let (run_id, sequence) = reference.rsplit_once(':').unwrap();
+        let diagnostics = std::fs::read_to_string(root.join("diagnostic.log")).unwrap();
+        assert!(
+            diagnostics
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .any(|event| event["runId"] == run_id
+                    && event["eventSeq"] == sequence.parse::<u64>().unwrap())
+        );
+    } else {
+        assert!(warning["error"]["diagnosticRef"].is_null());
+    }
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -213,12 +257,12 @@ fn cli_live_record_append_and_close_failure_preserve_lifecycle() {
         cli.events[cli.events.len() - 2]["error"]["code"],
         "record_write_failed"
     );
-    assert!(
+    assert_eq!(
         cli.events
             .iter()
             .filter(|v| v["error"]["code"] == "record_write_failed")
-            .count()
-            >= 2
+            .count(),
+        2
     );
     std::fs::remove_dir_all(root).unwrap();
 }

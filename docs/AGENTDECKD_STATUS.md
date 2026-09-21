@@ -4,10 +4,10 @@
 不代替产品北极星、稳定架构或具体实施计划。
 
 - 首次盘点基线：`7bebadc`（2026-08-17）
-- 当前验证：2026-09-21，基于 `32f10e6` 的本次变更。完整离线门禁、6 项实际 CLI
+- 当前验证：2026-09-21，基于 `32f10e6` 的本次变更。完整离线门禁、8 项实际 CLI
   fake 集成、Swift 和 CLI 自检通过；真实 Codex 四轮 M0 在下述临时配置覆盖环境通过，
   默认本机配置仍不兼容，历史列表首轮超时、复验通过但耗时接近 deadline。
-  iOS 设备测试受运行时缺失阻断。详见 [M0 CLI 实施记录](plans/2026-09-21-backend-m0-cli-implementation.md)。
+  iOS iPhone 17 Simulator 已执行 21 项测试且全部通过。详见 [M0 CLI 实施记录](plans/2026-09-21-backend-m0-cli-implementation.md)。
 - 当前桌面边界：GPUI 桌面尚未连接 daemon；本页的 backend 能力不能直接视为
   桌面端可用能力。
 - 当前 Codex 接入：`agentdeckd` 直接启动 `codex app-server` 子进程；不使用 managed
@@ -77,8 +77,8 @@ README、架构、诊断和计划文档用于解释目标与不变量；当文�
 | Claude Code | history archive/unarchive | 未接通 | archive 对普通 print session 没有稳定原生语义，可能返回不支持；unarchive 当前只是无效果 Ack。 | `agentdeckd/src/claude_code/history.rs`、`agentdeckd/src/claude_code/adapter.rs` |
 | shared history | 跨 agent list | 较完整 | 两个来源并发查询、独立 deadline、best-effort 合并、按最近活动排序并应用总 limit；全部失败与合法空结果可区分。 | `agentdeckd/src/runtime/router.rs` |
 | vendor control | session 内控制更新 | 骨架 | typed payload 与路由存在；Codex 返回 requires-new-turn，CC 多数控制返回 requires-new-turn 或 not-supported。 | 两个 adapter 的 `submit_vendor_control` |
-| observability | run record | 较完整 | router 在 spawn 前打开 session record，单 writer 按事件顺序 append，SessionClosed 后写 footer；open/append/close 失败发可定位的非终态告警，CLI 仍等待真实 terminal。JSONL/脱敏/数据目录格式保持不变。 | `agentdeckd/src/runtime/router.rs`、`agentdeckd/src/runtime/hub.rs`、`agentdeckd/src/record.rs` |
-| observability | diagnostic log/report | 部分 | Codex lifecycle 已覆盖 spawn/version/PID、RPC、turn outcome、interrupt、cleanup；failure diagnosticRef 对应实际 runId/eventSeq。写失败保留 stderr fallback；审批/history 等 M0 外路径尚未贯通。 | `agentdeckd/src/diag.rs`、`agentdeckd/src/codex/session.rs` |
+| observability | run record | 较完整 | router 在 spawn 前打开 session record，单 writer 按事件顺序 append，Codex SessionClosed / CC TurnComplete 后写 footer；启动失败或 legacy EOF/cancel 的遗留记录在 writer drain 后收尾。open/append/close 失败发非终态告警，诊断成功落盘时提供引用；连续 append 失败仅首次及终态告警。CLI 仍等待真实 terminal。JSONL/脱敏/数据目录格式保持不变。 | `agentdeckd/src/runtime/router.rs`、`agentdeckd/src/runtime/hub.rs`、`agentdeckd/src/record.rs` |
+| observability | diagnostic log/report | 部分 | Codex lifecycle 已覆盖 spawn/version/PID、RPC、turn outcome、interrupt、cleanup；failure diagnosticRef 仅在成功落盘后返回，对应实际 runId/eventSeq。写失败省略引用并保留 stderr fallback；审批/history 等 M0 外路径尚未贯通。 | `agentdeckd/src/diag.rs`、`agentdeckd/src/codex/session.rs` |
 | quality | 默认测试离线安全 | 较完整 | 真实 session、prompt、history、auth 和 vendor process 测试统一只认 `AGENTDECK_E2E=1`；普通 version/auth probe 使用可注入 fake。marker tripwire 通过临时 HOME 隔离用户 vendor history 与默认 AgentDeck data dir，并验证标准 workspace tests 不执行 PATH 中的 vendor shim；macOS workflow 已配置该门禁，首个 hosted run 已在 2026-08-18 通过。普通 passed 仍不代表真实 E2E 已执行。 | `agentdeckd/tests/support/mod.rs`、`scripts/verify-offline-tests.sh`、`.github/workflows/offline-ci.yml` |
 | CLI | admin、session、history | 部分 | session live 在一个 daemon 连接上双向转发 typed JSONL，支持顺序多轮、cancel、close、Ping，EOF 有序关闭。run/continue 保持 one-shot；record_write_failed 不终止健康会话。live 是协议驱动入口，尚无交互式审批产品界面。 | `agentdeck-cli/src/commands.rs`、`agentdeck-cli/src/client.rs`、`agentdeck-cli/tests/session_live.rs` |
 | product integration | GPUI desktop → daemon | 未接通 | 当前桌面 bundle 不携带、不启动、不连接 `agentdeckd`，也没有会话、审批或历史 UI。 | `README.md`、`docs/QUALITY.md`、`agentdeck-desktop/` |
@@ -86,7 +86,7 @@ README、架构、诊断和计划文档用于解释目标与不变量；当文�
 ## 当前验收边界
 
 - #4 的累计 streaming、#5 的持久 CLI 和 #6 的生产记录/诊断已经实现，离线 CLI 用例覆盖同一进程四轮、取消恢复、EOF 和记录写失败。
-- 真实四轮 M0 已在 Codex 0.145.0、当前 checkout daemon、`AGENTDECK_E2E=1` 下通过（58.39 秒）。临时 PATH launcher 使用 `-c features.context_management=false` 覆盖本机不兼容配置；全局配置未改，原生登录未复制。
+- 真实四轮 M0 已在 Codex 0.145.0、当前 checkout daemon、`AGENTDECK_E2E=1` 下通过（首版 58.39 秒，PR 修复后复验 50.40 秒）。临时 PATH launcher 使用 `-c features.context_management=false` 覆盖本机不兼容配置；全局配置未改，原生登录未复制。
 - 默认本机配置的 `features.context_management` 是 table，0.145.0 要求 bool：initialize 成功后 thread/start 失败，失败路径 cleanup 已确认。该结果不是 failed 模型 turn；覆盖环境的成功也不表示默认环境已修复。
 - 真实四轮为 succeeded/succeeded/canceled/succeeded，streaming 快照数为 29/30/2/28；PID `9186`、threadId `01a0c1d3-2841-75e1-93f7-fb678dd68b4a` 全程复用。唯一 SessionClosed(closed)、完整 record/footer、IPC 同序和进程组消失断言通过，diagnostics report 已生成。
 - 验收回执目录：`/tmp/agentdeck-m0-real-launcher-efmchgel/`；record 与 diagnostics：`/var/folders/zy/fn4lmxbx1cd5flcp81mk2xx80000gn/T/agentdeck-codex-live-e2e-9179-1789958234236367000/`。其余 7 项 Codex E2E 中，agent list、capabilities、Ping、selfcheck、one-shot run、continue 通过，history list 首轮在 30 秒总 deadline 超时。

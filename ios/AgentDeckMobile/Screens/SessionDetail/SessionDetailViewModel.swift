@@ -71,7 +71,9 @@ final class SessionDetailViewModel {
             approvalState = .pending
         case .error(_, let protocolError):
             errorText = protocolError.message
-            isStreaming = false
+            if protocolError.code != "record_write_failed" {
+                isStreaming = false
+            }
         case .turnFinished(_, _, _, _, let outcome, _, _, let error):
             isStreaming = false
             if outcome == .failed {

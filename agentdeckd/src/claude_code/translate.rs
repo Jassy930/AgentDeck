@@ -324,7 +324,7 @@ impl ClaudeCodeTranslator {
         let name = block.get("name").and_then(Value::as_str)?.to_string();
         let input = block.get("input").cloned().unwrap_or(Value::Null);
 
-        let event = match name.as_str() {
+        let mut event = match name.as_str() {
             "Bash" => {
                 let command = input
                     .get("command")
@@ -358,6 +358,9 @@ impl ClaudeCodeTranslator {
                 })
             }
         };
+        if let ServerEvent::AgentItem { state, .. } = &mut event {
+            *state = AgentItemState::Streaming;
+        }
 
         self.in_flight_tools.insert(
             id,
@@ -554,21 +557,13 @@ impl ClaudeCodeTranslator {
         let item_id = tool_id
             .map(str::to_string)
             .unwrap_or_else(|| format!("{}:{}", self.session_id.0, self.next_item_id));
-        let state = match &item {
-            AgentItem::Shell {
-                status: ShellStatus::Running,
-                ..
-            }
-            | AgentItem::ToolCall { result: None, .. } => AgentItemState::Streaming,
-            _ => AgentItemState::Completed,
-        };
         ServerEvent::AgentItem {
             session_id: self.session_id.clone(),
             thread_id: self.resolved_thread_id(),
             agent_kind: AgentKind::ClaudeCode,
             turn_id: self.turn_id.clone(),
             item_id,
-            state,
+            state: AgentItemState::Completed,
             item,
         }
     }

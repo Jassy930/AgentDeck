@@ -134,7 +134,6 @@ final class FixtureSessionSource: MobileSessionSource {
         let kind = session.agentKind
         let threadId = "t-prompt-\(seq)"
         emit(SessionStreamElement(
-            itemId: "prompt-user-\(seq)",
             event: .agentItem(sessionId: sessionID, threadId: threadId, agentKind: kind,
                               turnId: "prompt-\(seq)", itemId: "prompt-user-\(seq)", state: .completed,
                               item: .userMessage(text: text, meta: AgentItemMeta()))
@@ -142,14 +141,12 @@ final class FixtureSessionSource: MobileSessionSource {
         let reply = "（fixture 回声）收到：\(text)。真实链路接入后此处为 agent 输出。"
         await sleepTicks(600)
         emit(SessionStreamElement(
-            itemId: "prompt-reply-\(seq)",
             event: .agentItem(sessionId: sessionID, threadId: threadId, agentKind: kind,
                               turnId: "prompt-\(seq)", itemId: "prompt-reply-\(seq)", state: .completed,
                               item: .assistantMessage(text: reply, meta: AgentItemMeta()))
         ), sessionID: sessionID, playback: playback)
         await sleepTicks(200)
         emit(SessionStreamElement(
-            itemId: nil,
             event: .turnComplete(sessionId: sessionID, threadId: threadId, agentKind: kind,
                                  summary: TurnSummary(elapsedMs: 800))
         ), sessionID: sessionID, playback: playback)
@@ -189,7 +186,7 @@ final class FixtureSessionSource: MobileSessionSource {
             for step in steps {
                 await self?.sleepTicks(step.delayMs)
                 guard let self else { return }
-                self.emit(SessionStreamElement(itemId: step.itemId, event: step.event),
+                self.emit(SessionStreamElement(event: step.event),
                           sessionID: sessionID, playback: playback)
                 self.noteSideEffects(of: step.event, sessionID: sessionID)
                 if step.awaitApproval == true {
@@ -224,7 +221,7 @@ final class FixtureSessionSource: MobileSessionSource {
         case .turnComplete:
             appendInbox(.init(id: "inbox-done-\(sessionID)", sessionID: sessionID,
                               machineID: session.machineID, kind: .turnCompleted, title: session.title))
-        case .error:
+        case .error(_, let error) where error.code != "record_write_failed":
             if let index = sessionRows.firstIndex(where: { $0.id == sessionID }) {
                 sessionRows[index].group = .recent
             }
