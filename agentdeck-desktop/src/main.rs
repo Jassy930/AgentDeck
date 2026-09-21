@@ -1,46 +1,31 @@
+mod composer;
+mod shell;
+mod sidebar;
+
 use std::env;
 
-use gpui::{
-    App, Application, Context, IntoElement, ParentElement, Render, Window, WindowOptions,
-    prelude::*,
-};
-use gpui_component::{
-    Root,
-    button::{Button, ButtonVariants},
-    v_flex,
-};
+use gpui::{App, Application, TitlebarOptions, WindowOptions, point, prelude::*, px, size};
+use gpui_component::Root;
+
+use shell::Shell;
 
 const SELFCHECK_REPORT: &str = r#"{"status":"ok","surface":"desktop","ui":"gpui"}"#;
-
-struct AgentDeckView;
-
-impl Render for AgentDeckView {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
-            .size_full()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .child("AgentDeck")
-            .child("GPUI 桌面端已启动")
-            .child(
-                Button::new("quit")
-                    .primary()
-                    .label("关闭")
-                    .on_click(|_, _, cx| cx.quit()),
-            )
-    }
-}
 
 fn open_main_window(cx: &mut App, show: bool) {
     cx.open_window(
         WindowOptions {
             show,
             focus: show,
+            titlebar: Some(TitlebarOptions {
+                title: Some("AgentDeck".into()),
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(16.), px(16.))),
+            }),
+            window_min_size: Some(size(px(900.), px(620.))),
             ..Default::default()
         },
         |window, cx| {
-            let view = cx.new(|_| AgentDeckView);
+            let view = cx.new(|cx| Shell::new(window, cx));
             cx.new(|cx| Root::new(view, window, cx))
         },
     )

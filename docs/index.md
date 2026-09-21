@@ -25,7 +25,8 @@
 ### GPUI 桌面端重启（2026-08-17，当前）
 
 - `plans/2026-08-17-gpui-desktop-reset-design.md`：删除旧 AppKit target、建立最小 GPUI 桌面壳的目标、边界和验收标准。
-- `plans/2026-08-17-gpui-desktop-reset-implementation.md`：当前切片的逐文件实施与验证命令。
+- `plans/2026-08-17-gpui-desktop-reset-implementation.md`：最小壳切片的逐文件实施与验证命令。
+- `plans/2026-09-21-gpui-desktop-shell-layout-implementation.md`：向 Codex Desktop 视觉范式对齐的外壳布局骨架（侧栏 / 空态 / 会话态 / composer，全部静态占位）、gpui-component 0.5.1 坑点与目视验证方式。
 
 此前 macOS AppKit 文档仅保留为历史事实，不再定义当前桌面实现或默认迭代顺序。
 

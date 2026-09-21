@@ -39,6 +39,7 @@
 
 - `2026-08-17-gpui-desktop-reset-design.md`
 - `2026-08-17-gpui-desktop-reset-implementation.md`
+- `2026-09-21-gpui-desktop-shell-layout-implementation.md`
 
 desktop 接入前的 daemon 目标事实源（已接受设计，尚未完成代码验收）：
 

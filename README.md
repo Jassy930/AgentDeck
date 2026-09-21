@@ -11,15 +11,18 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
 
 当前桌面端只承诺：
 
-- 创建真实 GPUI macOS 窗口。
+- 创建真实 GPUI macOS 窗口，使用透明标题栏。
 - 初始化 `gpui-component` 并挂载 `Root`。
+- 渲染静态外壳布局：全高左侧栏（新建会话 / 项目区 / 账号区）、空态（居中标题、
+  圆角 composer、两家接入卡片），以及会话态（thread header、transcript 占位、
+  底部悬浮 composer）。侧栏条目在两种形态之间切换，全部数据为占位常量。
 - 提供 `--selfcheck`，验证 GPUI、Metal renderer、隐藏窗口和组件树初始化。
 - 通过统一脚本构建并启动 `dist/AgentDeck.app`。
 
 当前明确不包含：
 
-- daemon / IPC 连接。
-- 会话、历史、composer、审批和富文本 transcript。
+- daemon / IPC 连接；外壳里的项目、账号、连接状态全是静态占位。
+- 真实会话、历史、消息流、审批和富文本 transcript；composer 不发送任何内容。
 - 远程机器、网络数据源和配对流程。
 - 对旧 AppKit 界面或行为的兼容层。
 
@@ -38,7 +41,7 @@ diagnostics 等较宽的代码表面。Codex 路径已经落地 protocol v4 的 
 ## 仓库结构
 
 ```text
-agentdeck-desktop/       最小 Rust/GPUI macOS 客户端
+agentdeck-desktop/       Rust/GPUI macOS 客户端外壳（静态布局，未接 daemon）
 agentdeck-protocol/      AgentDeck 中立 IPC 类型与 schema 事实源
 agentdeckd/              Codex / Claude Code adapter daemon
 agentdeck-cli/           参考客户端与 E2E 驱动
