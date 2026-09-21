@@ -4,16 +4,19 @@
 不代替产品北极星、稳定架构或具体实施计划。
 
 - 首次盘点基线：`7bebadc`（2026-08-17）
+- 当前验证：2026-09-21，基于 `32f10e6` 的本次变更。完整离线门禁、6 项实际 CLI
+  fake 集成、Swift 和 CLI 自检通过；真实 Codex 四轮 M0 在下述临时配置覆盖环境通过，
+  默认本机配置仍不兼容，历史列表首轮超时、复验通过但耗时接近 deadline。
+  iOS 设备测试受运行时缺失阻断。详见 [M0 CLI 实施记录](plans/2026-09-21-backend-m0-cli-implementation.md)。
 - 当前桌面边界：GPUI 桌面尚未连接 daemon；本页的 backend 能力不能直接视为
   桌面端可用能力。
 - 当前 Codex 接入：`agentdeckd` 直接启动 `codex app-server` 子进程；不使用 managed
-  daemon/proxy。Issue #3 已落地 session-scoped owner 与 protocol v3 生命周期；当前状态
-  仍以离线 fake/fixture 证据为主，没有本轮真实 Codex session/prompt 回执。
+  daemon/proxy。session-scoped owner 与 protocol v4 已实现累计消息、持久 CLI 和生产运行记录；
+  真实 vendor 证据必须与离线结果单独记录。
 - desktop 接入前的目标边界：
   `docs/plans/2026-08-17-codex-app-server-lifecycle-adr.md` 与
-  `docs/plans/2026-08-17-agentdeckd-minimum-stable-boundary-design.md`。Issue #3 只完成其中的
-  生命周期切片；#4 streaming/item identity、#5 持久 CLI E2E、#6 RunRecord/diagnostics
-  仍是 M0 阻断。
+  `docs/plans/2026-08-17-agentdeckd-minimum-stable-boundary-design.md`。代码实现包含生命周期、streaming/item identity、持久 CLI 与 RunRecord/diagnostics；
+  M0 已完成限定环境验收；GPUI desktop 尚未接入。
 
 ## 状态定义
 
@@ -49,19 +52,19 @@ README、架构、诊断和计划文档用于解释目标与不变量；当文�
 | daemon runtime | JSONL stdin/stdout 与单 writer | 较完整 | 能解析 `ClientCommand`，统一串行写出 streaming event 与 admin reply；坏 JSON 会返回结构化错误。 | `agentdeckd/src/runtime/hub.rs` |
 | daemon runtime | lifecycle 有序且不阻塞 admin | 较完整 | stdin loop 只把 SessionStart/TurnStart/TurnCancel/SessionClose 入一个有序 worker，防止生命周期命令互相越过；admin 与 history 留在独立路径，因此慢 handshake/control 期间 Ping 仍可响应，history 有总 timeout。stdin EOF 会先 drain 已读 lifecycle 命令，再关闭并等待 retained session；stdout 写失败则立即停止 intake、丢弃尚未执行的 lifecycle 命令、关闭/回收已 retained session，并由 daemon 返回原始 I/O error。 | `agentdeckd/src/runtime/hub.rs` |
 | daemon runtime | adapter 注册与 typed router | 较完整 | Codex、Claude Code 通过同一 `Agent` trait 注册，按 `AgentKind` 和 `sessionId` 路由；两家实现互不依赖。 | `agentdeckd/src/agent.rs`、`agentdeckd/src/runtime/router.rs` |
-| daemon runtime | session 生命周期与并发约束 | 部分 | protocol v3 由 caller 提供 `sessionId` / `turnId`；router 预登记 session，Codex adapter 同时只允许一个 live session，owner 同时只接受一个 in-flight turn，并拒绝复用该 session 已接受的 `turnId`。owner 在 direct child wait、Unix 进程组有界轮询至 `ESRCH` 与 stderr pump join 后报告 cleanup；RuntimeHub 在共享 session-admission 临界区内登记 terminal tombstone、清 router/handle、释放 confirmed active slot 并入队唯一 `SessionClosed`，随后才允许 replacement start，因此新 session 不会越过旧 terminal 或撞到旧 slot。`SessionClosed` 后不再发该 ID 的 lifecycle/control error，也不复用该 ID。无法确认 cleanup 时发 failed terminal、poison 并退出 daemon，不释放 slot 或接受后续 session。确定性测试覆盖 EOF、进程组探测超时/错误和 cleanup failure；尚缺持久 CLI/真实 vendor 的同 PID 多轮验收，Claude Code 仍是 one-shot 路径。 | `agentdeck-protocol/src/trunk.rs`、`agentdeckd/src/codex/session.rs`、`agentdeckd/src/runtime/hub.rs`、`agentdeckd/src/runtime/router.rs` |
-| daemon runtime | turn cancel / session close | 部分 | Codex `TurnCancel` 会保留 pending cancel，取得 vendor turn id 后发送 `turn/interrupt`；健康 terminal 回 Ready，不把 cancel 当 close。若权威 terminal 先于 rejected interrupt response 到达，owner 会消费已缓存 terminal，避免误报 fatal 或产生双 terminal。`SessionClose` 才关闭 stdin、必要时终止进程组，回收 direct child 并确认进程组消失。one-shot CLI 会在 `TurnFinished` 后自动发送 close，并在匹配的 clean `SessionClosed` 与 daemon wait 后才交付 turn terminal；但 CLI 尚无持久 cancel/后续 turn 控制入口，真实 interrupt/close 未验收，Claude Code 也未迁移到这一生命周期。 | `agentdeck-cli/src/client.rs`、`agentdeckd/src/codex/session.rs`、`agentdeckd/src/codex/adapter.rs`、`agentdeckd/src/runtime/hub.rs` |
+| daemon runtime | session 生命周期与并发约束 | 部分 | protocol v4 使用 caller-owned sessionId/turnId；同一 Codex owner 复用 child/thread，并拒绝并发或重复 turn。SessionClosed 在 child wait、进程组消失、pump join 和路由清理后发出；cleanup 失败 poison 并退出。Codex 真实四轮在临时配置覆盖环境通过，同 PID/threadId 与单次 spawn 已读回；Claude Code 仍为 one-shot。 | `agentdeckd/src/codex/session.rs`、`agentdeck-cli/tests/support/live.rs` |
+| daemon runtime | turn cancel / session close | 部分 | Codex TurnCancel 使用官方 interrupt，健康会话回 Ready；SessionClose 才回收 child。session live 暴露完整控制命令，run/continue 保留自动 close/wait；真实四轮已证明第三轮取消后第四轮成功，最终 child/进程组消失。证据限定于下述覆盖环境，Claude Code 尚未迁移。 | `agentdeckd/src/codex/session.rs`、`agentdeck-cli/src/commands.rs` |
 | admin | ping、协议版本/schema、agent list/capabilities | 较完整 | 已有 typed command 和 CLI 入口，回复由单 writer 输出。 | `agentdeckd/src/runtime/hub.rs`、`agentdeck-cli/src/` |
 | admin | selfcheck | 部分 | `agentdeckd --selfcheck` 验证数据目录、诊断和 record 写入；CLI selfcheck 验证 daemon IPC 与静态 adapter 注册。两者都不证明 vendor CLI 登录、握手、真实 turn 或历史来源健康。 | `agentdeckd/src/main.rs`、`agentdeckd/src/runtime/hub.rs` |
-| Codex | app-server 进程与 JSON-RPC | 部分 | locator 解析并固定一个绝对 binary，`--version` 与 `app-server --listen stdio://` 使用同一路径且严格要求 0.145.0。单 owner/reader/RPC allocator 串行关联 initialize、thread、turn 和 interrupt；live 与 short-lived 路径都会按官方 `ClientNotification.json` 在 initialize response 后发送 `initialized`。malformed JSON、未关联 response、EOF 和 unsupported server request 有显式失败路径；live close 在 direct child wait 后还会确认 Unix 进程组消失并 join stderr pump。fake 证据已落地，但真实 session/prompt 未运行。 | `agentdeckd/src/codex/app_server.rs`、`agentdeckd/src/codex/session.rs`、`protocol/ClientNotification.json` |
-| Codex | 新 session | 部分 | `SessionStart` 先完成 initialize → initialized → thread/start|resume，再发 `SessionStarted`、`SessionCapabilities`；可携 initial turn，且启动前校验 caller ID、cwd 和固定 M0 options。启动失败不再伪造 session ready。真实 Codex 登录、握手和 prompt 本轮未验收。 | `agentdeckd/src/codex/adapter.rs`、`agentdeckd/src/codex/session.rs` |
-| Codex | resume 与 live 后续 turn | 部分 | `resumeThreadId` 走新 session 的 `thread/resume`，并显式携带 caller `cwd`、`sandbox=read-only`、`approvalPolicy=never`，响应 thread id 不一致会失败；Ready 后的 `TurnStart` 在同一 owner/connection/thread 上发起顺序下一轮。确定性 fake 覆盖 resume 参数与同 connection 两轮。当前 CLI `session continue` 仍会新建 daemon/session，且没有顶层 live `TurnStart`，所以不构成持久多轮真实 E2E。 | `agentdeck-cli/src/client.rs`、`agentdeckd/src/codex/session.rs` |
-| Codex | 固定 M0 options / capabilities | 部分 | 只接受 `approvalPolicy=never`、`sandbox=read-only`、`reasoningEffort=medium`、`persistApproval=false`、无 MCP；其他值在 spawn 前返回 `unsupported-session-options`。capability feature set 为空，仅 vendor block 报告该固定子集，未宣称 #4 之后的能力。真实 vendor 对这组参数尚未验收。 | `agentdeckd/src/codex/adapter.rs`、`agentdeckd/src/codex/capabilities.rs` |
+| Codex | app-server 进程与 JSON-RPC | 部分 | locator 解析并固定一个绝对 binary，`--version` 与 `app-server --listen stdio://` 使用同一路径且严格要求 0.145.0。单 owner/reader/RPC allocator 串行关联 initialize、thread、turn 和 interrupt；live 与 short-lived 路径都会按官方 `ClientNotification.json` 在 initialize response 后发送 `initialized`。malformed JSON、未关联 response、EOF 和 unsupported server request 有显式失败路径；live close 在 direct child wait 后还会确认 Unix 进程组消失并 join stderr pump。临时 launcher exec 固定 binary 并覆盖配置后，真实四轮已通过；默认本机配置仍阻断 thread/start。 | `agentdeckd/src/codex/app_server.rs`、`agentdeckd/src/codex/session.rs`、`protocol/ClientNotification.json` |
+| Codex | 新 session | 部分 | `SessionStart` 先完成 initialize → initialized → thread/start|resume，再发 `SessionStarted`、`SessionCapabilities`；可携 initial turn，且启动前校验 caller ID、cwd 和固定 M0 options。临时配置覆盖环境已验证原生登录态下的新 thread、握手和 prompt；默认配置的 thread/start 失败未伪造 session ready，cleanup 已确认。 | `agentdeckd/src/codex/adapter.rs`、`agentdeckd/src/codex/session.rs` |
+| Codex | resume 与 live 后续 turn | 部分 | resume 验证 threadId 和固定选项；session live 可在同一 daemon/owner/thread 上启动后续 turn。限定环境的真实四轮及 one-shot run/continue 均通过；run/continue 仍各自新建 daemon，该结果不证明原 session 全部启动配置恢复。 | `agentdeckd/src/codex/session.rs`、`agentdeck-cli/tests/e2e_codex.rs` |
+| Codex | 固定 M0 options / capabilities | 部分 | 仅接受 never/read-only/medium、persistApproval=false、无 MCP；只声明 StreamingMessages。审批、工具展示和正式 coding session 默认配置不在 M0 范围。 | `agentdeckd/src/codex/adapter.rs`、`agentdeckd/src/codex/capabilities.rs` |
 | Codex | 消息、reasoning、plan、shell、diff、tool 翻译 | 部分 | 常见 completed item 能映射到中立类型，未知 item 有受限 raw 降级；若干 progress、usage 和 vendor panel 信息未进入主干。 | `agentdeckd/src/codex/translate.rs` |
-| Codex | 客户端可见实时 delta | 未接通 | translator 在 daemon 内累积 delta，只在 item completed 时发一次完整 `AgentItem`；客户端看不到 token/tool progress 流。 | `agentdeckd/src/codex/translate.rs` |
-| Codex | turn 终态 | 部分 | lifecycle owner 从 `turn/completed.params.turn` 读取 id/status/duration，把 completed/failed/interrupted 映射为 succeeded/failed/canceled；`inProgress` 和未知状态按 fatal protocol failure 收口。每个已接受 turn 使用 typed `TurnFinished(outcome,nextState)`；旧 `TurnComplete` 仅留给未迁移的 Claude Code。token usage 仍未进入 summary，真实 failed/cancel 状态尚未用 vendor 验收。 | `agentdeckd/src/codex/session.rs`、`protocol/ServerNotification.json` |
+| Codex | 客户端可见累计 streaming | 较完整 | 每个非空 assistant delta 发累计快照，带官方 itemId、caller turnId 和 streaming/completed；最终文本不回退、completed 不重复，终态清空缓存。官方形状 fixture、实际 CLI fake 和限定环境的真实四轮链路均覆盖跨轮复用及顺序。 | `agentdeckd/src/codex/translate.rs`、`agentdeckd/src/codex/session.rs` |
+| Codex | turn 终态 | 部分 | lifecycle owner 从 `turn/completed.params.turn` 读取 id/status/duration，把 completed/failed/interrupted 映射为 succeeded/failed/canceled；`inProgress` 和未知状态按 fatal protocol failure 收口。每个已接受 turn 使用 typed `TurnFinished(outcome,nextState)`；旧 `TurnComplete` 仅留给未迁移的 Claude Code。真实 succeeded/canceled 已在限定环境验收；真实 failed turn 仍未验收，token usage 尚未进入 summary。 | `agentdeckd/src/codex/session.rs`、`protocol/ServerNotification.json` |
 | Codex | command/file/permission 审批 | 未接通 | M0 固定 `approvalPolicy=never`，capabilities 不宣称 approval，`submit_decision` 明确返回不支持。owner 收到任意带 id 的 server request 会回匹配 JSON-RPC not-supported error，并 interrupt/fail 当前 turn，避免静默悬挂；交互式 typed approval 留在 M0 外。 | `agentdeckd/src/codex/adapter.rs`、`agentdeckd/src/codex/session.rs` |
-| Codex | history list/read | 部分 | 使用官方 `thread/list`、`thread/read(includeTurns=true)`，短生命周期 app-server 有方法级和总 timeout，并按已提交的官方 `ClientNotification.json` 在 initialize response 后发送 `initialized`；仍缺本轮真实 history E2E。 | `agentdeckd/src/codex/history.rs`、`agentdeckd/src/codex/app_server.rs`、`protocol/ClientNotification.json` |
+| Codex | history list/read | 部分 | 使用官方 `thread/list`、`thread/read(includeTurns=true)`，短生命周期 app-server 有方法级和总 timeout，并按已提交的官方 `ClientNotification.json` 在 initialize response 后发送 `initialized`；本轮真实 list 首轮超时，默认 500 条复验通过但耗时 27.57 秒，五页聚合接近 deadline，稳定性风险保留；read 尚无本轮真实验收。 | `agentdeckd/src/codex/history.rs`、`agentdeckd/src/codex/app_server.rs`、`protocol/ClientNotification.json` |
 | Codex | history archive/unarchive/rename | 未接通 | 三项当前都返回明确的 `codex-*-not-supported` 错误。 | `agentdeckd/src/codex/history.rs` |
 | Claude Code | 安装、版本、认证预检 | 部分 | 有结构化 failure code 和启动前探测；selfcheck 本身不执行完整真实 turn。 | `agentdeckd/src/claude_code/auth.rs`、`agentdeckd/src/claude_code/capabilities.rs` |
 | Claude Code | 新 session | 部分 | 能以 `--print`、stream-json 启动并翻译结果；真实 vendor 行为仍受本机版本、登录及门控 E2E 约束。 | `agentdeckd/src/claude_code/adapter.rs` |
@@ -74,33 +77,22 @@ README、架构、诊断和计划文档用于解释目标与不变量；当文�
 | Claude Code | history archive/unarchive | 未接通 | archive 对普通 print session 没有稳定原生语义，可能返回不支持；unarchive 当前只是无效果 Ack。 | `agentdeckd/src/claude_code/history.rs`、`agentdeckd/src/claude_code/adapter.rs` |
 | shared history | 跨 agent list | 较完整 | 两个来源并发查询、独立 deadline、best-effort 合并、按最近活动排序并应用总 limit；全部失败与合法空结果可区分。 | `agentdeckd/src/runtime/router.rs` |
 | vendor control | session 内控制更新 | 骨架 | typed payload 与路由存在；Codex 返回 requires-new-turn，CC 多数控制返回 requires-new-turn 或 not-supported。 | 两个 adapter 的 `submit_vendor_control` |
-| observability | run record | 骨架 | JSONL、脱敏、header/event/footer helper 与测试存在；生产 RuntimeHub 和 adapter 事件流尚未调用 `RunRecord`。 | `agentdeckd/src/record.rs` |
-| observability | diagnostic log/report | 骨架 | 有结构化日志、数据目录和聚合报告；生产写入主要覆盖 daemon 启停/selfcheck，尚未贯穿 session、adapter、approval、history，`diagnosticRef` 多为空。 | `agentdeckd/src/diag.rs`、`agentdeckd/src/main.rs` |
+| observability | run record | 较完整 | router 在 spawn 前打开 session record，单 writer 按事件顺序 append，SessionClosed 后写 footer；open/append/close 失败发可定位的非终态告警，CLI 仍等待真实 terminal。JSONL/脱敏/数据目录格式保持不变。 | `agentdeckd/src/runtime/router.rs`、`agentdeckd/src/runtime/hub.rs`、`agentdeckd/src/record.rs` |
+| observability | diagnostic log/report | 部分 | Codex lifecycle 已覆盖 spawn/version/PID、RPC、turn outcome、interrupt、cleanup；failure diagnosticRef 对应实际 runId/eventSeq。写失败保留 stderr fallback；审批/history 等 M0 外路径尚未贯通。 | `agentdeckd/src/diag.rs`、`agentdeckd/src/codex/session.rs` |
 | quality | 默认测试离线安全 | 较完整 | 真实 session、prompt、history、auth 和 vendor process 测试统一只认 `AGENTDECK_E2E=1`；普通 version/auth probe 使用可注入 fake。marker tripwire 通过临时 HOME 隔离用户 vendor history 与默认 AgentDeck data dir，并验证标准 workspace tests 不执行 PATH 中的 vendor shim；macOS workflow 已配置该门禁，首个 hosted run 已在 2026-08-18 通过。普通 passed 仍不代表真实 E2E 已执行。 | `agentdeckd/tests/support/mod.rs`、`scripts/verify-offline-tests.sh`、`.github/workflows/offline-ci.yml` |
-| CLI | admin、session、history | 部分 | ping/selfcheck、协议、agent、run/continue 和 history 已暴露；run/continue 已生成 protocol v3 `SessionStart` 和 caller-owned ID。Codex one-shot turn 完成后会自动执行 `SessionClose` / 等待 `SessionClosed` / 回收 daemon；只有 daemon clean exit 才交付成功 terminal，非零退出或有界 shutdown 失败改为 `daemon-shutdown-failed`。每个 CLI 调用仍新建 daemon，顶层没有可交互的 live `TurnStart`、`TurnCancel`、手动 `SessionClose`、审批或 vendor-control，不能作为同 session 多轮生命周期驱动。 | `agentdeck-cli/src/main.rs`、`agentdeck-cli/src/client.rs`、`agentdeck-cli/src/commands.rs`、`agentdeck-cli/src/transport.rs` |
+| CLI | admin、session、history | 部分 | session live 在一个 daemon 连接上双向转发 typed JSONL，支持顺序多轮、cancel、close、Ping，EOF 有序关闭。run/continue 保持 one-shot；record_write_failed 不终止健康会话。live 是协议驱动入口，尚无交互式审批产品界面。 | `agentdeck-cli/src/commands.rs`、`agentdeck-cli/src/client.rs`、`agentdeck-cli/tests/session_live.rs` |
 | product integration | GPUI desktop → daemon | 未接通 | 当前桌面 bundle 不携带、不启动、不连接 `agentdeckd`，也没有会话、审批或历史 UI。 | `README.md`、`docs/QUALITY.md`、`agentdeck-desktop/` |
 
-## 关键缺口
+## 当前验收边界
 
-以下缺口会阻断“desktop 接入前，先稳定一条 daemon 最小完整功能”：
-
-1. **#4：事件更新契约尚未闭合。** 两家 adapter 都只发 completed snapshot；协议中的
-   `AgentItem` 没有稳定 `itemId` / streaming state，客户端不能可靠更新同一条消息或
-   工具执行。Issue #3 的 `TurnFinished` 不能替代这层内容流。
-2. **#5：缺少持久 client 与真实生命周期证据。** Issue #3 owner 已能在一个 connection
-   上执行顺序多轮、interrupt 和 close，但当前 CLI 每次命令都会新建 daemon/session。
-   one-shot CLI 的自动 `SessionClose` / `SessionClosed` / daemon wait 已有确定性单测，
-   但本轮没有运行真实 Codex session/prompt，因此尚未证明真实同 PID/threadId 两轮、
-   cancel 后续轮和持久连接最终回收。
-3. **#6：可观测链没有接入生产运行路径。** `RunRecord` helper 与 diagnostic report
-   存在，Issue #3 的部分错误也能携带 session-scoped `diagnosticRef`；但生命周期事件
-   尚未写入同一个 run record，引用也不能回读到实际 diagnostic 行。M0 的记录与关联
-   diagnostics 仍未验收。
-4. **M0 外能力仍未稳定。** Codex 交互式 approval 被明确关闭，Claude Code decision
-   wire 仍缺真实验证；CLI 也没有审批回写或 vendor-control 的可操作闭环。capabilities
-   已收紧，后续不得仅因旧 translator/helper 仍存在而重新放宽。
-5. **产品接入仍为空。** GPUI desktop 尚未携带或连接 daemon；只有 #4/#5/#6 和完整 M0
-   门禁通过后才允许开始 typed local client 接入。
+- #4 的累计 streaming、#5 的持久 CLI 和 #6 的生产记录/诊断已经实现，离线 CLI 用例覆盖同一进程四轮、取消恢复、EOF 和记录写失败。
+- 真实四轮 M0 已在 Codex 0.145.0、当前 checkout daemon、`AGENTDECK_E2E=1` 下通过（58.39 秒）。临时 PATH launcher 使用 `-c features.context_management=false` 覆盖本机不兼容配置；全局配置未改，原生登录未复制。
+- 默认本机配置的 `features.context_management` 是 table，0.145.0 要求 bool：initialize 成功后 thread/start 失败，失败路径 cleanup 已确认。该结果不是 failed 模型 turn；覆盖环境的成功也不表示默认环境已修复。
+- 真实四轮为 succeeded/succeeded/canceled/succeeded，streaming 快照数为 29/30/2/28；PID `9186`、threadId `01a0c1d3-2841-75e1-93f7-fb678dd68b4a` 全程复用。唯一 SessionClosed(closed)、完整 record/footer、IPC 同序和进程组消失断言通过，diagnostics report 已生成。
+- 验收回执目录：`/tmp/agentdeck-m0-real-launcher-efmchgel/`；record 与 diagnostics：`/var/folders/zy/fn4lmxbx1cd5flcp81mk2xx80000gn/T/agentdeck-codex-live-e2e-9179-1789958234236367000/`。其余 7 项 Codex E2E 中，agent list、capabilities、Ping、selfcheck、one-shot run、continue 通过，history list 首轮在 30 秒总 deadline 超时。
+- history list 同条件复验返回 500 条并通过（27.57 秒）；独立官方探测确认 500 条分五页，总耗时 25.64 秒，接近 28 秒工作截止时间。8 项均有单项通过回执，但首轮套件不是全绿，历史查询时延风险未修复；真实 failed turn 仍未验收。
+- Codex 交互审批、Claude Code lifecycle/partial streaming、history 管理语义和远程能力仍在 M0 外。
+- GPUI desktop 尚未连接 daemon，后端验证通过也不等于桌面产品闭环完成。
 
 ## 证据与验证边界
 
@@ -140,7 +132,7 @@ AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" \
   swift test
   ```
 
-  这些测试用于发现 protocol v3/schema 漂移、错误的 binary/argv/握手顺序、session owner
+  这些测试用于发现 protocol v4/schema 漂移、错误的 binary/argv/握手顺序、session owner
   状态机与 RPC 关联、路由/terminal 顺序、固定 option/resume 参数漂移和 Swift mirror
   漂移。Issue #3 当前确定性用例还覆盖同 connection 两轮、interrupt 后复用、running
   close、malformed/unmatched/EOF、handshake failure、unsupported server request、terminal
@@ -151,7 +143,7 @@ AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" \
   `protocol/CODEX_VERSION.txt` 不匹配的版本”。生产路径是否能在当前用户登录态完成
   session，仍只能由单独授权的真实门禁回答。
 - daemon/CLI selfcheck 和 diagnostics report 仍只用于 plumbing 排查。它们不证明 vendor
-  可用、M0 record 已接线或真实 session 已闭环。
+  可用或真实 session 已闭环；生产记录由实际 CLI integration 另行验收。
 
 ### 真实链路必须额外证明什么
 
@@ -172,11 +164,9 @@ AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" AGENTDECK_E2E=1 \
   值都在 vendor I/O 前提前返回。真实验证仍必须单独授权并显式使用 `1`。
 - 未启用真实门禁时显示 passed 可能只是测试提前返回；该结果不能作为真实 Codex 或
   Claude Code 链路证据。
-- E2E 当前主要验证 one-shot run/continue 与响应契约形态；`continue` 会新建 CLI、daemon
-  和 vendor session-scoped child，只按已知 `threadId` resume。Codex one-shot 会在内部
-  自动 close/wait，但它不证明同一 live session 的后续 `TurnStart`、流式 delta、取消后
-  继续、最终持久连接回收、审批、配置恢复或所有历史管理语义；这些属于 #5 的持久
-  driver 验收。
+- `e2e_codex_live_four_turn_lifecycle` 经实际 CLI 验证同 PID/threadId 两轮、第三轮取消、
+  第四轮成功及最终回收，并核对 run record 与 diagnostics。原 one-shot run/continue
+  仍只证明单轮和新进程 resume；审批、配置恢复及其他历史管理语义是独立验收范围。
 - `cargo run -p agentdeck-desktop -- --selfcheck` 只验证 GPUI/Metal/窗口初始化，与
   daemon 或 vendor 链路无关。
 

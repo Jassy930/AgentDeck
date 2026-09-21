@@ -25,6 +25,7 @@
 //! `ServerEvent::Reply` later without breaking on-wire behavior.
 
 use crate::agent::{AgentEventSender, AgentSessionHandle};
+use crate::diag::{self, DiagnosticEvent};
 use crate::runtime::router::AgentRouter;
 #[cfg(test)]
 use agentdeck_protocol::HistoryRequest;
@@ -135,8 +136,13 @@ impl RuntimeHub {
         let retiring_sessions = Arc::new(Mutex::new(HashSet::new()));
         let session_admission = Arc::new(Mutex::new(()));
 
-        let mut writer_handle =
-            tokio::spawn(writer_task(stdout, events_rx, admin_rx, poison_tx.clone()));
+        let mut writer_handle = tokio::spawn(writer_task(
+            stdout,
+            events_rx,
+            admin_rx,
+            poison_tx.clone(),
+            Arc::clone(&self.router),
+        ));
         let lifecycle_handle = tokio::spawn(lifecycle_worker(
             Arc::clone(&self.router),
             Arc::clone(&self.sessions),
@@ -707,7 +713,7 @@ async fn supervise_session(
                 let error = ProtocolError {
                     code: "session-exit-signal-dropped".into(),
                     message: "session owner exited without confirming cleanup".into(),
-                    diagnostic_ref: Some(session_id.0.clone()),
+                    diagnostic_ref: None,
                 };
                 retiring_sessions.lock().await.insert(session_id.clone());
                 let _ = poison_tx.send(true);
@@ -737,6 +743,7 @@ async fn writer_task<W>(
     mut events_rx: mpsc::Receiver<ServerEvent>,
     mut admin_rx: mpsc::Receiver<String>,
     stop_tx: watch::Sender<bool>,
+    router: Arc<AgentRouter>,
 ) -> io::Result<()>
 where
     W: AsyncWrite + Unpin + Send + 'static,
@@ -755,11 +762,7 @@ where
                             // admin channel closed; keep draining events
                             // until that side also closes.
                             while let Some(event) = events_rx.recv().await {
-                                let line = match serde_json::to_string(&event) {
-                                    Ok(s) => s,
-                                    Err(_) => continue,
-                                };
-                                write_line(&mut stdout, line.as_bytes()).await?;
+                                write_event(&mut stdout, &router, event).await?;
                             }
                             break;
                         }
@@ -768,11 +771,7 @@ where
                 maybe_event = events_rx.recv() => {
                     match maybe_event {
                         Some(event) => {
-                            let line = match serde_json::to_string(&event) {
-                                Ok(s) => s,
-                                Err(_) => continue,
-                            };
-                            write_line(&mut stdout, line.as_bytes()).await?;
+                            write_event(&mut stdout, &router, event).await?;
                         }
                         None => {
                             // events channel closed; keep draining admin
@@ -790,9 +789,14 @@ where
     }
     .await;
     if result.is_err() {
-        // Signal before dropping the receivers so an in-flight lifecycle
-        // operation cannot resume and drain queued starts first.
+        // Stop intake immediately, but preserve cleanup events after the
+        // client disappears so the record still has its terminal and footer.
         let _ = stop_tx.send(true);
+        drop(admin_rx);
+        let mut sink = tokio::io::sink();
+        while let Some(event) = events_rx.recv().await {
+            let _ = write_event(&mut sink, &router, event).await;
+        }
     }
     result
 }
@@ -801,6 +805,82 @@ async fn write_line<W: AsyncWrite + Unpin>(stdout: &mut W, body: &[u8]) -> io::R
     stdout.write_all(body).await?;
     stdout.write_all(b"\n").await?;
     stdout.flush().await
+}
+
+async fn write_event<W: AsyncWrite + Unpin>(
+    stdout: &mut W,
+    router: &AgentRouter,
+    mut event: ServerEvent,
+) -> io::Result<()> {
+    let session_id = match &event {
+        ServerEvent::SessionStarted { session_id, .. }
+        | ServerEvent::SessionCapabilities { session_id, .. }
+        | ServerEvent::AgentItem { session_id, .. }
+        | ServerEvent::ActionRequest { session_id, .. }
+        | ServerEvent::TurnStarted { session_id, .. }
+        | ServerEvent::TurnFinished { session_id, .. }
+        | ServerEvent::SessionClosed { session_id, .. }
+        | ServerEvent::TurnComplete { session_id, .. }
+        | ServerEvent::VendorControl { session_id, .. }
+        | ServerEvent::VendorPanelEvent { session_id, .. } => Some(session_id.clone()),
+        ServerEvent::Error { session_id, .. } => session_id.clone(),
+    };
+    if let Some(session_id) = session_id {
+        let (name, error) = match &mut event {
+            ServerEvent::TurnFinished { error, .. } => ("turn_finished", error.as_mut()),
+            ServerEvent::SessionClosed { error, .. } => ("session_closed", error.as_mut()),
+            ServerEvent::Error { error, .. } => ("session_error", Some(error)),
+            _ => ("", None),
+        };
+        if let Some(error) = error {
+            if error.diagnostic_ref.is_none() {
+                error.diagnostic_ref = Some(diag::log_session(
+                    &session_id.0,
+                    DiagnosticEvent::new(name).level("error").code(&error.code),
+                ));
+            }
+        }
+        if let ServerEvent::SessionClosed {
+            agent_kind,
+            thread_id,
+            outcome,
+            ..
+        } = &event
+        {
+            let mut diagnostic = DiagnosticEvent::new("session_closed")
+                .agent_kind(*agent_kind)
+                .detail(serde_json::json!({"outcome": outcome}).to_string());
+            if let Some(thread_id) = thread_id {
+                diagnostic = diagnostic.thread_id(&thread_id.0);
+            }
+            diag::log_session(&session_id.0, diagnostic);
+        }
+        let failure = {
+            let mut records = router.records.lock().await;
+            let append_error = records
+                .get(&session_id)
+                .and_then(|record| record.append_event(&event).err());
+            let close_error = if matches!(
+                event,
+                ServerEvent::SessionClosed { .. } | ServerEvent::TurnComplete { .. }
+            ) {
+                records
+                    .remove(&session_id)
+                    .and_then(|record| record.close().err())
+            } else {
+                None
+            };
+            append_error.or(close_error)
+        };
+        if let Some(reason) = failure {
+            // A terminal must remain the final wire event for its session.
+            let warning = crate::runtime::router::record_warning(&session_id, reason);
+            let line = serde_json::to_vec(&warning).map_err(io::Error::other)?;
+            write_line(stdout, &line).await?;
+        }
+    }
+    let line = serde_json::to_vec(&event).map_err(io::Error::other)?;
+    write_line(stdout, &line).await
 }
 
 #[cfg(test)]
@@ -818,10 +898,12 @@ mod tests {
         start_calls: AtomicUsize,
         close_calls: AtomicUsize,
         cleanup_confirmed: bool,
-        wait_for_event_receiver_close: bool,
+        wait_for_write_failure: Option<Arc<Notify>>,
     }
 
-    struct FailingWriter;
+    struct FailingWriter {
+        write_failure: Arc<Notify>,
+    }
 
     struct SpontaneousFailureStub {
         active_session: std::sync::Mutex<Option<SessionId>>,
@@ -836,6 +918,7 @@ mod tests {
             _: &mut std::task::Context<'_>,
             _: &[u8],
         ) -> std::task::Poll<io::Result<usize>> {
+            self.write_failure.notify_one();
             std::task::Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "deterministic stdout failure",
@@ -994,8 +1077,8 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            if self.wait_for_event_receiver_close {
-                events.closed().await;
+            if let Some(write_failure) = &self.wait_for_write_failure {
+                write_failure.notified().await;
             }
             let pump = tokio::spawn(std::future::pending::<()>());
             let abort_handle = pump.abort_handle();
@@ -1186,7 +1269,7 @@ mod tests {
             start_calls: AtomicUsize::new(0),
             close_calls: AtomicUsize::new(0),
             cleanup_confirmed: true,
-            wait_for_event_receiver_close: false,
+            wait_for_write_failure: None,
         });
         let mut router = AgentRouter::new();
         let agent: DynAgent = stub.clone();
@@ -1234,12 +1317,14 @@ mod tests {
 
     #[tokio::test]
     async fn stdout_write_failure_stops_intake_and_reaps_retained_session() {
+        let write_failure = Arc::new(Notify::new());
+        let session_id = format!("writer-failure-{}", uuid::Uuid::new_v4());
         let stub = Arc::new(EofLifecycleStub {
             exit_sender: std::sync::Mutex::new(None),
             start_calls: AtomicUsize::new(0),
             close_calls: AtomicUsize::new(0),
             cleanup_confirmed: true,
-            wait_for_event_receiver_close: true,
+            wait_for_write_failure: Some(Arc::clone(&write_failure)),
         });
         let mut router = AgentRouter::new();
         let agent: DynAgent = stub.clone();
@@ -1252,7 +1337,7 @@ mod tests {
         let (mut client_to_daemon, daemon_stdin) = duplex(4096);
         let queued_input = format!(
             "{}\n{}\n",
-            serde_json::to_string(&eof_session_start("writer-failure-session")).unwrap(),
+            serde_json::to_string(&eof_session_start(&session_id)).unwrap(),
             serde_json::to_string(&eof_session_start("must-not-start-after-writer-failure"))
                 .unwrap(),
         );
@@ -1260,7 +1345,7 @@ mod tests {
             .write_all(queued_input.as_bytes())
             .await
             .unwrap();
-        let hub_task = tokio::spawn(hub.run(daemon_stdin, FailingWriter));
+        let hub_task = tokio::spawn(hub.run(daemon_stdin, FailingWriter { write_failure }));
 
         let error = tokio::time::timeout(Duration::from_secs(2), hub_task)
             .await
@@ -1279,6 +1364,37 @@ mod tests {
             retained_sessions.lock().await.is_empty(),
             "run must not return while a failed-writer session remains retained"
         );
+        let record_path = crate::record::record_dir()
+            .unwrap()
+            .join(format!("{session_id}.jsonl"));
+        let record: Vec<serde_json::Value> = std::fs::read_to_string(record_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            record
+                .iter()
+                .filter(|line| line["type"] == "sessionStarted")
+                .count(),
+            1
+        );
+        assert_eq!(
+            record
+                .iter()
+                .filter(|line| line["type"] == "sessionClosed")
+                .count(),
+            1
+        );
+        assert_eq!(
+            record
+                .iter()
+                .filter(|line| line["kind"] == "runFooter")
+                .count(),
+            1
+        );
+        assert_eq!(record[record.len() - 2]["type"], "sessionClosed");
+        assert_eq!(record.last().unwrap()["kind"], "runFooter");
     }
 
     #[tokio::test]
@@ -1378,7 +1494,7 @@ mod tests {
             start_calls: AtomicUsize::new(0),
             close_calls: AtomicUsize::new(0),
             cleanup_confirmed: false,
-            wait_for_event_receiver_close: false,
+            wait_for_write_failure: None,
         });
         let mut router = AgentRouter::new();
         let agent: DynAgent = stub.clone();
@@ -1445,7 +1561,7 @@ mod tests {
             start_calls: AtomicUsize::new(0),
             close_calls: AtomicUsize::new(0),
             cleanup_confirmed: true,
-            wait_for_event_receiver_close: false,
+            wait_for_write_failure: None,
         });
         let mut router = AgentRouter::new();
         let agent: DynAgent = stub.clone();
@@ -1553,7 +1669,7 @@ mod tests {
             start_calls: AtomicUsize::new(0),
             close_calls: AtomicUsize::new(0),
             cleanup_confirmed: false,
-            wait_for_event_receiver_close: false,
+            wait_for_write_failure: None,
         });
         let mut router = AgentRouter::new();
         let agent: DynAgent = stub.clone();
@@ -1712,7 +1828,7 @@ mod tests {
         let sessions_changed = Arc::new(Notify::new());
 
         supervise_session(
-            router,
+            Arc::clone(&router),
             Arc::clone(&sessions),
             session_id.clone(),
             handle,
@@ -1734,6 +1850,9 @@ mod tests {
             "daemon poison must happen-before SessionClosed visibility"
         );
         assert!(!sessions.lock().await.contains_key(&session_id));
+        let (mut output, input) = duplex(4096);
+        write_event(&mut output, &router, terminal).await.unwrap();
+        let terminal = read_server_event(&mut BufReader::new(input)).await;
         assert!(matches!(
             terminal,
             ServerEvent::SessionClosed {
@@ -1749,7 +1868,7 @@ mod tests {
             } if terminal_session_id == session_id
                 && terminal_thread_id == thread_id
                 && code == "session-exit-signal-dropped"
-                && diagnostic_ref == session_id.0
+                && diagnostic_ref.starts_with(&format!("{}:", session_id.0))
         ));
         assert!(
             matches!(

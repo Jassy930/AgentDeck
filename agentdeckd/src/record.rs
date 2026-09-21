@@ -167,6 +167,9 @@ fn is_secret_delimiter(c: char) -> bool {
 /// Append one redacted JSONL line to today's run log. Returns the reason on
 /// failure so the caller can surface a VISIBLE warning (E2) — never silent.
 pub fn try_append(run_id: &str, line: &str) -> Result<(), String> {
+    if std::path::Path::new(run_id).file_name() != Some(OsStr::new(run_id)) {
+        return Err("runId must be a single file name".into());
+    }
     let dir = record_dir().ok_or_else(|| "HOME not set".to_string())?;
     create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
     let mut path = dir;
@@ -177,7 +180,8 @@ pub fn try_append(run_id: &str, line: &str) -> Result<(), String> {
         .open(&path)
         .map_err(|e| format!("open {}: {e}", path.display()))?;
     let safe = redact(line);
-    writeln!(f, "{safe}").map_err(|e| format!("write {}: {e}", path.display()))?;
+    f.write_all(format!("{safe}\n").as_bytes())
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(())
 }
 
@@ -265,6 +269,13 @@ impl RunRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_id_cannot_escape_the_runs_directory() {
+        for id in ["../outside", "/tmp/outside", "nested/run", ".", ""] {
+            assert!(try_append(id, "{}").is_err());
+        }
+    }
 
     #[test]
     fn record_dir_is_app_support_not_project_tree() {
@@ -402,6 +413,9 @@ mod tests {
             session_id: SessionId("sid".into()),
             thread_id: ThreadId("tid".into()),
             agent_kind: AgentKind::Codex,
+            turn_id: agentdeck_protocol::TurnId("turn".into()),
+            item_id: "message".into(),
+            state: agentdeck_protocol::AgentItemState::Completed,
             item: AgentItem::AssistantMessage {
                 text: "hello".into(),
                 meta: AgentItemMeta::default(),

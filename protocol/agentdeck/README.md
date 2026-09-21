@@ -14,7 +14,7 @@
 
 ## actionDecision wire 形态
 
-`ActionDecision` 是 protocol v3 `ClientCommand` 的 typed variant，并包含在 schema：
+`ActionDecision` 是 protocol v4 `ClientCommand` 的 typed variant，并包含在 schema：
 
 ```json
 {

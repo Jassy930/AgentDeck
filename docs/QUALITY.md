@@ -140,7 +140,7 @@ cargo test -p agentdeckd --test codex_adapter_shape
 swift test
 ```
 
-它们具体检测 protocol v3/schema 与 Swift mirror 漂移、不同 binary probe/spawn、错误
+它们具体检测 protocol v4/schema 与 Swift mirror 漂移、不同 binary probe/spawn、错误
 `app-server --listen stdio://` argv、`initialized` 乱序、RPC/turn/session 状态机和
 `SessionClosed` 清理顺序。当前确定性覆盖还包括同 connection 两轮、interrupt 后复用、
 running close、malformed/unmatched/EOF、handshake failure、unsupported request、terminal
@@ -267,12 +267,21 @@ Cargo 测试中显示为 passed 而非 ignored。
 
 **断言策略：** E2E 测试只断言响应的契约形态（消息 kind、必要字段存在、退出码等），不断言 agent 返回的具体文本内容，以避免测试因模型输出变化而 flaky。
 
-**Issue #3 边界：** 当前 CLI `session run` / `session continue` 每次都会启动新的 CLI、
-daemon 和 vendor session-scoped child；continue 只证明新 session 能按已知 `threadId`
-resume。Codex one-shot 在 `TurnFinished` 后会自动发送 `SessionClose`，等到 clean
-`SessionClosed` 和 daemon wait 才返回，但仍不能在同一 live session 发送第二个
-`TurnStart` 或 `TurnCancel`。因此即使真实 `e2e_codex` 通过，也不构成同 PID/threadId
-多轮或 cancel 后继续的 M0 证据；该持久 driver 与真实生命周期验收归 #5。
+**持久 CLI 门禁：** `session live` 读取 typed ClientCommand JSONL，并持有一个 daemon。
+`session_live` integration 用 fake Codex 驱动真实 CLI/daemon 子进程，验证四轮、Ping、取消恢复、EOF、坏输入清理，以及记录 open/append/close 失败不阻断会话。
+离线脚本会先构建当前 daemon 并以绝对路径绑定这些用例。
+
+真实生命周期只运行显式门控的用例：
+
+```bash
+AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" AGENTDECK_E2E=1 \
+  cargo test --locked -p agentdeck-cli --test e2e_codex \
+  e2e_codex_live_four_turn_lifecycle -- --nocapture
+```
+
+该用例经实际 CLI 验证同一 child PID/threadId 的两轮、第三轮取消、第四轮成功、
+SessionClosed 与进程组消失，再读回一个包含全部事件和 footer 的 run record。
+原 run/continue E2E 仍只证明 one-shot/resume，不能替代持久会话验收。
 
 **CI 默认跳过：** workflow 显式 unset `AGENTDECK_E2E`；三组 CLI E2E 和 adapter
 real-vendor shape 路径都会在 vendor I/O 前返回，不需要 vendor 登录。普通 CI passed

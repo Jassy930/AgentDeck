@@ -1,4 +1,4 @@
-//! The agent-neutral IPC protocol — v3.
+//! The agent-neutral IPC protocol — v4.
 //!
 //! All v1 types (IpcMessage, SessionState, Lifecycle, LegacyAgentItem,
 //! LegacyActionRequest, LegacyActionDecision, HistoryThreadSummary,
@@ -18,9 +18,9 @@ pub use trunk::{
     VendorControlPayload, VendorPanelPayload,
 };
 pub use trunk::{
-    AgentItem, AgentItemMeta, DiffFile, DiffStatus, PlanStep, PlanStepStatus, ProtocolError,
-    ServerEvent, SessionId, SessionOutcome, ShellStatus, ThreadId, TurnId, TurnNextState,
-    TurnOutcome, TurnSummary,
+    AgentItem, AgentItemMeta, AgentItemState, DiffFile, DiffStatus, PlanStep, PlanStepStatus,
+    ProtocolError, ServerEvent, SessionId, SessionOutcome, ShellStatus, ThreadId, TurnId,
+    TurnNextState, TurnOutcome, TurnSummary,
 };
 pub use trunk::{DEFAULT_HISTORY_LIST_LIMIT, MAX_HISTORY_LIST_LIMIT, effective_history_list_limit};
 pub use trunk::{
@@ -37,9 +37,9 @@ pub use vendor::codex::{CodexSessionOptions, McpOverride};
 pub use vendor::codex::{CodexVendorControl, CodexVendorPanelEvent};
 
 /// 契约产物版本。改动协议形态时手动 +1，并重生成快照。
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
-/// Aggregate JSON Schema for all v3 wire types. Snapshot-tested against
+/// Aggregate JSON Schema for all v4 wire types. Snapshot-tested against
 /// `protocol/agentdeck/agentdeck-protocol.schema.json`.
 pub fn protocol_schema() -> serde_json::Value {
     use schemars::schema_for;

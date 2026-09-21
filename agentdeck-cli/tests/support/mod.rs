@@ -1,5 +1,7 @@
 #![allow(dead_code)] // Each integration test crate uses only part of this shared helper.
 
+pub mod live;
+
 use std::ffi::OsStr;
 use std::fmt;
 use std::io::{self, Read};

@@ -3,6 +3,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Actual CLI fixtures must execute the daemon built from this checkout.
+cargo build --locked -p agentdeckd --bin agentdeckd
+offline_daemon_bin="$PWD/target/debug/agentdeckd"
+
 offline_root="$(mktemp -d "${TMPDIR:-/tmp}/agentdeck-offline-tests.XXXXXX")"
 offline_bin="$offline_root/bin"
 offline_home="$offline_root/home"
@@ -46,18 +50,19 @@ run_workspace_tests() {
     "RUSTUP_HOME=$rustup_home_dir"
     "PATH=$offline_bin:$PATH"
     "AGENTDECK_OFFLINE_MARKER=$offline_marker"
+    "AGENTDECK_DAEMON_BIN=$offline_daemon_bin"
   )
 
   rm -f "$offline_marker"
 
   printf 'verify-offline-tests: running workspace tests (%s)\n' "$case_name"
   if test "$e2e_value" = "__unset__"; then
-    if ! env -u AGENTDECK_E2E -u AGENTDECK_DAEMON_BIN "${environment[@]}" \
+    if ! env -u AGENTDECK_E2E "${environment[@]}" \
       cargo test --workspace --locked; then
       fail_if_vendor_ran "$case_name" || true
       return 1
     fi
-  elif ! env -u AGENTDECK_DAEMON_BIN "${environment[@]}" \
+  elif ! env "${environment[@]}" \
     "AGENTDECK_E2E=$e2e_value" \
     cargo test --workspace --locked; then
     fail_if_vendor_ran "$case_name" || true
@@ -77,12 +82,13 @@ run_gated_integration_tests() {
     "PATH=$offline_bin:$PATH"
     "AGENTDECK_OFFLINE_MARKER=$offline_marker"
     "AGENTDECK_E2E=$e2e_value"
+    "AGENTDECK_DAEMON_BIN=$offline_daemon_bin"
   )
 
   rm -f "$offline_marker"
 
   printf 'verify-offline-tests: running gated integration tests (%s)\n' "$case_name"
-  if ! env -u AGENTDECK_DAEMON_BIN "${environment[@]}" \
+  if ! env "${environment[@]}" \
     cargo test --locked -p agentdeck-cli \
       --test agent_subcommand_smoke \
       --test diagnostics_report_smoke \
@@ -94,7 +100,7 @@ run_gated_integration_tests() {
     return 1
   fi
 
-  if ! env -u AGENTDECK_DAEMON_BIN "${environment[@]}" \
+  if ! env "${environment[@]}" \
     cargo test --locked -p agentdeckd \
       --test cc_adapter_shape \
       --test codex_adapter_shape \

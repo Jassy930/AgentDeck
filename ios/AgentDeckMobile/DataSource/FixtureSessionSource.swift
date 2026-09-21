@@ -136,6 +136,7 @@ final class FixtureSessionSource: MobileSessionSource {
         emit(SessionStreamElement(
             itemId: "prompt-user-\(seq)",
             event: .agentItem(sessionId: sessionID, threadId: threadId, agentKind: kind,
+                              turnId: "prompt-\(seq)", itemId: "prompt-user-\(seq)", state: .completed,
                               item: .userMessage(text: text, meta: AgentItemMeta()))
         ), sessionID: sessionID, playback: playback)
         let reply = "（fixture 回声）收到：\(text)。真实链路接入后此处为 agent 输出。"
@@ -143,6 +144,7 @@ final class FixtureSessionSource: MobileSessionSource {
         emit(SessionStreamElement(
             itemId: "prompt-reply-\(seq)",
             event: .agentItem(sessionId: sessionID, threadId: threadId, agentKind: kind,
+                              turnId: "prompt-\(seq)", itemId: "prompt-reply-\(seq)", state: .completed,
                               item: .assistantMessage(text: reply, meta: AgentItemMeta()))
         ), sessionID: sessionID, playback: playback)
         await sleepTicks(200)

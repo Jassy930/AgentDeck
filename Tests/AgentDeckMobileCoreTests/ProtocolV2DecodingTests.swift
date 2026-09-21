@@ -40,14 +40,22 @@ final class ProtocolV2DecodingTests: XCTestCase {
 
     func testDecodeAgentItemAssistantMessage() throws {
         let json = """
-        {"type":"agentItem","sessionId":"s1","threadId":"t1","agentKind":"claude_code",
+        {"type":"agentItem","turnId":"turn-1","itemId":"item-1","state":"streaming","sessionId":"s1","threadId":"t1","agentKind":"claude_code",
          "item":{"kind":"assistantMessage","text":"hi","meta":{"vendorExtensions":{}}}}
         """
         let event = try decodeServerEvent(json)
-        guard case let .agentItem(_, _, kind, item) = event else {
+        guard case let .agentItem(_, _, kind, turnId, itemId, state, item) = event else {
             return XCTFail("expected agentItem")
         }
         XCTAssertEqual(kind, .claudeCode)
+        XCTAssertEqual(turnId, "turn-1")
+        XCTAssertEqual(itemId, "item-1")
+        XCTAssertEqual(state, .streaming)
+        let encoded = try JSONEncoder().encode(event)
+        let roundTrip = try JSONDecoder().decode(ServerEvent.self, from: encoded)
+        guard case .agentItem(_, _, _, "turn-1", "item-1", .streaming, _) = roundTrip else {
+            return XCTFail("stream identity did not round trip")
+        }
         guard case let .assistantMessage(text, _) = item else {
             return XCTFail("expected assistantMessage")
         }
@@ -56,12 +64,12 @@ final class ProtocolV2DecodingTests: XCTestCase {
 
     func testDecodeAgentItemShell() throws {
         let json = """
-        {"type":"agentItem","sessionId":"s1","threadId":"t1","agentKind":"codex",
+        {"type":"agentItem","turnId":"turn-1","itemId":"item-1","state":"streaming","sessionId":"s1","threadId":"t1","agentKind":"codex",
          "item":{"kind":"shell","command":"ls","status":"completed","exitCode":0,
                  "durationMs":42,"meta":{"vendorExtensions":{}}}}
         """
         let event = try decodeServerEvent(json)
-        guard case let .agentItem(_, _, _, item) = event,
+        guard case let .agentItem(_, _, _, _, _, _, item) = event,
               case let .shell(cmd, status, exit, dur, _) = item
         else { return XCTFail("expected shell agentItem") }
         XCTAssertEqual(cmd, "ls")

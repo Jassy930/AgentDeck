@@ -3,6 +3,16 @@ import Foundation
 import XCTest
 
 final class AgentItemReducerTests: XCTestCase {
+    func testStreamingSnapshotsReplaceOneItemAndFinishIt() {
+        var store = AgentItemStore()
+        AgentItemReducer.apply(.assistantMessage(text: "Hel", meta: AgentItemMeta()), itemId: "m", state: .streaming, into: &store)
+        XCTAssertEqual(store.items[0].lifecycle, "streaming")
+        AgentItemReducer.apply(.assistantMessage(text: "Hello", meta: AgentItemMeta()), itemId: "m", state: .completed, into: &store)
+        XCTAssertEqual(store.items.count, 1)
+        XCTAssertEqual(store.items[0].text, "Hello")
+        XCTAssertEqual(store.items[0].lifecycle, "completed")
+    }
+
     func testToolReducerPreservesNeutralPresentationMetadata() throws {
         let meta = AgentItemMeta(vendorExtensions: [
             "server": AnyCodable("node_repl"),

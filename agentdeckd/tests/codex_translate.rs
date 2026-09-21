@@ -7,8 +7,8 @@
 //! by replaying realistic short Codex turn sequences.
 
 use agentdeck_protocol::{
-    ActionKind, ActionRequestVendor, AgentItem, AgentKind, CodexApprovalPolicy, CodexSandboxMode,
-    DiffStatus, ServerEvent, SessionId, ShellStatus, ThreadId,
+    ActionKind, ActionRequestVendor, AgentItem, AgentItemState, AgentKind, CodexApprovalPolicy,
+    CodexSandboxMode, DiffStatus, ServerEvent, SessionId, ShellStatus, ThreadId,
 };
 use agentdeckd::codex::translate::CodexTranslator;
 
@@ -19,47 +19,37 @@ fn new_translator() -> CodexTranslator {
 }
 
 #[test]
-fn fixture_replay_basic_assistant_message_emits_one_cumulative_item() {
-    let mut t = new_translator();
-    let lines = vec![
-        r#"{"method":"item/started","params":{"item":{"id":"msg1","type":"agentMessage","text":""},"threadId":"thread-1"}}"#,
-        r#"{"method":"item/agentMessage/delta","params":{"itemId":"msg1","delta":"Hel","threadId":"thread-1"}}"#,
-        r#"{"method":"item/agentMessage/delta","params":{"itemId":"msg1","delta":"lo!","threadId":"thread-1"}}"#,
-        r#"{"method":"item/completed","params":{"item":{"id":"msg1","type":"agentMessage","text":"Hello!"},"threadId":"thread-1"}}"#,
-    ];
-    let mut events = Vec::new();
-    for l in lines {
-        events.extend(t.translate_line(l));
-    }
-    let messages: Vec<_> = events
-        .iter()
-        .filter(|e| {
-            matches!(
-                e,
-                ServerEvent::AgentItem {
-                    item: AgentItem::AssistantMessage { .. },
-                    ..
-                }
-            )
-        })
+fn fixture_replay_assistant_stream_has_stable_identity_and_cumulative_text() {
+    let mut translator = new_translator();
+    let events: Vec<_> = include_str!("fixtures/codex/assistant_stream.jsonl")
+        .lines()
+        .flat_map(|line| translator.translate_line(line))
         .collect();
-    assert_eq!(
-        messages.len(),
-        1,
-        "expected exactly one cumulative AssistantMessage emit; got {events:?}"
-    );
-    if let ServerEvent::AgentItem {
-        item: AgentItem::AssistantMessage { text, .. },
-        agent_kind,
-        thread_id,
-        session_id,
-        ..
-    } = messages[0]
-    {
-        assert_eq!(text, "Hello!");
-        assert_eq!(*agent_kind, AgentKind::Codex);
-        assert_eq!(thread_id.0, "thread-1");
+    assert_eq!(events.len(), 3);
+    for (event, (expected, expected_state)) in events.iter().zip([
+        ("Hel", AgentItemState::Streaming),
+        ("Hello!", AgentItemState::Streaming),
+        ("Hello!", AgentItemState::Completed),
+    ]) {
+        let ServerEvent::AgentItem {
+            session_id,
+            thread_id,
+            agent_kind,
+            turn_id,
+            item_id,
+            state,
+            item: AgentItem::AssistantMessage { text, .. },
+        } = event
+        else {
+            panic!("expected assistant snapshot: {event:?}")
+        };
         assert_eq!(session_id.0, "session-test");
+        assert_eq!(thread_id.0, "thread-1");
+        assert_eq!(*agent_kind, AgentKind::Codex);
+        assert_eq!(turn_id.0, "turn-1");
+        assert_eq!(item_id, "msg1");
+        assert_eq!(*state, expected_state);
+        assert_eq!(text, expected);
     }
 }
 

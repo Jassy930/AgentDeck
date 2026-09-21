@@ -95,7 +95,7 @@ fn e2e_codex_agent_list_contains_codex() {
 }
 
 #[test]
-fn e2e_codex_agent_capabilities_matches_lifecycle_only_boundary() {
+fn e2e_codex_agent_capabilities_matches_m0_boundary() {
     if !real_e2e_enabled() {
         eprintln!("SKIP: set AGENTDECK_E2E=1");
         return;
@@ -118,10 +118,7 @@ fn e2e_codex_agent_capabilities_matches_lifecycle_only_boundary() {
     let features = json["features"]
         .as_array()
         .expect("features must be an array");
-    assert!(
-        features.is_empty(),
-        "Issue #3 must not advertise streaming or interaction features before their own gates"
-    );
+    assert_eq!(features, &vec![serde_json::json!("streamingMessages")]);
     assert_eq!(
         json["agentKind"], "codex",
         "agentKind in capabilities reply must be 'codex'"
@@ -135,6 +132,21 @@ fn e2e_codex_agent_capabilities_matches_lifecycle_only_boundary() {
         json["vendor"]["reasoningEffortLevels"],
         serde_json::json!(["medium"])
     );
+}
+
+#[test]
+fn e2e_codex_live_four_turn_lifecycle() {
+    if !real_e2e_enabled() {
+        eprintln!("SKIP: set AGENTDECK_E2E=1");
+        return;
+    }
+    assert!(
+        codex_available(),
+        "AGENTDECK_E2E=1 requires the pinned Codex binary on PATH"
+    );
+    let root = support::live::temp_root("codex-live-e2e");
+    let command = support::cli_command(&["session", "live", "--data-dir", root.to_str().unwrap()]);
+    support::live::four_turn_scenario(command, &root, std::time::Duration::from_secs(300));
 }
 
 // ── Session run / continue ─────────────────────────────────────────────────────

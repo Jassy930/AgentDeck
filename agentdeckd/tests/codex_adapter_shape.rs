@@ -7,8 +7,7 @@
 //!
 //!   1. Confirms the adapter is `dyn Agent`-compatible (Send + Sync +
 //!      'static + the right method set).
-//!   2. Confirms its pre-M0 capability claim stays empty until the
-//!      corresponding lifecycle/streaming gates are accepted.
+//!   2. Confirms its M0 capability claim contains only assistant streaming.
 //!   3. Confirms it rejects wrong-vendor `VendorSessionOptions` /
 //!      `VendorControlPayload` with structured errors (N4 / N5 guard).
 //!   4. Confirms live commands reject an unknown session id while legacy
@@ -35,7 +34,10 @@ fn capabilities_do_not_claim_unaccepted_features() {
     let a = CodexAdapter::new_for_test();
     let caps = a.capabilities();
     assert_eq!(caps.agent_kind, AgentKind::Codex);
-    assert!(caps.features.is_empty());
+    assert_eq!(
+        caps.features,
+        std::collections::BTreeSet::from([agentdeck_protocol::CapabilityId::StreamingMessages])
+    );
 }
 
 #[tokio::test]

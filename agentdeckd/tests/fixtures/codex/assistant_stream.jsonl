@@ -1,0 +1,4 @@
+{"method":"item/started","params":{"item":{"id":"msg1","type":"agentMessage","text":"","phase":"final_answer"},"threadId":"thread-1","turnId":"turn-1","startedAtMs":1}}
+{"method":"item/agentMessage/delta","params":{"itemId":"msg1","delta":"Hel","threadId":"thread-1","turnId":"turn-1"}}
+{"method":"item/agentMessage/delta","params":{"itemId":"msg1","delta":"lo!","threadId":"thread-1","turnId":"turn-1"}}
+{"method":"item/completed","params":{"item":{"id":"msg1","type":"agentMessage","text":"Hello!","phase":"final_answer"},"threadId":"thread-1","turnId":"turn-1","completedAtMs":2}}

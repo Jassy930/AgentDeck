@@ -75,7 +75,7 @@ final class FixtureSessionSourceTests: XCTestCase {
         await source.sendPrompt(sessionID: "sess-cc-01", text: "继续，补第三个边界")
         let after = await collect(source.events(sessionID: "sess-cc-01"), until: isPromptTurnComplete)
         let texts: [String] = after.compactMap { element in
-            if case .agentItem(_, _, _, let item) = element.event,
+            if case .agentItem(_, _, _, _, _, _, let item) = element.event,
                case .userMessage(let text, _) = item { return text }
             return nil
         }

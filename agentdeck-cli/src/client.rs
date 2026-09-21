@@ -1,4 +1,4 @@
-//! v3 client API — sends `ClientCommand` JSONL, reads `ServerEvent` JSONL
+//! v4 client API — sends `ClientCommand` JSONL, reads `ServerEvent` JSONL
 //! and admin reply side-channel.
 //!
 //! ## Admin reply parsing
@@ -57,6 +57,10 @@ struct SessionStreamState {
 
 impl SessionStreamState {
     fn accept(&mut self, event: ServerEvent) -> SessionStreamAction {
+        if matches!(&event, ServerEvent::Error { error, .. } if error.code == "record_write_failed")
+        {
+            return SessionStreamAction::Forward(event);
+        }
         if let Some(expected_session) = &self.closing_session {
             return match &event {
                 ServerEvent::SessionClosed {
@@ -561,7 +565,7 @@ mod tests {
     }
 
     fn selfcheck_reply() -> String {
-        r#"{"reply":"selfcheck","ok":true,"protocolVersion":3,"agents":["codex","claude_code"]}"#
+        r#"{"reply":"selfcheck","ok":true,"protocolVersion":4,"agents":["codex","claude_code"]}"#
             .to_string()
     }
 
@@ -737,7 +741,7 @@ mod tests {
         let mut fake = FakeTransport::new(vec![selfcheck_reply()]);
         let v = admin_round_trip(&mut fake, &ClientCommand::Selfcheck, "selfcheck").unwrap();
         assert_eq!(v["ok"], true);
-        assert_eq!(v["protocolVersion"], 3);
+        assert_eq!(v["protocolVersion"], agentdeck_protocol::PROTOCOL_VERSION);
     }
 
     #[test]

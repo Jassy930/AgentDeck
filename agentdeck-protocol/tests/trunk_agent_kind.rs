@@ -1,6 +1,6 @@
 use agentdeck_protocol::{
-    AgentItem, AgentItemMeta, AgentKind, ServerEvent, SessionCapabilities, SessionId, ShellStatus,
-    ThreadId,
+    AgentItem, AgentItemMeta, AgentItemState, AgentKind, ServerEvent, SessionCapabilities,
+    SessionId, ShellStatus, ThreadId, TurnId,
 };
 use std::collections::BTreeSet;
 
@@ -9,6 +9,9 @@ fn ek(agent_kind: AgentKind) -> ServerEvent {
         session_id: SessionId("s1".into()),
         thread_id: ThreadId("t1".into()),
         agent_kind,
+        turn_id: TurnId("turn-1".into()),
+        item_id: "item-1".into(),
+        state: AgentItemState::Completed,
         item: AgentItem::AssistantMessage {
             text: "hi".into(),
             meta: AgentItemMeta::default(),
@@ -47,6 +50,9 @@ fn agent_item_shell_fields_camel_case() {
         session_id: SessionId("s1".into()),
         thread_id: ThreadId("t1".into()),
         agent_kind: AgentKind::ClaudeCode,
+        turn_id: TurnId("turn-1".into()),
+        item_id: "item-1".into(),
+        state: AgentItemState::Completed,
         item: AgentItem::Shell {
             command: "ls".into(),
             status: ShellStatus::Completed,
@@ -64,4 +70,22 @@ fn agent_item_shell_fields_camel_case() {
         json.contains(r#""durationMs":10"#),
         "durationMs missing in: {json}"
     );
+}
+
+#[test]
+fn streaming_identity_is_required_and_round_trips() {
+    let mut value = serde_json::to_value(ek(AgentKind::Codex)).unwrap();
+    value["state"] = serde_json::json!("streaming");
+    let event: ServerEvent = serde_json::from_value(value.clone()).unwrap();
+    assert!(
+        matches!(event, ServerEvent::AgentItem { turn_id, item_id, state: AgentItemState::Streaming, .. } if turn_id.0 == "turn-1" && item_id == "item-1")
+    );
+    for field in ["turnId", "itemId", "state"] {
+        let mut missing = value.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        assert!(
+            serde_json::from_value::<ServerEvent>(missing).is_err(),
+            "{field} must be required"
+        );
+    }
 }

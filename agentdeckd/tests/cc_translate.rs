@@ -14,6 +14,7 @@ fn tr() -> ClaudeCodeTranslator {
     let mut t =
         ClaudeCodeTranslator::new(SessionId("s1".into()), ClaudeCodePermissionMode::Default);
     t.set_thread_id(ThreadId("thread_1".into()));
+    t.set_turn_id(TurnId("client-turn-1".into()));
     t
 }
 
@@ -32,8 +33,14 @@ fn assistant_text_becomes_assistant_message() {
             item: AgentItem::AssistantMessage { text, .. },
             agent_kind,
             thread_id,
+            turn_id,
+            item_id,
+            state,
             ..
         } => {
+            assert_eq!(turn_id.0, "client-turn-1");
+            assert!(!item_id.is_empty());
+            assert_eq!(*state, AgentItemState::Completed);
             assert_eq!(text, "hi");
             assert_eq!(*agent_kind, AgentKind::ClaudeCode);
             assert_eq!(thread_id.0, "thread_1");
@@ -589,4 +596,24 @@ fn permission_mode_is_stamped_on_action_request() {
         _ => panic!("expected ClaudeCode vendor block"),
     }
     assert!(matches!(request.kind, ActionKind::EditFiles));
+}
+
+#[test]
+fn tool_snapshots_preserve_their_identity_until_completion() {
+    let mut translator = tr();
+    let running = translator.translate_line(&json!({
+        "type":"assistant", "message":{"content":[{"type":"tool_use", "id":"tool-1", "name":"Bash", "input":{"command":"true"}}]}
+    }).to_string());
+    let completed = translator.translate_line(&json!({
+        "type":"user", "message":{"content":[{"type":"tool_result", "tool_use_id":"tool-1", "content":""}]}
+    }).to_string());
+    for (events, expected) in [
+        (running.events, AgentItemState::Streaming),
+        (completed.events, AgentItemState::Completed),
+    ] {
+        assert!(
+            matches!(&events[..], [ServerEvent::AgentItem { item_id, turn_id, state, .. }]
+            if item_id == "tool-1" && turn_id.0 == "client-turn-1" && *state == expected)
+        );
+    }
 }
