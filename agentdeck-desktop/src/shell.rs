@@ -2,7 +2,9 @@
 //!
 //! 当前只有静态骨架，不连接 daemon、IPC 或任何 vendor 进程。
 
-use gpui::{App, Context, Entity, IntoElement, ParentElement, SharedString, Window, div, prelude::*, px};
+use gpui::{
+    App, Context, Entity, IntoElement, ParentElement, SharedString, Window, div, prelude::*, px,
+};
 use gpui_component::{ActiveTheme, StyledExt, h_flex, input::InputState, v_flex};
 
 use crate::composer;
@@ -46,6 +48,9 @@ impl Shell {
                 .auto_grow(1, 8)
         });
 
+        // 打开窗口即可直接输入。切换形态时的聚焦留到接入真实会话时一并处理。
+        composer.update(cx, |input, cx| input.focus(window, cx));
+
         Self {
             stage: Stage::Empty,
             composer,
@@ -66,35 +71,41 @@ impl Shell {
         v_flex()
             .flex_1()
             .h_full()
-            .items_center()
-            .justify_center()
-            .gap_8()
-            .p_10()
+            .child(sidebar::titlebar_area("empty-titlebar"))
             .child(
                 v_flex()
+                    .flex_1()
                     .items_center()
-                    .gap_2()
-                    .child(div().text_3xl().child("今天要做什么？"))
+                    .justify_center()
+                    .gap_8()
+                    .px_10()
+                    .pb_10()
+                    .child(
+                        v_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_3xl().child("今天要做什么？"))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("选择一个项目，或直接描述任务"),
+                            ),
+                    )
+                    .child(composer::render(&self.composer, cx))
+                    .child(
+                        h_flex().gap_3().children(
+                            CONNECTORS
+                                .iter()
+                                .map(|(name, status)| connector_card(name, status, cx)),
+                        ),
+                    )
                     .child(
                         div()
-                            .text_sm()
+                            .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child("选择一个项目，或直接描述任务"),
+                            .child("本机运行 · 尚未接入 daemon"),
                     ),
-            )
-            .child(composer::render(&self.composer, cx))
-            .child(
-                h_flex().gap_3().children(
-                    CONNECTORS
-                        .iter()
-                        .map(|(name, status)| connector_card(name, status, cx)),
-                ),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("本机运行 · 尚未接入 daemon"),
             )
     }
 
@@ -103,7 +114,7 @@ impl Shell {
             .flex_1()
             .h_full()
             .child(
-                // thread header：左标题，右上环境信息占位。
+                // thread header：左标题，右上环境信息占位。高度同时吃掉红绿灯占位。
                 h_flex()
                     .w_full()
                     .h(px(52.))
