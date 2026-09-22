@@ -106,7 +106,8 @@ stdout / stderr 直接丢弃，非零退出只返回结构化 failure code、exi
 
 ## 真实 Codex / Claude Code 历史刷新
 
-GPUI 桌面端当前没有历史界面。历史能力只通过 CLI/daemon 独立排查：
+GPUI 桌面端已接入只读历史；来源加载失败会在侧栏显示错误。可通过 CLI/daemon
+独立排查对应来源：
 
 ```bash
 agentdeck history list
@@ -126,6 +127,7 @@ CLI 与桌面 client 都为每次历史请求生成唯一 `requestId`。daemon �
 | code | 含义 | 下一步 |
 | --- | --- | --- |
 | `codex-version-unsupported` | daemon 找不到可规范化的 `codex` executable、`--version` 探测失败，或版本不等于 `protocol/CODEX_VERSION.txt` 固定值 | 运行 `/usr/bin/which codex` 和 `codex --version`；修复 GUI 启动环境的安装/路径，或安装固定版本后重启 App |
+| `codex-version-timeout` | `codex --version` 超过 5 秒；探测会终止并回收独立进程组，清理预算另为 2 秒 | 检查所定位 executable 或 launcher 是否挂起；不能将它视为版本不匹配或合法空历史 |
 | `codex-spawn-failed` | 已定位 `codex`，但无法启动 `codex app-server`，或子进程标准管道不可用 | 运行 `codex app-server --help`；结合错误中的系统原因检查可执行权限、隔离属性和启动环境 |
 | `codex-rpc-timeout` | 单次 `initialize` / `thread/list` / `thread/read` RPC 超过 20 秒 | 分别执行 Codex list/read 定位卡住的方法；核对 Codex 版本，并暂时禁用异常 MCP 配置后复测 |
 | `codex-history-timeout` | Codex 历史 list/read 的 30 秒总预算内会为进程清理预留 2 秒；工作阶段超时后 daemon 清理短生命周期 app-server 进程组 | 分别执行 Codex list/read 定位卡住的操作；优先排查 app-server 或 MCP helper 卡住 |

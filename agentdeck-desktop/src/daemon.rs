@@ -12,6 +12,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use agentdeck_protocol::{
     AgentKind, ClientCommand, HistoryListItem, HistoryRequest, HistoryResponse, HistoryTurn,
@@ -81,6 +82,31 @@ fn locate_daemon() -> Result<PathBuf> {
 /// 进程守卫：无论成功、失败还是提前返回都回收子进程。
 struct DaemonChild(Child);
 
+impl DaemonChild {
+    fn finish(&mut self, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self
+                .0
+                .try_wait()
+                .map_err(|source| format!("等待 agentdeckd 退出失败：{source}"))?
+            {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!("agentdeckd 异常退出：{status}"))
+                };
+            }
+            if Instant::now() >= deadline {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+                return Err("agentdeckd 回复后未及时退出，已终止进程".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 impl Drop for DaemonChild {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -121,8 +147,8 @@ fn reply_payload(
 
 /// 发一条命令并等待对应的 admin reply。
 ///
-/// ponytail: 没有客户端侧超时，依赖 daemon 自己的 history 硬超时；daemon 若完全
-/// 卡死，这里会一直占着一个 background 线程，等真出现再加客户端 deadline。
+/// ponytail: 依赖 daemon 有界的版本探测和历史查询；若需处理整个 daemon 无响应，
+/// 再增加客户端 deadline，当前阻塞读取仍会占用一个 background 线程。
 fn round_trip(
     command: &ClientCommand,
     expected_reply: &str,
@@ -151,7 +177,9 @@ fn round_trip(
     for line in BufReader::new(stdout).lines() {
         let line = line.map_err(|source| format!("读取 agentdeckd 失败：{source}"))?;
         if let Some(payload) = reply_payload(&line, expected_reply, expected_request_id) {
-            return payload;
+            // 回复 flush 后 daemon 还要排空 writer 并记录 daemon_stop。
+            let finished = child.finish(Duration::from_secs(2));
+            return payload.and_then(|value| finished.map(|()| value));
         }
     }
     Err(format!("agentdeckd 在返回 {expected_reply} 前退出"))
@@ -159,16 +187,16 @@ fn round_trip(
 
 /// daemon 当前注册的 agent；侧栏据此逐个查询历史，不硬编码 vendor。
 pub fn agent_list() -> Result<Vec<AgentKind>> {
-    let reply = round_trip(&ClientCommand::AgentList, "agentList", None)?;
-    let agents = reply.get("agents").cloned().unwrap_or_default();
+    let mut reply = round_trip(&ClientCommand::AgentList, "agentList", None)?;
+    let agents = reply["agents"].take();
     serde_json::from_value(agents).map_err(|source| format!("解析 agent 列表失败：{source}"))
 }
 
 fn history(request: HistoryRequest) -> Result<HistoryResponse> {
     let request_id = next_history_request_id();
     let command = ClientCommand::History(request.with_request_id(&request_id));
-    let reply = round_trip(&command, "history", Some(&request_id))?;
-    let response = reply.get("response").cloned().unwrap_or_default();
+    let mut reply = round_trip(&command, "history", Some(&request_id))?;
+    let response = reply["response"].take();
     serde_json::from_value(response).map_err(|source| format!("解析历史响应失败：{source}"))
 }
 
@@ -198,6 +226,39 @@ pub fn history_read(agent_kind: AgentKind, thread_id: ThreadId) -> Result<Vec<Hi
 #[cfg(test)]
 mod tests {
     use super::{next_history_request_id, reply_payload};
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_finish_waits_for_exit_and_reaps_on_timeout() {
+        use super::DaemonChild;
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::Command;
+        use std::time::Duration;
+
+        for (script, expected_code) in [("sleep 0.05; exit 0", 0), ("exit 7", 7)] {
+            let mut child = DaemonChild(
+                Command::new("/bin/sh")
+                    .args(["-c", script])
+                    .spawn()
+                    .unwrap(),
+            );
+            let result = child.finish(Duration::from_secs(2));
+            assert_eq!(result.is_ok(), expected_code == 0);
+            assert_eq!(
+                child.0.try_wait().unwrap().unwrap().code(),
+                Some(expected_code)
+            );
+        }
+
+        let mut child = DaemonChild(
+            Command::new("/bin/sh")
+                .args(["-c", "exec /bin/sleep 10"])
+                .spawn()
+                .unwrap(),
+        );
+        assert!(child.finish(Duration::from_millis(50)).is_err());
+        assert_eq!(child.0.try_wait().unwrap().unwrap().signal(), Some(9));
+    }
 
     #[test]
     fn history_request_ids_are_unique() {

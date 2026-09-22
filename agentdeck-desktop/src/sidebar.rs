@@ -33,26 +33,26 @@ pub const TRAFFIC_LIGHT_INSET: f32 = 44.;
 pub fn render(
     shell: &Shell,
     selected: Option<SharedString>,
+    window: &Window,
     cx: &mut Context<Shell>,
 ) -> impl IntoElement + use<> {
     let mut sessions = Vec::with_capacity(shell.sessions.len());
     for item in &shell.sessions {
         let is_selected =
             selected.as_ref().map(SharedString::as_ref) == Some(item.thread_id.0.as_str());
-        sessions.push(session_row(item, is_selected, cx));
+        sessions.push(session_row(item, is_selected, window, cx));
     }
 
     let status = if shell.pending > 0 {
         Some("正在读取会话…".to_string())
-    } else if !shell.sessions.is_empty() || shell.agents.iter().any(|agent| agent.error().is_some())
-    {
+    } else if !shell.sessions.is_empty() {
         None
     } else {
         Some(
             shell
                 .error
                 .clone()
-                .unwrap_or_else(|| "暂无历史会话".to_string()),
+                .unwrap_or_else(|| "没有可显示的会话".to_string()),
         )
     };
 
@@ -210,16 +210,27 @@ fn section_label(text: &str, cx: &Context<Shell>) -> impl IntoElement {
 fn session_row(
     item: &HistoryListItem,
     selected: bool,
+    window: &Window,
     cx: &mut Context<Shell>,
 ) -> impl IntoElement + use<> {
     let id: SharedString = item.thread_id.0.clone().into();
     let payload = item.clone();
+    // Button 的内部 label 容器不会收缩，正文需先扣除侧栏/按钮 padding 与三条边框。
+    let title_width = px(WIDTH - 3.) - window.rem_size() * 3.5;
 
     Button::new(id)
         .ghost()
         .selected(selected)
         .w_full()
         .justify_start()
-        .label(session_title(item))
+        .child(
+            div()
+                .w(title_width)
+                // nowrap 的文字缓存不随截断宽度变化；单行 clamp 保留按宽度重新测量。
+                .whitespace_normal()
+                .line_clamp(1)
+                .text_ellipsis()
+                .child(session_title(item)),
+        )
         .on_click(cx.listener(move |shell, _, _, cx| shell.open_session(payload.clone(), cx)))
 }

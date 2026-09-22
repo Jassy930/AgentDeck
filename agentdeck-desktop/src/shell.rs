@@ -3,7 +3,7 @@
 //! 会话列表和会话记录都来自本机 `agentdeckd`，通过 `daemon` 模块按 agent 拉取；
 //! 本期只读历史，不启动 session、不发 turn。
 
-use agentdeck_protocol::{AgentKind, HistoryListItem, HistoryTurn, ThreadId};
+use agentdeck_protocol::{AgentKind, HistoryListItem, ThreadId};
 use gpui::{
     App, Context, Entity, IntoElement, ParentElement, SharedString, Window, div, prelude::*, px,
 };
@@ -35,12 +35,16 @@ pub enum Stage {
 /// 选中会话的记录加载状态。
 pub enum Transcript {
     Loading,
-    Ready(Vec<HistoryTurn>),
+    Ready(Vec<transcript::TextBlock>),
     Failed(String),
 }
 
 impl Stage {
-    fn finish_read(&mut self, completed_id: u64, read: Result<Vec<HistoryTurn>, String>) -> bool {
+    fn finish_read(
+        &mut self,
+        completed_id: u64,
+        read: Result<Vec<transcript::TextBlock>, String>,
+    ) -> bool {
         if let Stage::Session {
             transcript,
             read_id,
@@ -70,6 +74,41 @@ impl Stage {
             Stage::Empty => None,
             Stage::Session { item, .. } => Some(&item.thread_id),
         }
+    }
+}
+
+struct ReadRequest {
+    id: u64,
+    kind: AgentKind,
+    thread_id: ThreadId,
+}
+
+#[derive(Default)]
+struct ReadQueue {
+    active: bool,
+    pending: Option<ReadRequest>,
+}
+
+impl ReadQueue {
+    fn push(&mut self, request: ReadRequest) -> Option<ReadRequest> {
+        if self.active {
+            self.pending = Some(request);
+            None
+        } else {
+            self.active = true;
+            Some(request)
+        }
+    }
+
+    fn finish(&mut self) -> Option<ReadRequest> {
+        let next = self.pending.take();
+        self.active = next.is_some();
+        next
+    }
+
+    fn clear_pending(&mut self) {
+        // 执行中的 daemon 仍会正常完成；回到会话时也必须继续受单请求限制。
+        self.pending = None;
     }
 }
 
@@ -134,9 +173,35 @@ impl AgentHistory {
     }
 }
 
+fn empty_hint(agents: &[AgentHistory], pending: usize, error: Option<&str>) -> String {
+    if let Some(error) = error {
+        return error.to_string();
+    }
+    if agents.is_empty() {
+        return if pending > 0 {
+            "正在连接本机 agentdeckd…"
+        } else {
+            "本机 agentdeckd 没有注册任何 agent"
+        }
+        .to_string();
+    }
+    if agents
+        .iter()
+        .any(|agent| matches!(agent.result, Some(Ok(count)) if count > 0))
+    {
+        "选择左侧会话查看记录，或试着输入任务"
+    } else if pending > 0 {
+        "正在读取会话…"
+    } else {
+        "没有可显示的会话"
+    }
+    .to_string()
+}
+
 pub struct Shell {
     stage: Stage,
     next_read_id: u64,
+    reads: ReadQueue,
     composer: Entity<InputState>,
     /// daemon 已注册的 agent，决定侧栏按哪些来源拉历史。
     pub(crate) agents: Vec<AgentHistory>,
@@ -165,6 +230,7 @@ impl Shell {
         let mut shell = Self {
             stage: Stage::Empty,
             next_read_id: 0,
+            reads: ReadQueue::default(),
             composer,
             agents: Vec::new(),
             sessions: Vec::new(),
@@ -240,15 +306,31 @@ impl Shell {
         };
         cx.notify();
 
+        if let Some(request) = self.reads.push(ReadRequest {
+            id: read_id,
+            kind,
+            thread_id,
+        }) {
+            self.start_read(request, cx);
+        }
+    }
+
+    fn start_read(&mut self, request: ReadRequest, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
+            let read_id = request.id;
             let read = cx
                 .background_executor()
-                .spawn(async move { daemon::history_read(kind, thread_id) })
+                .spawn(async move {
+                    daemon::history_read(request.kind, request.thread_id).map(transcript::prepare)
+                })
                 .await;
             this.update(cx, |shell, cx| {
                 // 回到同一会话也属于新请求，不能接受上次读取的迟到结果。
                 if shell.stage.finish_read(read_id, read) {
                     cx.notify();
+                }
+                if let Some(next) = shell.reads.finish() {
+                    shell.start_read(next, cx);
                 }
             })
             .ok();
@@ -258,6 +340,7 @@ impl Shell {
 
     pub fn show_empty(&mut self, cx: &mut Context<Self>) {
         self.stage = Stage::Empty;
+        self.reads.clear_pending();
         cx.notify();
     }
 
@@ -268,12 +351,7 @@ impl Shell {
             .map(|agent| connector_card(&agent_label(agent.kind), &agent.status(), cx))
             .collect();
 
-        let hint = match (&self.error, self.agents.is_empty(), self.pending > 0) {
-            (Some(message), _, _) => message.clone(),
-            (None, true, true) => "正在连接本机 agentdeckd…".to_string(),
-            (None, true, false) => "本机 agentdeckd 没有注册任何 agent".to_string(),
-            _ => "选择左侧会话查看记录，或试着输入任务".to_string(),
-        };
+        let hint = empty_hint(&self.agents, self.pending, self.error.as_deref());
 
         v_flex()
             .flex_1()
@@ -313,10 +391,10 @@ impl Shell {
         let body = match transcript {
             Transcript::Loading => placeholder("正在读取会话记录…", cx).into_any_element(),
             Transcript::Failed(message) => placeholder(message, cx).into_any_element(),
-            Transcript::Ready(turns) if turns.is_empty() => {
+            Transcript::Ready(blocks) if blocks.is_empty() => {
                 placeholder("这个会话没有可显示的记录", cx).into_any_element()
             }
-            Transcript::Ready(turns) => transcript::render(turns, cx).into_any_element(),
+            Transcript::Ready(blocks) => transcript::render(blocks, cx).into_any_element(),
         };
 
         v_flex()
@@ -342,7 +420,9 @@ impl Shell {
                         div()
                             .flex_1()
                             .min_w(px(0.))
-                            .truncate()
+                            .whitespace_normal()
+                            .line_clamp(1)
+                            .text_ellipsis()
                             .text_sm()
                             .font_semibold()
                             .child(session_title(item)),
@@ -406,7 +486,7 @@ fn connector_card(name: &str, status: &str, cx: &App) -> impl IntoElement + use<
 }
 
 impl Render for Shell {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let main = match &self.stage {
             Stage::Empty => self.render_empty(cx).into_any_element(),
             Stage::Session {
@@ -422,15 +502,18 @@ impl Render for Shell {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .child(sidebar::render(self, selected, cx))
+            .child(sidebar::render(self, selected, window, cx))
             .child(main)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentHistory, Stage, Transcript, agent_label, project_name, session_title};
-    use agentdeck_protocol::{AgentKind, HistoryListItem, HistoryTurn, ThreadId};
+    use super::{
+        AgentHistory, ReadQueue, ReadRequest, Stage, Transcript, agent_label, empty_hint,
+        project_name, session_title,
+    };
+    use agentdeck_protocol::{AgentKind, HistoryListItem, ThreadId};
 
     fn item(title: Option<&str>) -> HistoryListItem {
         HistoryListItem {
@@ -477,7 +560,7 @@ mod tests {
             transcript: Transcript::Loading,
             read_id: 3,
         };
-        assert!(stage.finish_read(3, Ok(vec![HistoryTurn { items: vec![] }])));
+        assert!(stage.finish_read(3, Ok(vec![("助手", "新的 A 记录".into())])));
         assert!(!stage.finish_read(1, Err("旧读取超时".into())));
         assert!(!stage.finish_read(1, Ok(vec![])));
         assert!(matches!(
@@ -487,6 +570,41 @@ mod tests {
 
         stage = Stage::Empty;
         assert!(!stage.finish_read(3, Ok(vec![])));
+    }
+
+    fn read_request(id: u64, thread: &str) -> ReadRequest {
+        ReadRequest {
+            id,
+            kind: AgentKind::Codex,
+            thread_id: ThreadId(thread.into()),
+        }
+    }
+
+    #[test]
+    fn slow_read_only_runs_the_last_pending_selection() {
+        let mut reads = ReadQueue::default();
+        let first = reads.push(read_request(1, "A")).unwrap();
+        assert_eq!(first.thread_id.0, "A");
+        assert!(reads.push(read_request(2, "B")).is_none());
+        assert!(reads.push(read_request(3, "C")).is_none());
+
+        let next = reads.finish().unwrap();
+        assert_eq!(next.thread_id.0, "C");
+        assert_eq!(next.id, 3);
+        assert!(reads.active);
+        assert!(reads.finish().is_none());
+        assert!(!reads.active);
+
+        assert!(reads.push(read_request(4, "A")).is_some());
+        assert!(reads.push(read_request(5, "B")).is_none());
+        reads.clear_pending();
+        assert!(reads.active);
+        assert!(reads.finish().is_none());
+
+        assert!(reads.push(read_request(6, "A")).is_some());
+        reads.clear_pending();
+        assert!(reads.push(read_request(7, "C")).is_none());
+        assert_eq!(reads.finish().unwrap().id, 7);
     }
 
     #[test]
@@ -506,6 +624,25 @@ mod tests {
         fast.complete(&Ok(vec![]));
         assert_eq!(fast.status(), "0 个会话");
         assert_eq!(slow.error(), Some("历史读取超时"));
+    }
+
+    #[test]
+    fn empty_hint_does_not_offer_selection_after_failure_and_zero_results() {
+        let mut agents = [
+            AgentHistory::new(AgentKind::Codex),
+            AgentHistory::new(AgentKind::ClaudeCode),
+        ];
+        agents[0].complete(&Err("历史读取超时".into()));
+        assert_eq!(empty_hint(&agents, 1, None), "正在读取会话…");
+
+        agents[1].complete(&Ok(vec![]));
+        assert_eq!(empty_hint(&agents, 0, None), "没有可显示的会话");
+
+        agents[1].complete(&Ok(vec![item(None)]));
+        assert_eq!(
+            empty_hint(&agents, 0, None),
+            "选择左侧会话查看记录，或试着输入任务"
+        );
     }
 
     #[test]

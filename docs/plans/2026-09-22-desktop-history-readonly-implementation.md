@@ -11,7 +11,7 @@
 
 - `agentdeck-desktop/src/daemon.rs`：桌面自己的 typed local client。每次请求
   spawn 一个 `agentdeckd` 子进程，写一行 `ClientCommand`，关闭 stdin，读到匹配的
-  admin reply 即返回并回收进程。
+  admin reply 后最多等待 2 秒让 daemon 正常退出，超时则终止并回收进程。
   - 不复用 `agentdeck-cli`：CLI 是 bin-only、依赖 clap/tokio，且架构上与 GUI 互相独立。
   - 不维护长连接：history 在 daemon 内部本来就是短生命周期调用（Codex 每次另起
     app-server，CC 每次扫描本地 JSONL），一个连接只发一条命令。每次历史请求仍按
@@ -25,8 +25,10 @@
   本次读取序号，切走后重开同一会话也只接受最新读取结果。加载顺序是先 `AgentList`，
   再按 agent 各发一次 `History::List`，谁先返回谁先进侧栏，慢的来源不挡快的。
   阻塞 IPC 全部走 `cx.background_executor()`。
+  会话读取最多执行一个，等待期间只保留最新待查会话；切回空态清空待查项，正在
+  执行的读取仍由 daemon 按自身时限完成并清理。
 - `agentdeck-desktop/src/transcript.rs`：把中立 `AgentItem` 映射成「标签 + 正文」
-  文本块，单条正文上限 2000 字符。
+  文本块，单条正文上限 2000 字符；后台读取完成时转换一次，渲染复用最终文本。
 - `script/build_and_run.sh`：bundle 内同时装配 `agentdeckd`，`--verify` 额外断言它存在。
 
 ## 关键决策与坑点
@@ -36,6 +38,8 @@
   「成功输出必须是单行 JSON」的门禁。
 - **侧栏每个 agent 只取 50 条**（`SIDEBAR_LIMIT`）。Codex 的 `thread/list` 按页聚合，
   500 条实测约 27 秒、逼近 daemon 的历史超时；50 条把首屏延迟压回一页。
+- Codex 的共享版本探测有 5 秒时限，结束后终止独立进程组，并最多用 2 秒确认直接
+  子进程已回收；超时返回 `codex-version-timeout`，清理失败返回 `codex-cleanup-failed`。
 - **flex 滚动要 `min_h(0)`**。GPUI 用 taffy，flex item 默认按内容撑高，`overflow_y_scroll`
   单独用不会限制高度，长记录会顶穿底部 composer。transcript 和侧栏列表都加了
   `min_h(px(0.))`，会话区外层再加 `overflow_hidden` 兜底。
@@ -88,6 +92,18 @@ scripts/verify-agent-docs.sh
   使用当前 Taffy 样式对 900px 窗口对应的 652px header 做布局测量，右侧信息结束于
   632px，保留 20px 内边距，没有收缩或越界。
 - 本次未启用 `AGENTDECK_E2E=1`，以上 fake 验收不构成新增真实 vendor 证据。
+
+PR 评论修复后的验证：
+
+- 17 项 desktop 单测、10 项 Codex capabilities 与 7 项 app-server focused 测试、
+  全量离线门禁、desktop selfcheck、绑定当前 checkout daemon 的 CLI selfcheck、
+  diagnostics report、格式与文档检查通过。版本探测的假 launcher 覆盖正常结束后
+  子进程仍持有管道及探测超时两条路径，均确认直接子进程与已记录 helper PID 消失。
+- 最终 bundle 经系统 Bash 的 `--verify` 通过。相同可执行文件的独立测试 bundle
+  使用 fake daemon 验证 A→B→C；日志顺序为 A 开始、A 结束、C 开始、C 结束，B
+  未执行，窗口显示 C 正文。侧栏与会话顶部的长标题显示省略号；失败来源加成功零条
+  时，侧栏和主区均显示“没有可显示的会话”，来源错误仍可见。
+- 未运行真实 vendor E2E；900px 实窗缩放和窗口拖动仍未取得验收证据。
 
 ## 已知缺口与后续
 
