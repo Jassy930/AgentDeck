@@ -63,6 +63,19 @@ struct ThreadReadTurn {
     items: Vec<Value>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadTurnsPage {
+    data: Vec<ThreadReadTurn>,
+    next_cursor: Option<String>,
+}
+
+fn history_turn(turn: ThreadReadTurn) -> HistoryTurn {
+    HistoryTurn {
+        items: turn.items.iter().map(history_item_to_agent_item).collect(),
+    }
+}
+
 fn decode_error(operation: &str, _error: serde_json::Error) -> ProtocolError {
     ProtocolError {
         code: "codex-history-decode-failed".into(),
@@ -103,9 +116,14 @@ fn runtime_cwd() -> Result<PathBuf, ProtocolError> {
 }
 
 fn thread_list_params(cwd_filter: Option<&Path>, limit: usize, cursor: Option<&str>) -> Value {
+    // `modelProviders: []` 按官方语义表示"不过滤 provider"。省略它时 app-server
+    // 只返回当前配置 provider 下的线程：本机 config.toml 解析失败就退回默认
+    // provider，自定义 provider 记下的历史会被整体过滤成空列表。历史是只读展示，
+    // 不该依赖用户的 provider 配置是否有效。
     let mut params = json!({
         "archived": false,
         "limit": u32::try_from(limit).expect("AgentDeck history limit fits u32"),
+        "modelProviders": [],
         "sortDirection": "desc",
         "sortKey": "updated_at",
     });
@@ -163,10 +181,16 @@ pub async fn list_history(
     limit: Option<usize>,
 ) -> Result<Vec<HistoryListItem>, ProtocolError> {
     let cwd_filter = cwd_filter.map(Path::to_path_buf);
-    let mut client = ShortLivedAppServer::spawn(&runtime_cwd()?)?;
-    let result = with_history_deadline(
+    let started = tokio::time::Instant::now();
+    let mut client = with_history_deadline(
         "list",
         history_work_timeout(),
+        ShortLivedAppServer::spawn(&runtime_cwd()?),
+    )
+    .await?;
+    let result = with_history_deadline(
+        "list",
+        history_work_timeout().saturating_sub(started.elapsed()),
         list_history_inner(&mut client, cwd_filter, limit),
     )
     .await;
@@ -232,9 +256,7 @@ fn decode_thread_read(
         .thread
         .turns
         .into_iter()
-        .map(|turn| HistoryTurn {
-            items: turn.items.iter().map(history_item_to_agent_item).collect(),
-        })
+        .map(history_turn)
         .collect();
     Ok(HistoryReadResponse {
         thread_id: requested_thread_id.clone(),
@@ -246,10 +268,16 @@ fn decode_thread_read(
 /// Read all persisted turns/items for one Codex thread. The item payloads are
 /// mapped through the same completed-item translator as live sessions.
 pub async fn read_history(thread_id: &ThreadId) -> Result<HistoryReadResponse, ProtocolError> {
-    let mut client = ShortLivedAppServer::spawn(&runtime_cwd()?)?;
-    let result = with_history_deadline(
+    let started = tokio::time::Instant::now();
+    let mut client = with_history_deadline(
         "read",
         history_work_timeout(),
+        ShortLivedAppServer::spawn(&runtime_cwd()?),
+    )
+    .await?;
+    let result = with_history_deadline(
+        "read",
+        history_work_timeout().saturating_sub(started.elapsed()),
         read_history_inner(&mut client, thread_id.clone()),
     )
     .await;
@@ -265,10 +293,41 @@ async fn read_history_inner(
     let result = client
         .request(
             "thread/read",
-            json!({ "threadId": thread_id.0.clone(), "includeTurns": true }),
+            json!({ "threadId": thread_id.0.clone(), "includeTurns": false }),
         )
         .await?;
-    decode_thread_read(result, &thread_id)
+    let mut history = decode_thread_read(result, &thread_id)?;
+    let mut cursor: Option<String> = None;
+    loop {
+        let result = client
+            .request(
+                "thread/turns/list",
+                json!({
+                    "threadId": thread_id.0,
+                    "cursor": cursor,
+                    "limit": 100,
+                    "sortDirection": "asc",
+                    "itemsView": "full",
+                }),
+            )
+            .await?;
+        let page: ThreadTurnsPage = serde_json::from_value(result)
+            .map_err(|error| decode_error("thread/turns/list", error))?;
+        history
+            .turns
+            .extend(page.data.into_iter().map(history_turn));
+        if page.next_cursor.is_none() {
+            return Ok(history);
+        }
+        if page.next_cursor == cursor {
+            return Err(ProtocolError {
+                code: "codex-history-pagination-stalled".into(),
+                message: "thread/turns/list returned the same pagination cursor twice".into(),
+                diagnostic_ref: None,
+            });
+        }
+        cursor = page.next_cursor;
+    }
 }
 
 /// Archive is not exposed yet; return a structured error.
@@ -307,7 +366,7 @@ mod tests {
         json!({
             "agentNickname": null,
             "agentRole": null,
-            "cliVersion": "0.145.0",
+            "cliVersion": "0.155.0-alpha.9.2",
             "createdAt": 10,
             "cwd": "/tmp/project",
             "ephemeral": false,
@@ -336,6 +395,8 @@ mod tests {
         assert_eq!(params["cwd"], "/tmp/project");
         assert_eq!(params["cursor"], "next-1");
         assert_eq!(params["limit"], 25);
+        // 空数组 = 全部 provider；缺省会被 app-server 收窄到当前配置的 provider。
+        assert_eq!(params["modelProviders"], json!([]));
         assert_eq!(params["sortKey"], "updated_at");
         assert_eq!(params["sortDirection"], "desc");
         assert!(params.get("sourceKinds").is_none());
@@ -392,7 +453,7 @@ mod tests {
     fn thread_read_reuses_live_item_mapping_and_preserves_turns() {
         let response = json!({
             "thread": {
-                "cliVersion": "0.145.0",
+                "cliVersion": "0.155.0-alpha.9.2",
                 "createdAt": 10,
                 "cwd": "/tmp/project",
                 "ephemeral": false,
@@ -551,6 +612,111 @@ mod tests {
         assert_eq!(error.code, "codex-history-decode-failed");
         assert!(error.message.contains(DECODE_DETAILS_WITHHELD_NOTE));
         assert!(!error.message.contains(secret));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn history_reads_full_turn_pages_in_order_and_rejects_incomplete_results() {
+        use crate::codex::app_server::CodexBinary;
+        use std::os::unix::fs::PermissionsExt;
+
+        let first_page = json!({
+            "data": [{ "items": [{ "type": "userMessage", "content": [
+                { "type": "text", "text": "first turn" }
+            ] }] }],
+            "nextCursor": "page-2"
+        });
+        let cases = [
+            (
+                json!({ "result": {
+                "data": [{ "items": [{ "type": "agentMessage", "text": "second turn" }] }]
+            } }),
+                None,
+            ),
+            (
+                json!({ "result": { "data": [], "nextCursor": "page-2" } }),
+                Some("codex-history-pagination-stalled"),
+            ),
+            (
+                json!({ "result": { "data": "sk-malformed-page-secret" } }),
+                Some("codex-history-decode-failed"),
+            ),
+            (
+                json!({ "error": { "code": -32603, "message": "sk-upstream-secret" } }),
+                Some("codex-protocol-error"),
+            ),
+        ];
+        for (mut last_reply, expected_error) in cases {
+            let root = std::env::temp_dir()
+                .join(format!("agentdeck-history-pages-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            let executable = root.join("codex");
+            let log = root.join("requests.jsonl");
+            last_reply["id"] = json!(4);
+            let replies = [
+                json!({ "id": 1, "result": {} }),
+                json!({ "id": 2, "result": { "thread": { "id": "thread-1", "turns": [] } } }),
+                json!({ "id": 3, "result": first_page }),
+                last_reply,
+            ];
+            let mut script = format!(
+                "#!/bin/sh\nif [ \"$1\" = '--version' ]; then\n  printf '%s\\n' '{}'\n  exit 0\nfi\n",
+                crate::codex::capabilities::supported_codex_version()
+            );
+            for (index, reply) in replies.iter().enumerate() {
+                script.push_str(&format!(
+                    "IFS= read -r frame || exit 10\nprintf '%s\\n' \"$frame\" >> '{}'\nprintf '%s\\n' '{}'\n",
+                    log.display(), reply
+                ));
+                if index == 0 {
+                    script.push_str(&format!(
+                        "IFS= read -r frame || exit 11\nprintf '%s\\n' \"$frame\" >> '{}'\n",
+                        log.display()
+                    ));
+                }
+            }
+            script.push_str("while IFS= read -r frame; do :; done\n");
+            std::fs::write(&executable, script).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let binary = CodexBinary::resolve_at(&executable).await.unwrap();
+            let mut client = ShortLivedAppServer::spawn_with_binary(&root, &binary).unwrap();
+            let result = read_history_inner(&mut client, ThreadId("thread-1".into())).await;
+            client.shutdown().await;
+            let requests: Vec<Value> = std::fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            std::fs::remove_dir_all(&root).unwrap();
+
+            assert_eq!(requests.len(), 5);
+            assert!(requests[0]["params"].get("capabilities").is_none());
+            assert_eq!(requests[1]["method"], "initialized");
+            assert_eq!(requests[2]["method"], "thread/read");
+            assert_eq!(requests[2]["params"]["includeTurns"], false);
+            for (request, cursor) in requests[3..].iter().zip([Value::Null, json!("page-2")]) {
+                assert_eq!(request["method"], "thread/turns/list");
+                assert_eq!(
+                    request["params"],
+                    json!({
+                        "threadId": "thread-1", "cursor": cursor,
+                        "limit": 100, "sortDirection": "asc", "itemsView": "full"
+                    })
+                );
+            }
+            if let Some(code) = expected_error {
+                let error = result.expect_err("later-page failure must not return partial history");
+                assert_eq!(error.code, code);
+                assert!(!error.message.contains("sk-"));
+            } else {
+                let history = result.unwrap();
+                assert_eq!(history.turns.len(), 2);
+                assert!(matches!(&history.turns[0].items[0],
+                    AgentItem::UserMessage { text, .. } if text == "first turn"));
+                assert!(matches!(&history.turns[1].items[0],
+                    AgentItem::AssistantMessage { text, .. } if text == "second turn"));
+            }
+        }
     }
 
     #[tokio::test]

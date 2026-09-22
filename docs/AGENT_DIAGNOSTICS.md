@@ -92,12 +92,12 @@ daemon 会持续 drain Codex app-server 子进程 stderr，避免管道回压卡
 | `codex-interrupt-timeout` | `turn/interrupt` 后未在 grace period 内收到权威 terminal | 等待 failed `SessionClosed` 与 daemon 退出；从保留的 threadId 显式恢复，不要自动重放 |
 | `codex-close-timeout` | close 已开始，但 active turn 未在 close deadline 内收口 | 等待 daemon 执行强制 cleanup；若随后是 failed close，按 cleanup failure 排查 |
 | `codex-disconnected` / `codex-stdout-read-failed` / `codex-stdin-write-failed` | app-server transport 在 terminal 前断开或读写失败 | 将当前 session 视为不可继续；核对 Codex 版本、进程退出原因与对应 diagnosticRef |
-| `codex-malformed-json` / `codex-unmatched-response` / `codex-protocol-error` | vendor frame 无法按固定 schema 解码、response 无对应 request，或 JSON-RPC error | 与 `protocol/` 中 0.145.0 官方 schema 对照；不要把该 session 恢复为 Ready |
+| `codex-malformed-json` / `codex-unmatched-response` / `codex-protocol-error` | vendor frame 无法按固定 schema 解码、response 无对应 request，或 JSON-RPC error | 与 `protocol/` 中 0.155.0-alpha.9.2 官方 schema 对照；不要把该 session 恢复为 Ready |
 | `codex-unsupported-server-request` / `codex-terminal-status-invalid` | app-server 发出 M0 不支持的 server request，或 terminal status 仍是 `inProgress` | 记录可复现方法与固定版本；该 turn/session 会按 protocol failure 收口 |
 | `codex-cleanup-failed` | 无法确认 direct child 已 wait、Unix 进程组已消失或 stderr pump 已停止 | 不再向该 daemon 发新 session；等待 failed `SessionClosed` 后 daemon 退出，检查残留 app-server/helper 进程 |
 | `turn-id-already-used` | client 在同一 session 内复用了已接受的 caller-owned `turnId` | 生成新的 `turnId` 后重试；该拒绝不会写入 vendor 或改变 Ready session |
 
-`initialize` 成功仍可能在 `thread/start` 因用户配置类型不兼容而返回 `codex-protocol-error`；本轮 0.145.0 遇到 `features.context_management` 的 table/bool 冲突，仅用进程级 `-c features.context_management=false` 覆盖完成真实验收，未修改全局配置，详见 [当前验收边界](AGENTDECKD_STATUS.md#当前验收边界)。
+`initialize` 成功仍可能在 `thread/start` 因用户配置类型不兼容而返回 `codex-protocol-error`；2026-09-21 的 0.145.0 验收曾遇到 `features.context_management` 的 table/bool 冲突，仅用进程级 `-c features.context_management=false` 覆盖完成真实验收，未修改全局配置。当前 0.155.0-alpha.9.2 尚未重跑 lifecycle E2E，详见 [当前验收边界](AGENTDECKD_STATUS.md#当前验收边界)。
 
 Claude Code 历史 archive / rename 子进程遵守同一 K9 边界：daemon 将其
 stdout / stderr 直接丢弃，非零退出只返回结构化 failure code、exit status 和
@@ -116,8 +116,25 @@ agentdeck history list --agent claude-code --limit 20
 ```
 
 排查“全部历史为空”时不要加 `--cwd-filter`，否则结果会被缩小到指定项目。Codex
-列表和读取分别调用官方 `thread/list`、`thread/read(includeTurns=true)`，不是扫描
-当前 AgentDeck 会话或猜测本地记录格式。
+列表调用官方 `thread/list(modelProviders=[])`，避免按当前 provider 过滤掉其他来源的
+历史。正文先调用 `thread/read(includeTurns=false)` 核对会话，再用
+`thread/turns/list(itemsView=full, sortDirection=asc)` 跟随游标读取全部轮次；不扫描
+当前 AgentDeck 会话或猜测本地记录格式。任意页面失败会使整次读取失败，不返回残缺正文。
+当前固定版本的分页接口属于稳定 API，不需要 `experimentalApi`。
+
+若列表正常而读取返回 `codex-protocol-error`，需区分分页接口与 vendor 数据兼容性：
+调查中旧 0.145.0 曾拒绝解析部分新版客户端保存的子代理 `completed` 记录（上游
+`-32603`）。当前已将协议与版本升级至 0.155.0-alpha.9.2；仍须核对实际运行版本和
+逐页读回结果，不能改用摘要或空列表掩盖失败。桌面 selfcheck 和 fake bundle 验证
+均不能证明真实正文可读。
+
+daemon 会依次异步探测 PATH 与常见安装位置，只跳过成功读出但不匹配的版本，选择完整版本精确
+匹配 `protocol/CODEX_VERSION.txt` 的首个 executable。macOS 候选包含
+`/Applications/ChatGPT.app/Contents/Resources/codex`，因此 shell 中的 `codex --version`
+可能仍显示 Homebrew 的 0.145.0，不能据此认定 daemon 选错版本。probe 与 spawn 使用
+同一规范化绝对路径。执行失败、非法输出、超时或清理失败立即返回，不再尝试其他候选。
+所有候选共享 5 秒探测预算，历史请求的候选查找与 RPC 共享 28 秒工作预算，另预留
+2 秒清理。App 更新后若不再提供固定版本，需要安装匹配版本或同步升级协议。
 
 CLI 与桌面 client 都为每次历史请求生成唯一 `requestId`。daemon 无论成功还是失败
 都在对应的 history admin 终态回复中原样回显。客户端只消费严格匹配当前
@@ -126,12 +143,14 @@ CLI 与桌面 client 都为每次历史请求生成唯一 `requestId`。daemon �
 
 | code | 含义 | 下一步 |
 | --- | --- | --- |
-| `codex-version-unsupported` | daemon 找不到可规范化的 `codex` executable、`--version` 探测失败，或版本不等于 `protocol/CODEX_VERSION.txt` 固定值 | 运行 `/usr/bin/which codex` 和 `codex --version`；修复 GUI 启动环境的安装/路径，或安装固定版本后重启 App |
-| `codex-version-timeout` | `codex --version` 超过 5 秒；探测会终止并回收独立进程组，清理预算另为 2 秒 | 检查所定位 executable 或 launcher 是否挂起；不能将它视为版本不匹配或合法空历史 |
-| `codex-spawn-failed` | 已定位 `codex`，但无法启动 `codex app-server`，或子进程标准管道不可用 | 运行 `codex app-server --help`；结合错误中的系统原因检查可执行权限、隔离属性和启动环境 |
-| `codex-rpc-timeout` | 单次 `initialize` / `thread/list` / `thread/read` RPC 超过 20 秒 | 分别执行 Codex list/read 定位卡住的方法；核对 Codex 版本，并暂时禁用异常 MCP 配置后复测 |
-| `codex-history-timeout` | Codex 历史 list/read 的 30 秒总预算内会为进程清理预留 2 秒；工作阶段超时后 daemon 清理短生命周期 app-server 进程组 | 分别执行 Codex list/read 定位卡住的操作；优先排查 app-server 或 MCP helper 卡住 |
-| `codex-history-decode-failed` | 官方 `thread/list` 或 `thread/read` 返回值无法按当前协议结构解码；错误只带固定 withheld 标记，不包含 serde 文本或 vendor 响应值 | 记录 `codex --version`，与 `protocol/CODEX_VERSION.txt` 对照；按官方 schema 刷新流程确认是否发生版本漂移，不要把它当作合法空历史 |
+| `codex-version-unsupported` | daemon 探测候选后没有找到完整版本精确匹配 `protocol/CODEX_VERSION.txt` 的 executable | 核对 PATH 和常见安装位置中各 executable 的 `--version`，包括 macOS App 自带路径；修复安装/路径，或安装固定版本后重启 App |
+| `codex-version-probe-failed` | 已存在的候选无法执行、`--version` 非零退出或输出不是合法版本 | 检查该 executable 或 launcher 的权限、退出码及版本输出；修复此候选后重试，不会回退到其他系统安装 |
+| `codex-version-timeout` | 所有候选共享的 5 秒探测预算耗尽；探测会终止并回收独立进程组，清理预算另为 2 秒 | 检查所定位 executable 或 launcher 是否挂起；不能将它视为版本不匹配或合法空历史 |
+| `codex-spawn-failed` | 已定位 `codex`，但无法启动 `codex app-server`，或子进程标准管道不可用 | 使用实际匹配版本的 executable 运行 `app-server --help`；结合错误中的系统原因检查可执行权限、隔离属性和启动环境 |
+| `codex-rpc-timeout` | 单次 `initialize` / `thread/list` / `thread/read` / `thread/turns/list` RPC 超过 20 秒 | 分别执行 Codex list/read 定位卡住的方法；核对 Codex 版本，并暂时禁用异常 MCP 配置后复测 |
+| `codex-history-timeout` | Codex 历史 list/read 的候选查找与 RPC 共用 28 秒工作预算，另预留 2 秒清理；工作阶段超时后 daemon 清理短生命周期 app-server 进程组 | 分别执行 Codex list/read 定位卡住的操作；优先排查 app-server 或 MCP helper 卡住 |
+| `codex-history-decode-failed` | 官方 history 返回值无法按当前协议结构解码；错误只带固定 withheld 标记，不包含 serde 文本或 vendor 响应值 | 记录实际使用的 executable 路径及 `--version`，与 `protocol/CODEX_VERSION.txt` 对照；按官方 schema 刷新流程确认是否发生版本漂移，不要把它当作合法空历史 |
+| `codex-history-pagination-stalled` | 列表或正文分页返回了未推进的游标 | 本次读取失败；核对固定版本的分页接口，不能把已读页面当完整结果 |
 | `history-no-sources` | router 中没有注册任何历史来源 | 运行 `agentdeck selfcheck` 和 `agentdeck agent list`，确认 App 使用的是当前打包 daemon 且 adapter 已注册 |
 | `history-source-timeout` | 跨 agent list 中单一来源超过 router 的 30 秒独立 deadline；若另一来源成功，router 会保留其结果并完成 best-effort 回复 | 用带 `--agent` 的 list 命令单独探测慢来源；检查对应 vendor CLI 或 app-server 是否挂起 |
 | `history-all-sources-failed` | 已注册的所有来源都失败；错误消息会列出各来源及其底层 failure code | 分别运行两条带 `--agent` 的 list 命令，按各自底层 code 修复；该错误不能按“历史为空”处理 |

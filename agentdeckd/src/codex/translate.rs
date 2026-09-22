@@ -776,6 +776,7 @@ fn classify(item: &Value) -> InFlightKind {
         "imageView" | "imageGeneration" => InFlightKind::Image,
         "mcpToolCall"
         | "dynamicToolCall"
+        | "functionCallOutput"
         | "collabAgentToolCall"
         | "subAgentActivity"
         | "contextCompaction"
@@ -927,7 +928,7 @@ fn tool_meta(item: &Value) -> AgentItemMeta {
                 .insert("activityKind".to_string(), json!("collaboration"));
         }
         if kind == "subAgentActivity" {
-            if let Some(activity_event @ ("started" | "interacted" | "interrupted")) =
+            if let Some(activity_event @ ("started" | "interacted" | "interrupted" | "completed")) =
                 item.get("kind").and_then(Value::as_str)
             {
                 meta.vendor_extensions
@@ -1005,6 +1006,7 @@ fn tool_args(item: &Value) -> Value {
 
 fn tool_result(item: &Value) -> Option<Value> {
     match item.get("type").and_then(Value::as_str).unwrap_or("") {
+        "functionCallOutput" => item.get("output").cloned(),
         "dynamicToolCall" => Some(object_with_present_fields(
             item,
             &["contentItems", "success"],
@@ -1551,8 +1553,52 @@ mod tests {
     }
 
     #[test]
+    fn shared_tool_mapping_preserves_function_call_outputs() {
+        for output in [
+            json!("found"),
+            json!([
+                { "type": "input_text", "text": "found" },
+                { "type": "input_image", "image_url": "https://example.com/image.png" }
+            ]),
+        ] {
+            let item = history_item_to_agent_item(&json!({
+                "id": "function-output-1",
+                "type": "functionCallOutput",
+                "name": "lookup",
+                "namespace": "tools",
+                "output": output,
+                "vendorSecret": "must-not-cross"
+            }));
+
+            match &item {
+                AgentItem::ToolCall {
+                    name,
+                    args,
+                    result,
+                    meta,
+                } => {
+                    assert_eq!(name, "lookup");
+                    assert!(args.is_null());
+                    assert_eq!(result.as_ref(), Some(&output));
+                    assert_eq!(meta.vendor_extensions["namespace"], "tools");
+                    assert_eq!(
+                        meta.vendor_extensions["codexToolKind"],
+                        "functionCallOutput"
+                    );
+                }
+                other => panic!("expected function output ToolCall, got {other:?}"),
+            }
+            assert!(
+                !serde_json::to_string(&item)
+                    .unwrap()
+                    .contains("must-not-cross")
+            );
+        }
+    }
+
+    #[test]
     fn shared_tool_mapping_preserves_subagent_activity_without_inventing_status() {
-        for activity_event in ["started", "interacted", "interrupted"] {
+        for activity_event in ["started", "interacted", "interrupted", "completed"] {
             let item = history_item_to_agent_item(&json!({
                 "id": format!("activity-{activity_event}"),
                 "type": "subAgentActivity",

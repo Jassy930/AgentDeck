@@ -1,22 +1,16 @@
-//! Gate: `AGENTDECK_E2E=1` — requires real `codex` binary in PATH and `codex login`.
+//! Gate: `AGENTDECK_E2E=1` — requires an installed supported Codex and `codex login`.
 //!
 //! Run with:
 //!   cargo build --locked -p agentdeckd --bin agentdeckd
 //!   AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" AGENTDECK_E2E=1 \
 //!     cargo test -p agentdeck-cli --test e2e_codex
 //!
-//! All tests double-gated: skip cleanly when `AGENTDECK_E2E` is unset OR
-//! when the `codex` binary is absent.
+//! Tests skip unless `AGENTDECK_E2E=1`; enabled tests require the current checkout
+//! daemon. The daemon resolves Codex, including supported App installations.
 
 mod support;
 
-use support::{
-    ADMIN_TIMEOUT, HISTORY_TIMEOUT, SESSION_TIMEOUT, real_e2e_enabled, run_cli, vendor_available,
-};
-
-fn codex_available() -> bool {
-    vendor_available("codex")
-}
+use support::{ADMIN_TIMEOUT, HISTORY_TIMEOUT, SESSION_TIMEOUT, real_e2e_enabled, run_cli};
 
 // ── Basic plumbing ─────────────────────────────────────────────────────────────
 
@@ -24,10 +18,6 @@ fn codex_available() -> bool {
 fn e2e_codex_ping() {
     if !real_e2e_enabled() {
         eprintln!("SKIP: set AGENTDECK_E2E=1 to run Codex E2E tests");
-        return;
-    }
-    if !codex_available() {
-        eprintln!("SKIP: codex not in PATH");
         return;
     }
     let out = run_cli(&["ping"], ADMIN_TIMEOUT);
@@ -47,10 +37,6 @@ fn e2e_codex_selfcheck() {
         eprintln!("SKIP: set AGENTDECK_E2E=1");
         return;
     }
-    if !codex_available() {
-        eprintln!("SKIP: codex not in PATH");
-        return;
-    }
     let out = run_cli(&["selfcheck"], ADMIN_TIMEOUT);
     assert!(
         out.status.success(),
@@ -68,10 +54,6 @@ fn e2e_codex_selfcheck() {
 fn e2e_codex_agent_list_contains_codex() {
     if !real_e2e_enabled() {
         eprintln!("SKIP: set AGENTDECK_E2E=1");
-        return;
-    }
-    if !codex_available() {
-        eprintln!("SKIP: codex not in PATH");
         return;
     }
     let out = run_cli(&["agent", "list"], ADMIN_TIMEOUT);
@@ -98,10 +80,6 @@ fn e2e_codex_agent_list_contains_codex() {
 fn e2e_codex_agent_capabilities_matches_m0_boundary() {
     if !real_e2e_enabled() {
         eprintln!("SKIP: set AGENTDECK_E2E=1");
-        return;
-    }
-    if !codex_available() {
-        eprintln!("SKIP: codex not in PATH");
         return;
     }
     let out = run_cli(
@@ -140,10 +118,6 @@ fn e2e_codex_live_four_turn_lifecycle() {
         eprintln!("SKIP: set AGENTDECK_E2E=1");
         return;
     }
-    assert!(
-        codex_available(),
-        "AGENTDECK_E2E=1 requires the pinned Codex binary on PATH"
-    );
     let root = support::live::temp_root("codex-live-e2e");
     let command = support::cli_command(&["session", "live", "--data-dir", root.to_str().unwrap()]);
     support::live::four_turn_scenario(command, &root, std::time::Duration::from_secs(300));
@@ -249,10 +223,6 @@ fn e2e_codex_session_run_to_completion() {
         eprintln!("SKIP: set AGENTDECK_E2E=1");
         return;
     }
-    if !codex_available() {
-        eprintln!("SKIP: codex not in PATH");
-        return;
-    }
 
     let (thread_id, events) = run_codex_session("say hi");
 
@@ -280,10 +250,6 @@ fn e2e_codex_session_run_to_completion() {
 fn e2e_codex_session_continue_to_completion() {
     if !real_e2e_enabled() {
         eprintln!("SKIP: set AGENTDECK_E2E=1");
-        return;
-    }
-    if !codex_available() {
-        eprintln!("SKIP: codex not in PATH");
         return;
     }
 
@@ -344,10 +310,6 @@ fn e2e_codex_session_continue_to_completion() {
 fn e2e_codex_history_list_succeeds() {
     if !real_e2e_enabled() {
         eprintln!("SKIP: set AGENTDECK_E2E=1");
-        return;
-    }
-    if !codex_available() {
-        eprintln!("SKIP: codex not in PATH");
         return;
     }
 

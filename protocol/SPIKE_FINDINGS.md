@@ -1,8 +1,8 @@
 # 协议 Spike 发现（Step 0,Eng D7）
 
 首次 framing 实测日期：2026-05-19
-schema 最近刷新日期：2026-08-18
-codex 版本：codex-cli 0.145.0（已固定在 `CODEX_VERSION.txt`）
+schema 最近刷新日期：2026-09-22
+codex 版本：codex-cli 0.155.0-alpha.9.2（完整版本已固定在 `CODEX_VERSION.txt`）
 
 ## D7 核心问题：wire framing 是什么？
 
@@ -29,15 +29,16 @@ schema；`generate-ts --out DIR` 可生成 TypeScript binding。**不需要逆�
 固化进项目的关键 schema（`protocol/`）：
 - `JSONRPCMessage.json` — 消息信封（Request/Notification/Response/Error）
 - `ClientRequest.json` — 客户端可发的请求（方法名见 client-methods.txt）
-- `ClientNotification.json` — 客户端通知；0.145.0 当前定义 `initialized`。该官方生成
+- `ClientNotification.json` — 客户端通知，包含 `initialized`。该官方生成
   快照已提交，live session 与 short-lived history path 均实现该 notification。
 - `ServerNotification.json` — 服务端通知（item 事件流在这里）
 - `ServerRequest.json` — 服务端发起的请求（approval 在这里）
 - `codex_app_server_protocol.v2.schemas.json` — v2 完整 schema
 
 `client-methods.txt` 从 `ClientRequest.json` 的
-`oneOf[*].properties.method.enum[0]` 确定性派生，不手写。0.145.0 共
-89 个方法；派生命令见 `docs/QUALITY.md`。
+`oneOf[*].properties.method.enum[0]` 确定性派生，不手写。0.155.0-alpha.9.2 的默认
+生成物包含 101 个稳定方法；派生命令见 `docs/QUALITY.md`。这套 vendor schema
+与 AgentDeck 自身 IPC v4 独立，升级 vendor 快照不改变 IPC 版本。
 
 ## 关键方法确认
 
@@ -48,8 +49,12 @@ schema；`generate-ts --out DIR` 可生成 TypeScript binding。**不需要逆�
 - `turn/interrupt` / `turn/steer` — 打断/引导当前 turn（D9 状态机 cancel 用）
 - **`thread/fork`** — 确实存在（D8 fork 能力的协议依据，v0.2）
 - `thread/resume` — 恢复会话（对应研究里的 resume 痛点）
-- `thread/list` / `thread/read` — 列出本机会话并读取持久化 turns/items
-- `thread/shellCommand`、`thread/compact/start`、`thread/rollback` 等
+- `thread/list` / `thread/read` — 列出本机会话并读取元数据
+- `thread/turns/list` — 稳定 API，按游标读取持久化 turns/items，全文使用
+  `itemsView=full`，不需要 `experimentalApi`。新旧存储模式均支持，paginated
+  模式不能使用 `thread/read(includeTurns=true)`；请求与响应已包含在默认官方快照中。
+- `thread/shellCommand`、`thread/compact/start`、`thread/revert` 等；当前方法表不再
+  包含旧 `thread/rollback`。
 
 ## approval 协议（D8 验证）
 
@@ -62,7 +67,7 @@ ServerRequest 里有具体 approval 类型，**带结构化元数据**（非字�
 是带类型的结构化对象，daemon 可据此映射中立 `AgentActionRequest` 并
 判定危险等级，无需字符串猜命令。
 
-0.145.0 的默认官方生成物已包含对应 response schema：
+当前默认官方生成物包含对应 response schema：
 - `CommandExecutionRequestApprovalResponse`：`{"decision":"accept|decline|cancel|acceptForSession|..."}`
 - `FileChangeRequestApprovalResponse`：`{"decision":"accept|decline|cancel|acceptForSession"}`
 - `PermissionsRequestApprovalResponse`：`{"permissions": GrantedPermissionProfile, "scope": "turn|session", "strictAutoReview": ...}`
@@ -75,11 +80,11 @@ AgentDeck v0.1 只暴露一次性 approve / deny：命令和文件请求映射�
 
 - **D7 → 已验证**：framing = 逐行 JSONL，最简单分支。BufReader 按行读。
 - **C-protocol 待补 → 已解决**：request/notification 方法名、版本和关键 schema 已锁定。
-- **M0 握手实现 → 已落地、待真实验收**：Issue #3 的 live session owner 与
+- **M0 握手实现 → 已落地、升级后待重新验收**：Issue #3 的 live session owner 与
   `ShortLivedAppServer` 都在 initialize response 后、thread request 前发送
   `initialized`，fake executable/duplex 测试守护顺序，官方 `ClientNotification.json`
-  同步固定该 wire。desktop 接入前仍须由 #5 的持久真实 Codex E2E 证明握手、多轮和
-  close 没有随 vendor 漂移。
+  同步固定该 wire。0.145.0 已有受限配置环境的真实四轮证据；升级至
+  0.155.0-alpha.9.2 后尚未重跑持久真实 E2E，需重新证明握手、多轮和 close。
 - **D8 → 强化**：approval 元数据结构化，中立 action 抽象有可靠数据源。
 - **D2 → 实现路径清晰**：daemon 用官方 schema 反序列化 Codex 消息，
   翻译成中立 AgentItem，IPC 传中立 JSON。

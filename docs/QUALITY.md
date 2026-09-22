@@ -192,18 +192,30 @@ RuntimeHub/router 修正；这些离线证据不能升级为真实 Codex E2E。
 
 ## Codex vendor schema 快照
 
-`protocol/ClientRequest.json` 等文件是 Codex app-server 的 vendor 协议快照。Issue #3
-已从固定 0.145.0 官方生成物补入 `protocol/ClientNotification.json`；live session 与
-short-lived history path 都发送规范的 `initialized`，fake 测试守护 initialize response
+`protocol/ClientRequest.json` 等文件是 Codex app-server 的 vendor 协议快照，当前固定为
+`codex-cli 0.155.0-alpha.9.2`，包含完整版本后缀。live session 与 short-lived history
+path 都发送规范的 `initialized`，fake 测试守护 initialize response
 → initialized → thread request 顺序。这套 vendor 快照与 AgentDeck 自身 schemars 生成的
 `protocol/agentdeck/agentdeck-protocol.schema.json` 是两套独立门禁。
 `cargo test` 通过不能证明本机 Codex 版本与 vendor 快照一致。
 
+历史正文使用稳定的 `thread/turns/list`，参数与响应保存在同一套官方默认生成物中，
+无需 `experimentalApi` 或单独的 experimental 快照。真实读取验收必须覆盖 paginated
+历史，只验证 `kind=list` 或合法空列表不足以证明正文可读；后续页面失败不能算完整
+读取通过。历史读回也不能替代升级后的真实 lifecycle E2E 与桌面正文点击验收。
+
+daemon 按 PATH、常见安装位置的顺序异步探测候选，只跳过成功读出但不匹配的版本并使用首个精确
+匹配版本。macOS 同时探测 App 自带 executable；即使 `command -v codex` 返回旧版
+Homebrew 安装，也不代表 daemon 使用它。离线 locator 用例须验证跳过不匹配候选、
+非零退出与非法输出停止查找、慢探测不阻塞 runtime，以及候选共享 5 秒探测预算；
+history 候选查找与 RPC 须共享 28 秒工作预算并预留清理。probe 与 spawn 始终绑定同一
+规范化绝对路径，CLI fake 用例覆盖探测失败不会启动后续系统候选。
+
 升级刷新或同版本复验时，都先在临时目录 fail-closed 生成，并记录本机
-Codex 的实际版本：
+Codex 的实际版本。显式指定要生成快照的 executable，不依赖 PATH 首项：
 
 ```bash
-CODEX_BIN="$(command -v codex)"
+CODEX_BIN="/Applications/ChatGPT.app/Contents/Resources/codex"
 ACTUAL_VERSION="$("$CODEX_BIN" --version)"
 SCHEMA_DIR="$(mktemp -d /tmp/agentdeck-codex-schema.XXXXXX)"
 "$CODEX_BIN" app-server generate-json-schema --out "$SCHEMA_DIR"
@@ -249,7 +261,8 @@ cmp "$SCHEMA_DIR/committed-v2.normalized.json" \
   "$SCHEMA_DIR/generated-v2.normalized.json"
 ```
 
-确认 method 表行数和内容一致后，运行 `scripts/verify-offline-tests.sh`、
+当前稳定 method 表为 101 项；旧 `thread/rollback` 已替换为 `thread/revert`，正文
+分页进入稳定表。确认 method 表行数和内容一致后，运行 `scripts/verify-offline-tests.sh`、
 `scripts/verify-agent-docs.sh` 和 `git diff --check`。当前稳定合约不使用
 `--experimental`；只有客户端显式启用 `experimentalApi` 时才建立独立实验基线。
 
@@ -304,6 +317,8 @@ AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" AGENTDECK_E2E=1 \
 Cargo 测试中显示为 passed 而非 ignored。
 
 **前置条件：** `codex login` 已完成（测试会真实 spawn daemon 并发送 IPC）。
+Codex E2E 在显式门控后使用 daemon 的候选定位，不因 PATH 中没有 `codex` 而跳过；
+仅安装在受支持 App 路径中的匹配版本也能进入验收。
 
 **断言策略：** E2E 测试只断言响应的契约形态（消息 kind、必要字段存在、退出码等），不断言 agent 返回的具体文本内容，以避免测试因模型输出变化而 flaky。
 
