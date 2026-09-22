@@ -1,5 +1,7 @@
 # AgentDeck
 
+<img src="assets/brand/agentdeck.png" width="96" alt="AgentDeck 图标" />
+
 AgentDeck 是 Coding Agent 的统一原生桌面客户端。产品目标仍是把 Codex 和
 Claude Code 作为一等公民放进同一个工作台；当前实现处于桌面端重启阶段。
 
@@ -92,6 +94,9 @@ cargo run -p agentdeck-desktop -- --selfcheck
 `script/build_and_run.sh` 是唯一桌面 build/run 入口。它构建
 `agentdeck-desktop`、装配 `dist/AgentDeck.app`、写入 macOS 15 最低版本并启动
 最新产物。当前最小 bundle 不携带或启动 `agentdeckd`。
+
+macOS 应用图标和侧栏品牌行使用统一的 04C 图标；iOS companion 使用同款满版
+AppIcon。正式资源和重新生成 `.icns` 的方式见 [图标资源](assets/brand/README.md)。
 
 Codex 桌面应用里的 Run action 已指向该脚本：
 

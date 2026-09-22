@@ -2,7 +2,12 @@
 //!
 //! 条目当前全部是占位常量，点击只切换主区形态，不加载任何数据。
 
-use gpui::{Context, IntoElement, ParentElement, SharedString, Window, div, prelude::*, px};
+use std::sync::{Arc, LazyLock};
+
+use gpui::{
+    Context, Image, ImageFormat, IntoElement, ParentElement, SharedString, Window, div, img,
+    prelude::*, px,
+};
 use gpui_component::{
     ActiveTheme, Disableable, InteractiveElementExt, Selectable, StyledExt,
     button::{Button, ButtonVariants},
@@ -13,6 +18,13 @@ use crate::shell::{CONNECTORS, Shell};
 
 /// 侧栏宽度，与 Codex Desktop 的全高侧栏一致。
 const WIDTH: f32 = 248.;
+
+static BRAND_ICON: LazyLock<Arc<Image>> = LazyLock::new(|| {
+    Arc::new(Image::from_bytes(
+        ImageFormat::Png,
+        include_bytes!("../../assets/brand/agentdeck.png").to_vec(),
+    ))
+});
 
 /// 透明标题栏下给红绿灯留出的顶部空间。
 pub const TRAFFIC_LIGHT_INSET: f32 = 44.;
@@ -61,7 +73,13 @@ pub fn render(selected: Option<&str>, cx: &mut Context<Shell>) -> impl IntoEleme
                         .pb_1()
                         .justify_between()
                         .items_center()
-                        .child(div().text_sm().font_semibold().child("AgentDeck"))
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(img(BRAND_ICON.clone()).size(px(24.)).flex_shrink_0())
+                                .child(div().text_sm().font_semibold().child("AgentDeck")),
+                        )
                         .child(
                             div()
                                 .text_sm()
