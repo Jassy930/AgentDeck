@@ -89,6 +89,7 @@ selfcheck 的成功输出必须是单行 JSON，并明确包含：
 - 实际启动进程的 executable path 等于 `dist/AgentDeck.app/Contents/MacOS/AgentDeck`。
 - `Info.plist` 的 `LSMinimumSystemVersion` 为 15.0。
 - Mach-O 的 `minos` 为 15.0。
+- `CFBundleIconFile` 指向 `AgentDeck.icns`，bundle 内图标与 `assets/brand/AgentDeck.icns` 一致。
 
 当前 P0 bundle 不携带、也不启动 `agentdeckd`。
 

@@ -11,6 +11,7 @@ DIST_DIR="$ROOT_DIR/dist"
 APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
 APP_CONTENTS="$APP_BUNDLE/Contents"
 APP_MACOS="$APP_CONTENTS/MacOS"
+APP_RESOURCES="$APP_CONTENTS/Resources"
 APP_BINARY="$APP_MACOS/$APP_NAME"
 INFO_PLIST="$APP_CONTENTS/Info.plist"
 DESKTOP_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
@@ -78,8 +79,9 @@ if [[ ! -x "$BUILD_BINARY" ]]; then
 fi
 
 rm -rf "$APP_BUNDLE"
-mkdir -p "$APP_MACOS"
+mkdir -p "$APP_MACOS" "$APP_RESOURCES"
 cp "$BUILD_BINARY" "$APP_BINARY"
+cp "$ROOT_DIR/assets/brand/AgentDeck.icns" "$APP_RESOURCES/AgentDeck.icns"
 chmod +x "$APP_BINARY"
 
 cat >"$INFO_PLIST" <<PLIST
@@ -93,6 +95,8 @@ cat >"$INFO_PLIST" <<PLIST
   <string>$BUNDLE_ID</string>
   <key>CFBundleName</key>
   <string>$APP_NAME</string>
+  <key>CFBundleIconFile</key>
+  <string>AgentDeck.icns</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>LSMinimumSystemVersion</key>
@@ -112,6 +116,12 @@ verify_running_bundle() {
   local actual_min_system_version=""
   local binary_min_system_version=""
   local candidate_pid=""
+
+  if [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$INFO_PLIST")" != "AgentDeck.icns" ]] \
+    || ! cmp -s "$ROOT_DIR/assets/brand/AgentDeck.icns" "$APP_RESOURCES/AgentDeck.icns"; then
+    echo "verify failed: bundle icon is missing or differs from assets/brand/AgentDeck.icns" >&2
+    return 1
+  fi
 
   actual_min_system_version="$(
     /usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" "$INFO_PLIST" 2>/dev/null || true
@@ -144,6 +154,7 @@ verify_running_bundle() {
       echo "verify OK: $APP_BINARY pid=$app_pid"
       echo "verify OK: LSMinimumSystemVersion=$actual_min_system_version"
       echo "verify OK: Mach-O minos=$binary_min_system_version"
+      echo "verify OK: CFBundleIconFile=AgentDeck.icns and bundled icon matches source"
       return 0
     fi
     sleep 0.1
