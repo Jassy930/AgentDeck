@@ -97,12 +97,33 @@ selfcheck 的成功输出必须是单行 JSON，并明确包含：
 每个可交互桌面切片完成前至少确认：
 
 - [ ] `AgentDeck.app` 打开真实窗口并成为前台应用。
-- [ ] 窗口能看到“AgentDeck”和“GPUI 桌面端已启动”。
-- [ ] “关闭”按钮能退出应用。
+- [ ] 侧栏渲染出品牌行、快捷入口、置顶会话、项目区和账号区五段结构。
+- [ ] 空态渲染居中标题、composer 和两张接入卡片；点侧栏会话行切到会话态，
+      点“新建会话”切回空态。
 - [ ] 重新运行统一脚本能停止旧 bundle 实例并启动最新二进制。
 - [ ] 未实现的 daemon、会话和历史能力没有伪 UI 或成功提示。
 
 只有实际检查过窗口后才能勾选；进程存在不能替代视觉和点击证据。
+
+布局类改动用**窗口级截图**留证，不要用全屏截图（会被其他应用的全屏遮罩挡住），
+也不要用模拟鼠标点击驱动 GPUI 窗口（GPUI 不响应 AX click，坐标点击会落到别的应用上）：
+
+```bash
+# 取窗口 ID
+cd /tmp && uv run --quiet --with pyobjc-framework-Quartz python -c "
+import Quartz
+wins = Quartz.CGWindowListCopyWindowInfo(
+    Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements,
+    Quartz.kCGNullWindowID)
+for w in wins:
+    if 'AgentDeck' in str(w.get('kCGWindowOwnerName', '')):
+        print(w.get('kCGWindowNumber'))
+"
+screencapture -x -o -l <WINID> /tmp/agentdeck-shot.png
+```
+
+需要看非默认形态时，临时改初始 `stage` 重新构建截图，截完还原；截图要用最终提交的
+代码重拍。键入和窗口拖动这类需要注入真实输入事件的项目做不到，如实标为未验证。
 
 ## Swift Core 门禁
 
@@ -309,7 +330,8 @@ real-vendor shape 路径都会在 vendor I/O 前返回，不需要 vendor 登录
 ## GPUI P0 收口清单
 
 1. 更新与行为变化直接相关的文档。
-2. 运行桌面测试、selfcheck、bundle verify 和 Swift Core 测试。
-3. 真实查看并点击新窗口。
+2. 运行 `cargo fmt --check -p agentdeck-desktop`、桌面测试、selfcheck、bundle verify
+   和 Swift Core 测试。`cargo check` 通过不代表 fmt 通过，两者都要跑。
+3. 真实查看并点击新窗口，布局改动留窗口级截图。
 4. 运行 `git diff --check` 与 `git status --short --branch`。
 5. 报告未实现的 backend 边界，不把 P0 描述为完整客户端。

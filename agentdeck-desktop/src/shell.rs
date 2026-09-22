@@ -134,16 +134,12 @@ impl Shell {
             )
             .child(
                 // transcript 区：本期只有占位，不渲染消息流。
-                v_flex()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("transcript 尚未接入"),
-                    ),
+                v_flex().flex_1().items_center().justify_center().child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("transcript 尚未接入"),
+                ),
             )
             .child(
                 // 底部悬浮 composer。

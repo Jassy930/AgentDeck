@@ -28,7 +28,11 @@ pub fn render(state: &Entity<InputState>, cx: &App) -> impl IntoElement {
             h_flex()
                 .items_center()
                 .justify_between()
-                .child(h_flex().gap_2().children(TOOLS.iter().map(|tool| chip(tool, cx))))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .children(TOOLS.iter().map(|tool| chip(tool, cx))),
+                )
                 .child(Button::new("composer-send").primary().label("发送")),
         )
 }
