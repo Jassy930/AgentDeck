@@ -44,7 +44,8 @@ pub fn render(
 
     let status = if shell.pending > 0 {
         Some("正在读取会话…".to_string())
-    } else if !shell.sessions.is_empty() {
+    } else if !shell.sessions.is_empty() || shell.agents.iter().any(|agent| agent.error().is_some())
+    {
         None
     } else {
         Some(
@@ -58,13 +59,12 @@ pub fn render(
     let agents: Vec<_> = shell
         .agents
         .iter()
-        .map(|kind| {
-            let count = shell
-                .sessions
-                .iter()
-                .filter(|item| item.agent_kind == *kind)
-                .count();
-            (agent_label(*kind), format!("{count}"))
+        .map(|agent| {
+            (
+                agent_label(agent.kind),
+                agent.status(),
+                agent.error().map(str::to_string),
+            )
         })
         .collect();
 
@@ -153,23 +153,31 @@ pub fn render(
         )
         .child(
             v_flex()
+                .flex_shrink_0()
                 .mx_3()
                 .gap_1()
                 .pt_3()
                 .border_t_1()
                 .border_color(cx.theme().sidebar_border)
                 .child(section_label("本机 Agent", cx))
-                .children(agents.into_iter().map(|(name, count)| {
-                    h_flex()
+                .children(agents.into_iter().map(|(name, status, error)| {
+                    v_flex()
                         .px_2()
                         .text_sm()
-                        .justify_between()
-                        .child(name)
+                        .gap_1()
                         .child(
-                            div()
-                                .text_color(cx.theme().sidebar_foreground.opacity(0.72))
-                                .child(count),
+                            h_flex().justify_between().child(name).child(
+                                div()
+                                    .text_color(cx.theme().sidebar_foreground.opacity(0.72))
+                                    .child(status),
+                            ),
                         )
+                        .children(error.map(|message| {
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().sidebar_foreground.opacity(0.72))
+                                .child(message)
+                        }))
                 })),
         )
 }

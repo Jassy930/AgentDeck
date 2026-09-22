@@ -14,14 +14,17 @@
   admin reply 即返回并回收进程。
   - 不复用 `agentdeck-cli`：CLI 是 bin-only、依赖 clap/tokio，且架构上与 GUI 互相独立。
   - 不维护长连接：history 在 daemon 内部本来就是短生命周期调用（Codex 每次另起
-    app-server，CC 每次扫描本地 JSONL），一个连接只发一条命令，因此也不需要
-    requestId 关联。session streaming 需要长连接时再单独引入。
+    app-server，CC 每次扫描本地 JSONL），一个连接只发一条命令。每次历史请求仍按
+    K11 生成唯一 `requestId`，成功与错误回复都必须严格匹配。session streaming
+    需要长连接时再单独引入。
   - daemon 定位：`AGENTDECK_DAEMON_BIN`（必须是绝对可执行路径，不回退）→
     可执行文件同目录（`.app` bundle 内）→ `target/debug` / `target/release`。
-- `agentdeck-desktop/src/shell.rs`：`Shell` 持有 `agents` / `sessions` / `pending` /
-  `error`，`Stage::Session` 持有 `HistoryListItem` 和 `Transcript`（Loading / Ready /
-  Failed）。加载顺序是先 `AgentList`，再按 agent 各发一次 `History::List`，谁先返回谁
-  先进侧栏，慢的来源不挡快的。阻塞 IPC 全部走 `cx.background_executor()`。
+- `agentdeck-desktop/src/shell.rs`：`Shell` 保存合并后的会话与各 agent 的加载结果；
+  加载中、成功计数和失败原因分别保留，侧栏与空态共用状态文案。
+  `Stage::Session` 持有 `HistoryListItem`、`Transcript`（Loading / Ready / Failed）与
+  本次读取序号，切走后重开同一会话也只接受最新读取结果。加载顺序是先 `AgentList`，
+  再按 agent 各发一次 `History::List`，谁先返回谁先进侧栏，慢的来源不挡快的。
+  阻塞 IPC 全部走 `cx.background_executor()`。
 - `agentdeck-desktop/src/transcript.rs`：把中立 `AgentItem` 映射成「标签 + 正文」
   文本块，单条正文上限 2000 字符。
 - `script/build_and_run.sh`：bundle 内同时装配 `agentdeckd`，`--verify` 额外断言它存在。
@@ -36,6 +39,7 @@
 - **flex 滚动要 `min_h(0)`**。GPUI 用 taffy，flex item 默认按内容撑高，`overflow_y_scroll`
   单独用不会限制高度，长记录会顶穿底部 composer。transcript 和侧栏列表都加了
   `min_h(px(0.))`，会话区外层再加 `overflow_hidden` 兜底。
+- 会话标题允许收缩并以省略号截断，右侧 agent / 项目不收缩，长标题不会挤出环境信息。
 - **`cargo` 不把 `MACOSX_DEPLOYMENT_TARGET` 计入 fingerprint**。普通 `cargo build` /
   `cargo test` 会留下 `minos=11.0` 的产物，脚本直接拷会让 `--verify` 失败；脚本现在
   先 `touch agentdeck-desktop/src/main.rs` 强制重新链接。
@@ -66,6 +70,24 @@ scripts/verify-agent-docs.sh
   user / 命令 / 工具条目。截图通过 `screencapture -l <windowId>` 取窗口，不模拟鼠标点击。
 - 本机 Codex `history list` 返回空列表（CLI 复验同样为 `{"kind":"list","value":[]}`），
   桌面显示的 0 条是对 daemon 返回的忠实反映，不是 desktop 侧的解析问题。
+
+当前代码在 macOS 27 arm64 上补充完成离线验收：
+
+- `cargo fmt --all -- --check`、13 项 desktop 单测、`scripts/verify-offline-tests.sh`、
+  `swift test`、desktop selfcheck、绑定当前 checkout daemon 的 CLI selfcheck、
+  临时数据目录 diagnostics report、文档检查与 `git diff --check` 均通过。
+- 通过 `AGENTDECK_DAEMON_BIN` 注入 fake daemon，以 `/bin/bash script/build_and_run.sh --verify`
+  验证最终 bundle 路径、自带 daemon、Info.plist 与 Mach-O 最低版本。本机 Homebrew Bash
+  在 heredoc 写入处挂起，验证使用系统 Bash；脚本未因此修改。
+- fake 窗口验收使用同一可执行文件的临时独立 bundle 标识，以区分其他 worktree 实例。
+  键盘操作 A→B→A，先完成新 A 再返回旧 A 错误，窗口仍显示新 A；侧栏保留失败来源
+  的错误原因与成功来源的会话，空态卡片同样区分失败和数量。fake 回执含错 ID 错误和
+  缺 ID 成功回复，均未截断当前请求；请求日志确认所有历史请求 ID 唯一。
+- 长中文标题下右侧 agent / 项目信息可见。自动化鼠标接口返回 `noWindowsAvailable`，
+  未完成真实窗口缩至 900px 或拖动验证；窗口交互使用键盘与原生 zoom 动作。
+  使用当前 Taffy 样式对 900px 窗口对应的 652px header 做布局测量，右侧信息结束于
+  632px，保留 20px 内边距，没有收缩或越界。
+- 本次未启用 `AGENTDECK_E2E=1`，以上 fake 验收不构成新增真实 vendor 证据。
 
 ## 已知缺口与后续
 

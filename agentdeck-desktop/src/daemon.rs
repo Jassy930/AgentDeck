@@ -2,14 +2,16 @@
 //! 通过它的 JSONL stdin/stdout 完成一次 admin round-trip 后回收进程。
 //!
 //! 历史查询在 daemon 内部本来就是短生命周期调用（Codex 每次另起 app-server，
-//! Claude Code 每次扫描本地 JSONL），所以这里不维护长连接，也不需要 requestId
-//! 关联：一个连接只发一条命令。会话流式接入需要长连接时再单独引入。
+//! Claude Code 每次扫描本地 JSONL），所以这里不维护长连接。一个连接只发一条
+//! 命令，历史请求仍按 K11 生成唯一 requestId 并严格匹配回复。会话流式接入需要
+//! 长连接时再单独引入。
 //!
 //! 所有函数都是阻塞的，调用方必须放到 GPUI 的 background executor 上。
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use agentdeck_protocol::{
     AgentKind, ClientCommand, HistoryListItem, HistoryRequest, HistoryResponse, HistoryTurn,
@@ -20,6 +22,15 @@ use agentdeck_protocol::{
 const DAEMON_BIN_ENV: &str = "AGENTDECK_DAEMON_BIN";
 
 pub type Result<T> = std::result::Result<T, String>;
+
+fn next_history_request_id() -> String {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    format!(
+        "desktop-history-{}-{}",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 fn is_exec(path: &Path) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
@@ -79,10 +90,19 @@ impl Drop for DaemonChild {
 
 /// 从一行 daemon 输出里取出目标 admin reply。
 ///
-/// `None` 表示这行不是目标 reply（事件行或其他命令的回复），继续读下一行。
-fn reply_payload(raw: &str, expected: &str) -> Option<Result<serde_json::Value>> {
+/// `None` 表示这行不是目标 reply 或 requestId 不匹配，继续读下一行。
+fn reply_payload(
+    raw: &str,
+    expected: &str,
+    expected_request_id: Option<&str>,
+) -> Option<Result<serde_json::Value>> {
     let value: serde_json::Value = serde_json::from_str(raw).ok()?;
     if value.get("reply")?.as_str()? != expected {
+        return None;
+    }
+    if expected_request_id
+        .is_some_and(|expected| value.get("requestId").and_then(|id| id.as_str()) != Some(expected))
+    {
         return None;
     }
     if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
@@ -103,7 +123,11 @@ fn reply_payload(raw: &str, expected: &str) -> Option<Result<serde_json::Value>>
 ///
 /// ponytail: 没有客户端侧超时，依赖 daemon 自己的 history 硬超时；daemon 若完全
 /// 卡死，这里会一直占着一个 background 线程，等真出现再加客户端 deadline。
-fn round_trip(command: &ClientCommand, expected_reply: &str) -> Result<serde_json::Value> {
+fn round_trip(
+    command: &ClientCommand,
+    expected_reply: &str,
+    expected_request_id: Option<&str>,
+) -> Result<serde_json::Value> {
     let path = locate_daemon()?;
     let child = Command::new(&path)
         .stdin(Stdio::piped())
@@ -126,7 +150,7 @@ fn round_trip(command: &ClientCommand, expected_reply: &str) -> Result<serde_jso
     let stdout = child.0.stdout.take().ok_or("agentdeckd stdout 不可用")?;
     for line in BufReader::new(stdout).lines() {
         let line = line.map_err(|source| format!("读取 agentdeckd 失败：{source}"))?;
-        if let Some(payload) = reply_payload(&line, expected_reply) {
+        if let Some(payload) = reply_payload(&line, expected_reply, expected_request_id) {
             return payload;
         }
     }
@@ -135,13 +159,15 @@ fn round_trip(command: &ClientCommand, expected_reply: &str) -> Result<serde_jso
 
 /// daemon 当前注册的 agent；侧栏据此逐个查询历史，不硬编码 vendor。
 pub fn agent_list() -> Result<Vec<AgentKind>> {
-    let reply = round_trip(&ClientCommand::AgentList, "agentList")?;
+    let reply = round_trip(&ClientCommand::AgentList, "agentList", None)?;
     let agents = reply.get("agents").cloned().unwrap_or_default();
     serde_json::from_value(agents).map_err(|source| format!("解析 agent 列表失败：{source}"))
 }
 
 fn history(request: HistoryRequest) -> Result<HistoryResponse> {
-    let reply = round_trip(&ClientCommand::History(request), "history")?;
+    let request_id = next_history_request_id();
+    let command = ClientCommand::History(request.with_request_id(&request_id));
+    let reply = round_trip(&command, "history", Some(&request_id))?;
     let response = reply.get("response").cloned().unwrap_or_default();
     serde_json::from_value(response).map_err(|source| format!("解析历史响应失败：{source}"))
 }
@@ -171,26 +197,53 @@ pub fn history_read(agent_kind: AgentKind, thread_id: ThreadId) -> Result<Vec<Hi
 
 #[cfg(test)]
 mod tests {
-    use super::reply_payload;
+    use super::{next_history_request_id, reply_payload};
+
+    #[test]
+    fn history_request_ids_are_unique() {
+        let first = next_history_request_id();
+        let second = next_history_request_id();
+        assert_ne!(first, second);
+        assert!(first.starts_with(&format!("desktop-history-{}-", std::process::id())));
+    }
 
     #[test]
     fn reply_payload_only_accepts_the_expected_reply() {
         let event = r#"{"type":"turnStarted","sessionId":"s","turnId":"t"}"#;
-        assert!(reply_payload(event, "history").is_none());
+        assert!(reply_payload(event, "history", Some("current")).is_none());
 
         let other_reply = r#"{"reply":"ping","ok":true}"#;
-        assert!(reply_payload(other_reply, "history").is_none());
+        assert!(reply_payload(other_reply, "history", Some("current")).is_none());
 
-        let matching = r#"{"reply":"history","response":{"kind":"list","value":[]}}"#;
-        let payload = reply_payload(matching, "history").expect("matching reply");
+        let agent_list = r#"{"reply":"agentList","agents":["codex"]}"#;
+        assert!(
+            reply_payload(agent_list, "agentList", None)
+                .unwrap()
+                .is_ok()
+        );
+
+        let matching =
+            r#"{"reply":"history","requestId":"current","response":{"kind":"list","value":[]}}"#;
+        let payload = reply_payload(matching, "history", Some("current")).expect("matching reply");
         assert_eq!(payload.expect("ok reply")["response"]["kind"], "list");
     }
 
     #[test]
+    fn history_replies_without_the_expected_request_id_are_ignored() {
+        for raw in [
+            r#"{"reply":"history","response":{"kind":"list","value":[]}}"#,
+            r#"{"reply":"history","requestId":"old","response":{"kind":"list","value":[]}}"#,
+            r#"{"reply":"history","error":{"code":"history-timeout","message":"超时"}}"#,
+            r#"{"reply":"history","requestId":"old","error":{"code":"history-timeout","message":"超时"}}"#,
+        ] {
+            assert!(reply_payload(raw, "history", Some("current")).is_none());
+        }
+    }
+
+    #[test]
     fn reply_payload_surfaces_daemon_errors_with_their_code() {
-        let failed =
-            r#"{"reply":"history","error":{"code":"codex-history-timeout","message":"超时"}}"#;
-        let payload = reply_payload(failed, "history").expect("matching reply");
+        let failed = r#"{"reply":"history","requestId":"current","error":{"code":"codex-history-timeout","message":"超时"}}"#;
+        let payload = reply_payload(failed, "history", Some("current")).expect("matching reply");
         assert_eq!(
             payload.expect_err("error reply"),
             "超时（codex-history-timeout）"

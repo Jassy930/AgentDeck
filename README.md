@@ -21,7 +21,7 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
 - **接入本机 `agentdeckd` 的只读历史**：启动时先问 daemon 注册了哪些 agent，再按
   agent 分别拉取会话列表（各 50 条），谁先返回谁先进侧栏；点击条目按
   `threadId` + `agentKind` 读取该会话的真实记录并渲染为纯文本。加载中、失败和空结果
-  都有明确文案。
+  都有明确文案；某个来源失败时保留其他来源的会话，并在侧栏显示该来源的错误。
 - composer 显示当前会话的项目与 agent，两种形态共用草稿；发送和搜索仍禁用，
   模型、审批和沙箱显示暂不可用。
 - 透明标题栏下为红绿灯留出顶部空间，空态与会话态顶部均按系统偏好处理双击；
@@ -98,8 +98,8 @@ cargo run -p agentdeck-desktop -- --selfcheck
 ```
 
 `script/build_and_run.sh` 是唯一桌面 build/run 入口。它构建
-`agentdeck-desktop`、装配 `dist/AgentDeck.app`、写入 macOS 15 最低版本并启动
-最新产物。当前最小 bundle 不携带或启动 `agentdeckd`。
+`agentdeck-desktop` 与 `agentdeckd`、装配 `dist/AgentDeck.app`、写入 macOS 15 最低版本并
+启动最新产物。桌面按请求启动 bundle 内自带的 `agentdeckd` 读取历史。
 
 macOS 应用图标和侧栏品牌行使用统一的 04C 图标；iOS companion 使用同款满版
 AppIcon。正式资源和重新生成 `.icns` 的方式见 [图标资源](assets/brand/README.md)。

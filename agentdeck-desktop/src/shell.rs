@@ -28,6 +28,7 @@ pub enum Stage {
     Session {
         item: HistoryListItem,
         transcript: Transcript,
+        read_id: u64,
     },
 }
 
@@ -39,6 +40,23 @@ pub enum Transcript {
 }
 
 impl Stage {
+    fn finish_read(&mut self, completed_id: u64, read: Result<Vec<HistoryTurn>, String>) -> bool {
+        if let Stage::Session {
+            transcript,
+            read_id,
+            ..
+        } = self
+            && *read_id == completed_id
+        {
+            *transcript = match read {
+                Ok(turns) => Transcript::Ready(turns),
+                Err(message) => Transcript::Failed(message),
+            };
+            return true;
+        }
+        false
+    }
+
     /// 会话态的项目名；空态没有会话上下文。
     pub fn project_name(&self) -> Option<String> {
         match self {
@@ -88,16 +106,45 @@ pub fn agent_label(kind: AgentKind) -> String {
         .join(" ")
 }
 
+pub(crate) struct AgentHistory {
+    pub kind: AgentKind,
+    /// None 表示仍在读取；成功与失败都必须保留来源，不能把失败显示成零条。
+    result: Option<Result<usize, String>>,
+}
+
+impl AgentHistory {
+    fn new(kind: AgentKind) -> Self {
+        Self { kind, result: None }
+    }
+
+    fn complete(&mut self, listed: &Result<Vec<HistoryListItem>, String>) {
+        self.result = Some(listed.as_ref().map(Vec::len).map_err(Clone::clone));
+    }
+
+    pub fn status(&self) -> String {
+        match &self.result {
+            None => "读取中…".to_string(),
+            Some(Ok(count)) => format!("{count} 个会话"),
+            Some(Err(_)) => "读取失败".to_string(),
+        }
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        self.result.as_ref()?.as_ref().err().map(String::as_str)
+    }
+}
+
 pub struct Shell {
     stage: Stage,
+    next_read_id: u64,
     composer: Entity<InputState>,
     /// daemon 已注册的 agent，决定侧栏按哪些来源拉历史。
-    pub(crate) agents: Vec<AgentKind>,
+    pub(crate) agents: Vec<AgentHistory>,
     /// 所有来源合并后的会话，按最近活动倒序。
     pub(crate) sessions: Vec<HistoryListItem>,
     /// 尚未返回的 daemon 请求数；用于区分"还在加载"和"确实没有会话"。
     pub(crate) pending: usize,
-    /// 最近一次失败原因；成功的来源仍会正常展示。
+    /// AgentList 的失败原因；各来源历史的错误由 AgentHistory 保留。
     pub(crate) error: Option<String>,
 }
 
@@ -117,6 +164,7 @@ impl Shell {
 
         let mut shell = Self {
             stage: Stage::Empty,
+            next_read_id: 0,
             composer,
             agents: Vec::new(),
             sessions: Vec::new(),
@@ -142,7 +190,7 @@ impl Shell {
                 shell.pending -= 1;
                 match agents {
                     Ok(kinds) => {
-                        shell.agents = kinds.clone();
+                        shell.agents = kinds.iter().copied().map(AgentHistory::new).collect();
                         for kind in kinds {
                             shell.load_agent_sessions(kind, cx);
                         }
@@ -165,14 +213,14 @@ impl Shell {
                 .await;
             this.update(cx, |shell, cx| {
                 shell.pending -= 1;
-                match listed {
-                    Ok(mut items) => {
-                        shell.sessions.append(&mut items);
-                        shell
-                            .sessions
-                            .sort_by(|a, b| b.last_active_ms.cmp(&a.last_active_ms));
-                    }
-                    Err(message) => shell.error = Some(message),
+                if let Some(agent) = shell.agents.iter_mut().find(|agent| agent.kind == kind) {
+                    agent.complete(&listed);
+                }
+                if let Ok(mut items) = listed {
+                    shell.sessions.append(&mut items);
+                    shell
+                        .sessions
+                        .sort_by(|a, b| b.last_active_ms.cmp(&a.last_active_ms));
                 }
                 cx.notify();
             })
@@ -183,30 +231,25 @@ impl Shell {
 
     pub fn open_session(&mut self, item: HistoryListItem, cx: &mut Context<Self>) {
         let (kind, thread_id) = (item.agent_kind, item.thread_id.clone());
+        self.next_read_id += 1;
+        let read_id = self.next_read_id;
         self.stage = Stage::Session {
             item,
             transcript: Transcript::Loading,
+            read_id,
         };
         cx.notify();
 
-        let requested = thread_id.clone();
         cx.spawn(async move |this, cx| {
             let read = cx
                 .background_executor()
                 .spawn(async move { daemon::history_read(kind, thread_id) })
                 .await;
             this.update(cx, |shell, cx| {
-                // 读取期间用户可能已经切走：只回填仍然选中的那个会话。
-                if shell.stage.thread_id() != Some(&requested) {
-                    return;
+                // 回到同一会话也属于新请求，不能接受上次读取的迟到结果。
+                if shell.stage.finish_read(read_id, read) {
+                    cx.notify();
                 }
-                if let Stage::Session { transcript, .. } = &mut shell.stage {
-                    *transcript = match read {
-                        Ok(turns) => Transcript::Ready(turns),
-                        Err(message) => Transcript::Failed(message),
-                    };
-                }
-                cx.notify();
             })
             .ok();
         })
@@ -218,26 +261,11 @@ impl Shell {
         cx.notify();
     }
 
-    /// 某个 agent 已加载到的会话数，用于空态卡片。
-    fn session_count(&self, kind: AgentKind) -> usize {
-        self.sessions
-            .iter()
-            .filter(|item| item.agent_kind == kind)
-            .count()
-    }
-
     fn render_empty(&self, cx: &App) -> impl IntoElement + use<> {
         let cards: Vec<_> = self
             .agents
             .iter()
-            .map(|kind| {
-                let status = if self.pending > 0 {
-                    "读取中…".to_string()
-                } else {
-                    format!("{} 个会话", self.session_count(*kind))
-                };
-                connector_card(&agent_label(*kind), &status, cx)
-            })
+            .map(|agent| connector_card(&agent_label(agent.kind), &agent.status(), cx))
             .collect();
 
         let hint = match (&self.error, self.agents.is_empty(), self.pending > 0) {
@@ -304,14 +332,24 @@ impl Shell {
                     .h(px(52.))
                     .flex_shrink_0()
                     .px_5()
+                    .gap_3()
                     .items_center()
                     .justify_between()
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .on_double_click(|_, window: &mut Window, _| window.titlebar_double_click())
-                    .child(div().text_sm().font_semibold().child(session_title(item)))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_sm()
+                            .font_semibold()
+                            .child(session_title(item)),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
                             .child(format!(
@@ -371,9 +409,9 @@ impl Render for Shell {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let main = match &self.stage {
             Stage::Empty => self.render_empty(cx).into_any_element(),
-            Stage::Session { item, transcript } => {
-                self.render_session(item, transcript, cx).into_any_element()
-            }
+            Stage::Session {
+                item, transcript, ..
+            } => self.render_session(item, transcript, cx).into_any_element(),
         };
         let selected: Option<SharedString> = self
             .stage
@@ -391,8 +429,8 @@ impl Render for Shell {
 
 #[cfg(test)]
 mod tests {
-    use super::{Stage, Transcript, agent_label, project_name, session_title};
-    use agentdeck_protocol::{AgentKind, HistoryListItem, ThreadId};
+    use super::{AgentHistory, Stage, Transcript, agent_label, project_name, session_title};
+    use agentdeck_protocol::{AgentKind, HistoryListItem, HistoryTurn, ThreadId};
 
     fn item(title: Option<&str>) -> HistoryListItem {
         HistoryListItem {
@@ -413,12 +451,61 @@ mod tests {
         stage = Stage::Session {
             item: item(Some("修复记录收尾")),
             transcript: Transcript::Loading,
+            read_id: 1,
         };
         assert_eq!(stage.thread_id().map(|id| id.0.as_str()), Some("7330efa6"));
         assert_eq!(stage.project_name(), Some("AgentDeck".to_string()));
 
         stage = Stage::Empty;
         assert_eq!((stage.thread_id(), stage.project_name()), (None, None));
+    }
+
+    #[test]
+    fn reopening_a_thread_rejects_results_from_its_previous_read() {
+        let first = item(Some("A"));
+        let mut other = item(Some("B"));
+        other.thread_id = ThreadId("other-thread".into());
+        let mut stage = Stage::Session {
+            item: other,
+            transcript: Transcript::Loading,
+            read_id: 2,
+        };
+        assert!(!stage.finish_read(1, Ok(vec![])));
+
+        stage = Stage::Session {
+            item: first,
+            transcript: Transcript::Loading,
+            read_id: 3,
+        };
+        assert!(stage.finish_read(3, Ok(vec![HistoryTurn { items: vec![] }])));
+        assert!(!stage.finish_read(1, Err("旧读取超时".into())));
+        assert!(!stage.finish_read(1, Ok(vec![])));
+        assert!(matches!(
+            &stage,
+            Stage::Session { transcript: Transcript::Ready(turns), .. } if turns.len() == 1
+        ));
+
+        stage = Stage::Empty;
+        assert!(!stage.finish_read(3, Ok(vec![])));
+    }
+
+    #[test]
+    fn each_agent_keeps_its_loading_failure_and_empty_result_distinct() {
+        let mut fast = AgentHistory::new(AgentKind::ClaudeCode);
+        let mut slow = AgentHistory::new(AgentKind::Codex);
+        fast.complete(&Ok(vec![item(None)]));
+        assert_eq!(fast.status(), "1 个会话");
+        assert_eq!(slow.status(), "读取中…");
+
+        slow.complete(&Err("历史读取超时".into()));
+        assert_eq!(slow.status(), "读取失败");
+        assert_eq!(slow.error(), Some("历史读取超时"));
+        assert_eq!(fast.status(), "1 个会话");
+        assert_eq!(fast.error(), None);
+
+        fast.complete(&Ok(vec![]));
+        assert_eq!(fast.status(), "0 个会话");
+        assert_eq!(slow.error(), Some("历史读取超时"));
     }
 
     #[test]

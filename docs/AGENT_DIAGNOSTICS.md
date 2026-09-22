@@ -18,8 +18,9 @@ AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" \
 cargo run -p agentdeckd -- --diagnostics-report
 ```
 
-当前 GPUI 桌面端没有连接 daemon，也没有 profile、run record 或 diagnostics report
-入口。桌面 selfcheck 成功不能证明 backend 或 vendor CLI 健康。
+当前 GPUI 桌面端通过 daemon 读取 agent 列表与会话历史，尚无 profile、run record 或
+diagnostics report 的 UI 入口。桌面 selfcheck 不连接 daemon，成功不能证明 backend
+或 vendor CLI 健康。
 
 ## 日志位置
 
@@ -56,8 +57,8 @@ stderr fallback，省略 `diagnosticRef`，不返回无法定位的引用，也�
 4. 查看 `byLevel` / `byEvent` 和 `tail` 中最近的错误或告警。
 5. 按 `tail` 里的事件上下文继续执行只读检查。
 
-backend 的 profile 与 `AGENTDECK_DATA_DIR` 规则保持不变；它们不影响当前 GPUI
-桌面壳。
+桌面启动的 daemon 继承 `AGENTDECK_PROFILE` 与 `AGENTDECK_DATA_DIR`，遵循相同的
+backend 数据目录规则；这些变量不改变 vendor 历史来源。
 
 ## Failure Codes
 
@@ -117,7 +118,7 @@ agentdeck history list --agent claude-code --limit 20
 列表和读取分别调用官方 `thread/list`、`thread/read(includeTurns=true)`，不是扫描
 当前 AgentDeck 会话或猜测本地记录格式。
 
-CLI 会为每次历史请求生成唯一 `requestId`；未来桌面接入时必须遵守同一契约。daemon 无论成功还是失败
+CLI 与桌面 client 都为每次历史请求生成唯一 `requestId`。daemon 无论成功还是失败
 都在对应的 history admin 终态回复中原样回显。客户端只消费严格匹配当前
 `requestId` 的回复，忽略其他请求或已超时请求的迟到回复。wire 字段保持可选仅用于
 兼容旧客户端；当前客户端的请求或回复缺少该字段，应按关联链路回归排查。
