@@ -35,8 +35,10 @@ dependencies = [
 name = "agentdeck-desktop"
 version = "0.1.0"
 dependencies = [
+ "agentdeck-protocol",
  "gpui",
  "gpui-component",
+ "serde_json",
 ]
 
 [[package]]

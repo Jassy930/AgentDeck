@@ -11,14 +11,14 @@
 5. `docs/AGENT_DIAGNOSTICS.md`：自检、诊断日志和 failure code（含 CC adapter failure codes）。
 6. `docs/AGENTDECKD_STATUS.md`：daemon 当前功能完整度、证据边界和关键缺口。
 7. `docs/QUALITY.md`：GPUI P0、共享 Core、backend 和文档质量门禁。
-8. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前 macOS 实现只以 `docs/plans/2026-08-17-gpui-desktop-reset-design.md` / implementation 为事实源；desktop 接入前的 daemon 边界以 `docs/plans/2026-08-17-agentdeckd-minimum-stable-boundary-design.md` 和 Codex 生命周期 ADR 为事实源。旧 AppKit 计划是历史记录，不定义当前桌面迭代顺序。
+8. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前 macOS 实现只以 `docs/plans/2026-08-17-gpui-desktop-reset-design.md` / implementation 与 `docs/plans/2026-09-22-desktop-history-readonly-implementation.md` 为事实源；desktop 接入前的 daemon 边界以 `docs/plans/2026-08-17-agentdeckd-minimum-stable-boundary-design.md` 和 Codex 生命周期 ADR 为事实源。旧 AppKit 计划是历史记录，不定义当前桌面迭代顺序。
 9. `protocol/SPIKE_FINDINGS.md` 与 `protocol/`：Codex app-server 协议事实源。
 
 ## 项目边界
 
 - AgentDeck 是 Coding Agent 的统一原生桌面客户端，把 Codex 和 Claude Code 作为绝对一等公民，不是 IDE、不是 Codex Desktop 替代品、不是通用多 agent 聊天界面。
-- 当前 macOS 桌面端是 `agentdeck-desktop/` 下的 Rust/GPUI 最小壳；尚未连接 daemon 或 IPC，也不恢复旧 AppKit 兼容层。
-- `agentdeckd` 的 Codex 本地链路固定为由 daemon 直接持有 session-scoped `codex app-server --listen stdio://` 子进程，不依赖 Codex managed daemon/proxy；M0 已完成限定环境验收，证据与剩余边界见 `docs/AGENTDECKD_STATUS.md`，GPUI desktop 尚未接入。
+- 当前 macOS 桌面端是 `agentdeck-desktop/` 下的 Rust/GPUI 外壳，已通过自带的 typed local client（`src/daemon.rs`）连接本机 `agentdeckd`，但只覆盖只读历史（agent list / history list / history read）；session、turn、streaming、审批仍未接入，也不恢复旧 AppKit 兼容层。
+- `agentdeckd` 的 Codex 本地链路固定为由 daemon 直接持有 session-scoped `codex app-server --listen stdio://` 子进程，不依赖 Codex managed daemon/proxy；M0 已完成限定环境验收，证据与剩余边界见 `docs/AGENTDECKD_STATUS.md`，GPUI desktop 目前只接入只读历史。
 - 后续会话 UI 必须通过 Rust typed router 按 `SessionCapabilities` 路由，禁止硬编码 vendor 分支（N2）。
 - IPC 主干类型严禁出现 vendor 字样；vendor 字段只能出现在 `capabilities.*` / `vendorControl.*` / `vendorPanel.*` 命名空间（N1）。
 - Codex 细节只能留在 `agentdeckd/src/codex/` 子模块；CC 细节只能留在 `agentdeckd/src/claude_code/` 子模块；两者互不知晓（N3）。

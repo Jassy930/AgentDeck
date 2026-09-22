@@ -9,7 +9,12 @@ use gpui_component::{
     v_flex,
 };
 
-pub fn render(state: &Entity<InputState>, project: Option<&str>, cx: &App) -> impl IntoElement {
+pub fn render(
+    state: &Entity<InputState>,
+    project: Option<&str>,
+    agent: Option<&str>,
+    cx: &App,
+) -> impl IntoElement {
     v_flex()
         .w_full()
         .max_w(px(720.))
@@ -21,8 +26,9 @@ pub fn render(state: &Entity<InputState>, project: Option<&str>, cx: &App) -> im
         .border_color(cx.theme().border)
         .shadow_lg()
         .child(div().text_sm().child(format!(
-            "项目：{} · Agent：未连接",
-            project.unwrap_or("未选择")
+            "项目：{} · Agent：{}",
+            project.unwrap_or("未选择"),
+            agent.unwrap_or("未选择")
         )))
         .child(Input::new(state).appearance(false))
         .child(
@@ -33,7 +39,7 @@ pub fn render(state: &Entity<InputState>, project: Option<&str>, cx: &App) -> im
                     v_flex()
                         .gap_1()
                         .text_sm()
-                        .child("界面预览，暂不能发送任务")
+                        .child("只读历史预览，暂不能发送任务")
                         .child(
                             div()
                                 .text_color(cx.theme().muted_foreground)

@@ -15,20 +15,25 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
 
 - 创建真实 GPUI macOS 窗口，使用透明标题栏。
 - 初始化 `gpui-component` 并挂载 `Root`。
-- 渲染静态外壳布局：全高左侧栏（品牌行 / 快捷入口 / 置顶会话 / 项目区 / 本机 Agent 状态）、
-  空态（居中标题、圆角 composer、两家接入卡片），以及会话态（thread header、
-  任务记录占位、底部悬浮 composer）。侧栏示例条目在两种形态之间切换，并保留选中态。
-- composer 显示示例项目上下文和 Agent 未连接状态，两种形态共用草稿；发送和搜索禁用，
-  模型、审批和沙箱显示暂不可用。两家 Agent 在首页和侧栏均明确标为尚未接入。
+- 渲染外壳布局：全高左侧栏（品牌行 / 快捷入口 / 最近会话 / 本机 Agent 状态）、
+  空态（居中标题、圆角 composer、按已注册 agent 生成的接入卡片），以及会话态
+  （thread header、会话记录、底部悬浮 composer）。
+- **接入本机 `agentdeckd` 的只读历史**：启动时先问 daemon 注册了哪些 agent，再按
+  agent 分别拉取会话列表（各 50 条），谁先返回谁先进侧栏；点击条目按
+  `threadId` + `agentKind` 读取该会话的真实记录并渲染为纯文本。加载中、失败和空结果
+  都有明确文案。
+- composer 显示当前会话的项目与 agent，两种形态共用草稿；发送和搜索仍禁用，
+  模型、审批和沙箱显示暂不可用。
 - 透明标题栏下为红绿灯留出顶部空间，空态与会话态顶部均按系统偏好处理双击；
   打开窗口后 composer 默认聚焦。
-- 提供 `--selfcheck`，验证 GPUI、Metal renderer、隐藏窗口和组件树初始化。
-- 通过统一脚本构建并启动 `dist/AgentDeck.app`。
+- 提供 `--selfcheck`，验证 GPUI、Metal renderer、隐藏窗口和组件树初始化；该路径
+  不连接 daemon，也不触碰本机 vendor 历史。
+- 通过统一脚本构建并启动 `dist/AgentDeck.app`，bundle 内自带 `agentdeckd`。
 
 当前明确不包含：
 
-- daemon / IPC 连接；外壳里的项目和会话均为示例，尚不读取本机 Agent 的真实状态。
-- 真实会话、历史、消息流、审批和富文本 transcript；composer 不发送任何内容。
+- 启动会话、发送 turn、streaming、审批和 vendor 控制；composer 不发送任何内容。
+- Markdown / diff 渲染、工具结果折叠、会话搜索与按项目分组。
 - 远程机器、网络数据源和配对流程。
 - 对旧 AppKit 界面或行为的兼容层。
 
@@ -47,7 +52,7 @@ diagnostics 等较宽的代码表面。Codex 路径已经落地 protocol v4 的 
 ## 仓库结构
 
 ```text
-agentdeck-desktop/       Rust/GPUI macOS 客户端外壳（静态布局，未接 daemon）
+agentdeck-desktop/       Rust/GPUI macOS 客户端（外壳 + daemon 只读历史）
 agentdeck-protocol/      AgentDeck 中立 IPC 类型与 schema 事实源
 agentdeckd/              Codex / Claude Code adapter daemon
 agentdeck-cli/           参考客户端与 E2E 驱动
@@ -57,9 +62,10 @@ protocol/                Codex 官方 schema 与 AgentDeck schema 快照
 docs/                    架构、诊断、质量规则与计划
 ```
 
-`agentdeck-desktop` 当前不依赖 daemon 或 protocol crate。下一阶段若接入
-本地能力，只允许增加 `desktop → typed client → agentdeckd` 的单向依赖；UI 不直接
-解析 vendor JSON，也不把 daemon 嵌入 GUI 进程。
+`agentdeck-desktop` 依赖 `agentdeck-protocol`，并通过自带的 typed local client
+（`agentdeck-desktop/src/daemon.rs`）按请求 spawn 一个 `agentdeckd` 子进程走 JSONL
+stdin/stdout。依赖方向固定为 `desktop → typed local client → agentdeckd`；UI 不直接
+解析 vendor JSON，也不把 daemon 嵌入 GUI 进程，更不依赖 `agentdeck-cli`。
 
 ## 依赖版本
 
@@ -150,14 +156,18 @@ Codex / Claude Code E2E 证据；完整边界见 [docs/QUALITY.md](docs/QUALITY.
 
 ## 下一条纵向切片
 
-下一目标是先稳定 daemon，再开始 desktop 的真实连接，而不是恢复旧客户端的全部功能：
+desktop 已经通过 typed local client 接入 daemon 的只读历史，下一步是把写入侧接上，
+而不是恢复旧客户端的全部功能：
 
-1. 持久 CLI 四轮已在临时配置覆盖环境通过，包含累计 streaming、同 PID/threadId
+1. 桌面只读历史已落地（侧栏真实会话列表 + 会话记录），实现与坑点见
+   [只读历史接入记录](docs/plans/2026-09-22-desktop-history-readonly-implementation.md)。
+   本机 Codex 历史当前返回空列表，Claude Code 的会话标题常带 `<local-command-caveat>`
+   噪声，两者都在 daemon 侧收敛。
+2. 持久 CLI 四轮已在临时配置覆盖环境通过，包含累计 streaming、同 PID/threadId
    复用、取消后继续、回收与记录读回；继续收敛默认配置兼容及历史列表时延风险，
    证据见 [M0 CLI 实施记录](docs/plans/2026-09-21-backend-m0-cli-implementation.md)。
-2. M0 全部门禁通过后，再抽出 typed local client 并连接本机 `agentdeckd`；desktop 首
-   切片仍只消费首轮。
-3. 在该闭环稳定后再增加历史、审批、Markdown、Claude Code 和多 agent 能力。
+3. 在此之上给 desktop 接入会话启动与 turn 流（需要把 one-shot round-trip 换成长连接），
+   再增加审批、Markdown 和多 agent 能力。
 
 `agentdeck session live` 的 stdin 接受现有 `ClientCommand` JSONL，stdout 连续输出协议
 事件和管理回复。客户端收到 `TurnFinished(nextState=ready)` 后可发送下一条 `TurnStart`；

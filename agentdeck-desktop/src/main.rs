@@ -1,6 +1,8 @@
 mod composer;
+mod daemon;
 mod shell;
 mod sidebar;
+mod transcript;
 
 use std::env;
 
@@ -25,7 +27,8 @@ fn open_main_window(cx: &mut App, show: bool) {
             ..Default::default()
         },
         |window, cx| {
-            let view = cx.new(|cx| Shell::new(window, cx));
+            // 隐藏窗口只出现在 selfcheck 路径；那里不连接 daemon。
+            let view = cx.new(|cx| Shell::new(window, show, cx));
             cx.new(|cx| Root::new(view, window, cx))
         },
     )
