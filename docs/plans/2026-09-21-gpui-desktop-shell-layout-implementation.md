@@ -19,8 +19,8 @@ header + 底部悬浮 composer。该文档描述的是已移除的 AppKit 实现
 - 不渲染真实会话、历史、消息流、审批或 Markdown。
 - 不把 `designs/agentdeck-design-system` 的 token 桥接进 Rust；颜色全部取自
   `gpui_component::ActiveTheme`。
-- 不引入 vendor 分支。空态两张接入卡片由 `CONNECTORS` 常量数组驱动，UI 不按 vendor
-  写 `if`/`match`（N1、N2）。
+- 不引入 vendor 分支。空态两张接入卡片与侧栏本机 Agent 状态共用 `CONNECTORS`
+  常量数组，UI 不按 vendor 写 `if`/`match`（N1、N2）。
 
 ## Architecture
 
@@ -30,11 +30,12 @@ agentdeck-desktop
 └─ Shell (Entity, Render)
    ├─ sidebar.rs   全高侧栏，条目回调走 cx.listener 改 Shell.stage
    ├─ shell.rs     Stage::Empty | Stage::Session，空态与会话态两套主区
-   └─ composer.rs  圆角 composer，持有 Entity<InputState>
+   └─ composer.rs  圆角 composer，接收 Entity<InputState> 与项目上下文
 ```
 
 `Shell` 持有唯一状态 `stage` 和 composer 的 `InputState`；`sidebar` / `composer` 只是
 渲染函数，不各自持有状态。两种形态共用同一个 composer entity，输入内容在切换时保留。
+`Stage::Session` 同时保存示例标题与项目，侧栏选中态由当前 stage 派生，不依赖键盘焦点。
 
 ## Tech Stack
 
@@ -46,11 +47,11 @@ agentdeck-desktop
 
 - `agentdeck-desktop/src/main.rs`：挂载 `Shell`；`TitlebarOptions { appears_transparent,
   traffic_light_position }`；`window_min_size` 900×620。`SELFCHECK_REPORT` 保持原样。
-- `agentdeck-desktop/src/shell.rs`：`Stage` 枚举与 `header_title()`、`Shell` 状态与两套主区渲染、
+- `agentdeck-desktop/src/shell.rs`：`Stage` 枚举与标题、项目访问方法，`Shell` 状态与两套主区渲染、
   `CONNECTORS` 常量、接入卡片。
 - `agentdeck-desktop/src/sidebar.rs`：侧栏宽度 248、顶部 44px 红绿灯留白、`PROJECTS` 占位、
   新建会话按钮。
-- `agentdeck-desktop/src/composer.rs`：圆角 composer 与 `TOOLS` 工具行占位。
+- `agentdeck-desktop/src/composer.rs`：圆角 composer、项目与 Agent 上下文、预览说明和禁用发送按钮。
 
 ## 已知坑点
 
@@ -67,10 +68,9 @@ cargo run -p agentdeck-desktop -- --selfcheck
 ./script/build_and_run.sh --verify
 ```
 
-布局改动额外做目视检查：启动 `dist/AgentDeck.app` 后 `screencapture` 截图确认侧栏、
-空态、会话态三块实际渲染。会话态截图通过临时把初始 `stage` 改为 `Stage::Session`
-获得，截图后还原；不要用模拟鼠标点击驱动 GPUI 窗口（GPUI 不响应 AX click，坐标点击
-会落到其他应用上）。
+布局改动额外做目视检查：启动 `dist/AgentDeck.app` 并确认前台，优先通过真实 UI 的
+Tab / Shift-Tab / Return 进入空态与会话态，再用窗口级截图确认侧栏、主区及 composer。
+截图使用最终代码构建的窗口，不改初始 `stage`；环境限制下无法完成的交互标为未验证。
 
 2026-09-21 本机验证结果：desktop 单测 2 passed；selfcheck 输出
 `{"status":"ok","surface":"desktop","ui":"gpui"}` 且退出码 0；bundle verify 三项 OK；
@@ -84,8 +84,8 @@ cargo run -p agentdeck-desktop -- --selfcheck
 **文件变更**
 
 - `sidebar.rs`：加品牌行（`AgentDeck` + `本机`，对应 Codex 侧栏顶部 workspace 位，
-  当前不可切换）、快捷入口（新建会话可点；搜索为无行为占位）、`PINNED_SESSIONS`
-  置顶会话分组与 `PROJECTS` 项目分组两层列表、底部账号区；导出 `titlebar_area()`。
+  当前不可切换）、快捷入口（新建会话可点；搜索禁用）、`PINNED_SESSIONS`
+  置顶会话分组与 `PROJECTS` 项目分组两层列表、底部本机 Agent 状态；导出 `titlebar_area()`。
 - `shell.rs`：`Shell::new` 里对 composer 调一次 `focus`，打开窗口即可直接输入；
   空态主区顶部加 `titlebar_area`（会话态由 52px header 自己吃掉这段高度）。
 
@@ -103,10 +103,9 @@ cargo run -p agentdeck-desktop -- --selfcheck
   `platform/mac/window.rs` 的 `on_hit_test_window_control` 是空实现（`{}`），
   `start_window_move` 只有 `platform.rs` 里的 trait 默认空实现且 macOS 未覆盖，
   两者都只服务 Windows/Linux。gpui-component 的 `TitleBar` 同时用这两条路也是为了
-  非 macOS 平台。曾一度按 `window_control_area(WindowControlArea::Drag)` 实现并写进
-  文档，实际是死代码，已删除。macOS 的窗口拖动仍由系统标题栏区域处理。
-  同一文件里的 `titlebar_double_click` 反而**有**真实 macOS 实现（读
-  `AppleActionOnDoubleClick` 偏好），所以双击行为是真的。
+  非 macOS 平台。macOS 的窗口拖动仍由系统标题栏区域处理。
+  同一文件里的 `titlebar_double_click` 有真实 macOS 实现，读取
+  `AppleActionOnDoubleClick` 偏好；实际双击交互仍需单独验收。
 - `font_semibold` 来自 `gpui_component::StyledExt`，`on_double_click` 来自
   `gpui_component::InteractiveElementExt`，两个 trait 都要显式 import。
 
@@ -114,15 +113,28 @@ cargo run -p agentdeck-desktop -- --selfcheck
 
 - 目视验证改用**窗口级截图**：`uv run --with pyobjc-framework-Quartz` 取窗口 ID，再
   `screencapture -x -o -l <winid>`。这样不依赖屏幕可见性，也比全屏截图清晰。
-  2026-09-21 全屏截图被 ChatGPT 桌面端的 "ChatGPT is Using Your Mac" 遮罩挡住，
-  窗口级截图不受影响。
-- **未验证项**：composer 实际键入与聚焦、窗口鼠标拖动。聚焦本可用"间隔连拍看光标
-  闪烁"零成本判定，但未激活窗口不画闪烁光标（三帧截图字节完全一致），当时屏幕被
-  ChatGPT 桌面端接管、窗口无法成为前台，故判不了；注入键盘事件同理不适合做。
+- 2026-09-22 修复前 UI 审查已实际验证直接键入、中文多行粘贴、键盘切换会话与返回
+  空态；该结果不替代后续变更验收。窗口鼠标拖动与双击仍无实际验收证据。
+
+## 界面审查修复（2026-09-22）
+
+- 新建会话、项目与置顶条目保留持续选中态；会话态顶部补齐系统标题栏双击处理。
+- composer 展示当前示例项目或“未选择”及 Agent 未连接，明确标为界面预览；发送、
+  搜索禁用，模型、审批和沙箱改为暂不可用说明。
+- 首页和侧栏共用两家 Agent 的“尚未接入”状态，示例条目明确标注；提高分组与状态字号。
+- 两种形态继续共用草稿，不接 daemon，也不提供真实 Agent 选择。
+
+本轮验证：
+
+- `cargo test --locked -p agentdeck-desktop`：2 passed；desktop selfcheck 与真实 bundle
+  verify 均通过，运行路径为当前 checkout 的 `dist/AgentDeck.app`。
+- 实际窗口确认空态与会话态、禁用发送和搜索的样式、本机 Agent 状态及项目上下文；
+  键盘和鼠标均可切换示例，焦点移入输入框后侧栏仍保持选中，返回空态保留草稿。
+- 会话顶部鼠标双击已验证缩放与恢复；测试草稿已清空。当前仍不验证真实 Agent 链路。
 
 ## 后续
 
-- 侧栏置顶会话、项目区、账号区和 composer 工具行接入真实数据时，替换对应常量数组，
+- 侧栏置顶会话、项目区、本机 Agent 状态和 composer 接入真实数据时，替换对应示例数据，
   保持"数据驱动、不加 vendor 分支"的形状。
 - 真实能力控件应按 `SessionCapabilities` 由 typed router 装配进 composer 工具行。
 - 图标资源：注册 `AssetSource` 后可用 `IconName::*` 替换侧栏纯文字行。

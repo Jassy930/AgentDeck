@@ -5,7 +5,9 @@
 use gpui::{
     App, Context, Entity, IntoElement, ParentElement, SharedString, Window, div, prelude::*, px,
 };
-use gpui_component::{ActiveTheme, StyledExt, h_flex, input::InputState, v_flex};
+use gpui_component::{
+    ActiveTheme, InteractiveElementExt, StyledExt, h_flex, input::InputState, v_flex,
+};
 
 use crate::composer;
 use crate::sidebar;
@@ -15,7 +17,10 @@ pub enum Stage {
     /// 空态：居中大标题、composer 和连接卡片。
     Empty,
     /// 会话态：thread header、transcript 区和底部悬浮 composer。
-    Session { title: SharedString },
+    Session {
+        title: SharedString,
+        project: SharedString,
+    },
 }
 
 impl Stage {
@@ -23,16 +28,20 @@ impl Stage {
     pub fn header_title(&self) -> Option<&str> {
         match self {
             Stage::Empty => None,
-            Stage::Session { title } => Some(title.as_ref()),
+            Stage::Session { title, .. } => Some(title.as_ref()),
+        }
+    }
+
+    pub fn project_name(&self) -> Option<&str> {
+        match self {
+            Stage::Empty => None,
+            Stage::Session { project, .. } => Some(project.as_ref()),
         }
     }
 }
 
 /// 空态下并列展示的接入入口。两家并列由数据驱动，UI 不按 vendor 分支。
-const CONNECTORS: [(&str, &str); 2] = [
-    ("Codex", "本机 CLI · 未连接"),
-    ("Claude Code", "本机 CLI · 未连接"),
-];
+pub const CONNECTORS: [(&str, &str); 2] = [("Codex", "尚未接入"), ("Claude Code", "尚未接入")];
 
 pub struct Shell {
     stage: Stage,
@@ -43,7 +52,7 @@ impl Shell {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let composer = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("交给 agent 一个任务…")
+                .placeholder("描述任务，预览输入效果…")
                 .multi_line(true)
                 .auto_grow(1, 8)
         });
@@ -57,8 +66,13 @@ impl Shell {
         }
     }
 
-    pub fn open_session(&mut self, title: SharedString, cx: &mut Context<Self>) {
-        self.stage = Stage::Session { title };
+    pub fn open_session(
+        &mut self,
+        title: SharedString,
+        project: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        self.stage = Stage::Session { title, project };
         cx.notify();
     }
 
@@ -89,22 +103,16 @@ impl Shell {
                                 div()
                                     .text_sm()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child("选择一个项目，或直接描述任务"),
+                                    .child("选择示例项目，或试着输入任务"),
                             ),
                     )
-                    .child(composer::render(&self.composer, cx))
+                    .child(composer::render(&self.composer, None, cx))
                     .child(
                         h_flex().gap_3().children(
                             CONNECTORS
                                 .iter()
                                 .map(|(name, status)| connector_card(name, status, cx)),
                         ),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("本机运行 · 尚未接入 daemon"),
                     ),
             )
     }
@@ -116,6 +124,7 @@ impl Shell {
             .child(
                 // thread header：左标题，右上环境信息占位。高度同时吃掉红绿灯占位。
                 h_flex()
+                    .id("session-titlebar")
                     .w_full()
                     .h(px(52.))
                     .flex_shrink_0()
@@ -124,12 +133,13 @@ impl Shell {
                     .justify_between()
                     .border_b_1()
                     .border_color(cx.theme().border)
+                    .on_double_click(|_, window: &mut Window, _| window.titlebar_double_click())
                     .child(div().text_sm().font_semibold().child(title.to_string()))
                     .child(
                         div()
-                            .text_xs()
+                            .text_sm()
                             .text_color(cx.theme().muted_foreground)
-                            .child("本机 · 分支未知"),
+                            .child("示例会话"),
                     ),
             )
             .child(
@@ -138,7 +148,7 @@ impl Shell {
                     div()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
-                        .child("transcript 尚未接入"),
+                        .child("任务记录将在这里显示"),
                 ),
             )
             .child(
@@ -148,7 +158,11 @@ impl Shell {
                     .justify_center()
                     .px_6()
                     .pb_6()
-                    .child(composer::render(&self.composer, cx)),
+                    .child(composer::render(
+                        &self.composer,
+                        self.stage.project_name(),
+                        cx,
+                    )),
             )
     }
 }
@@ -165,8 +179,8 @@ fn connector_card(name: &str, status: &str, cx: &App) -> impl IntoElement {
         .child(div().text_sm().font_semibold().child(name.to_string()))
         .child(
             div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
+                .text_sm()
+                .text_color(cx.theme().secondary_foreground)
                 .child(status.to_string()),
         )
 }
@@ -182,7 +196,7 @@ impl Render for Shell {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .child(sidebar::render(cx))
+            .child(sidebar::render(self.stage.header_title(), cx))
             .child(main)
     }
 }
@@ -192,14 +206,20 @@ mod tests {
     use super::Stage;
 
     #[test]
-    fn empty_stage_has_no_header_title() {
-        assert_eq!(Stage::Empty.header_title(), None);
+    fn navigation_keeps_the_selected_item_and_project_together() {
+        let mut stage = Stage::Empty;
+        assert_eq!((stage.header_title(), stage.project_name()), (None, None));
+
+        stage = Stage::Session {
+            title: "修复记录收尾".into(),
+            project: "agentdeckd".into(),
+        };
         assert_eq!(
-            Stage::Session {
-                title: "demo".into()
-            }
-            .header_title(),
-            Some("demo")
+            (stage.header_title(), stage.project_name()),
+            (Some("修复记录收尾"), Some("agentdeckd"))
         );
+
+        stage = Stage::Empty;
+        assert_eq!((stage.header_title(), stage.project_name()), (None, None));
     }
 }
