@@ -187,3 +187,10 @@ bundle verify 均通过。分页 fake 的最后一页省略 `nextCursor`，仍�
 当前 checkout daemon 的真实 list 返回 3 条、legacy read 返回 4 轮 / 8 条目；
 重建 bundle 内 daemon 的长会话 read 返回 30 轮 / 505 条目。此次只执行真实历史
 list/read，未发送模型 prompt；新版完整 lifecycle 与桌面正文点击的验收边界不变。
+
+macOS 进程组存在性查询在组仅剩僵尸进程时可能返回 `EPERM`；将其视为仍存在，
+继续在原清理预算内等待 `ESRCH`。发送 SIGKILL 的权限错误仍立即报错。CI 的探测
+清理用例捕获了此问题，本地 100 次子进程对照中复现 4 次查询 `EPERM`，最终均确认
+进程组消失；该修复同时用于版本探测与 live session 的进程组退出确认。
+修复后的 88 项 Codex focused、完整离线门禁、CLI/desktop selfcheck、diagnostics report
+与真实 bundle verify 均通过。

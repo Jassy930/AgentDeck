@@ -360,6 +360,9 @@ pub(super) fn process_group_exists(process_group_id: u32) -> io::Result<bool> {
     let error = io::Error::last_os_error();
     if error.raw_os_error() == Some(ESRCH) {
         Ok(false)
+    } else if error.raw_os_error() == Some(EPERM) {
+        // Darwin can report EPERM while the group contains only zombies.
+        Ok(true)
     } else {
         Err(error)
     }
@@ -627,6 +630,8 @@ impl Drop for ShortLivedAppServer {
 const SIGKILL: i32 = 9;
 #[cfg(unix)]
 const ESRCH: i32 = 3;
+#[cfg(unix)]
+const EPERM: i32 = 1;
 #[cfg(unix)]
 unsafe extern "C" {
     #[link_name = "kill"]
