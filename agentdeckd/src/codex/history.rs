@@ -181,10 +181,16 @@ pub async fn list_history(
     limit: Option<usize>,
 ) -> Result<Vec<HistoryListItem>, ProtocolError> {
     let cwd_filter = cwd_filter.map(Path::to_path_buf);
-    let mut client = ShortLivedAppServer::spawn(&runtime_cwd()?)?;
-    let result = with_history_deadline(
+    let started = tokio::time::Instant::now();
+    let mut client = with_history_deadline(
         "list",
         history_work_timeout(),
+        ShortLivedAppServer::spawn(&runtime_cwd()?),
+    )
+    .await?;
+    let result = with_history_deadline(
+        "list",
+        history_work_timeout().saturating_sub(started.elapsed()),
         list_history_inner(&mut client, cwd_filter, limit),
     )
     .await;
@@ -262,10 +268,16 @@ fn decode_thread_read(
 /// Read all persisted turns/items for one Codex thread. The item payloads are
 /// mapped through the same completed-item translator as live sessions.
 pub async fn read_history(thread_id: &ThreadId) -> Result<HistoryReadResponse, ProtocolError> {
-    let mut client = ShortLivedAppServer::spawn(&runtime_cwd()?)?;
-    let result = with_history_deadline(
+    let started = tokio::time::Instant::now();
+    let mut client = with_history_deadline(
         "read",
         history_work_timeout(),
+        ShortLivedAppServer::spawn(&runtime_cwd()?),
+    )
+    .await?;
+    let result = with_history_deadline(
+        "read",
+        history_work_timeout().saturating_sub(started.elapsed()),
         read_history_inner(&mut client, thread_id.clone()),
     )
     .await;
@@ -617,8 +629,7 @@ mod tests {
         let cases = [
             (
                 json!({ "result": {
-                "data": [{ "items": [{ "type": "agentMessage", "text": "second turn" }] }],
-                "nextCursor": null
+                "data": [{ "items": [{ "type": "agentMessage", "text": "second turn" }] }]
             } }),
                 None,
             ),
@@ -667,7 +678,7 @@ mod tests {
             script.push_str("while IFS= read -r frame; do :; done\n");
             std::fs::write(&executable, script).unwrap();
             std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let binary = CodexBinary::resolve_at(&executable).unwrap();
+            let binary = CodexBinary::resolve_at(&executable).await.unwrap();
             let mut client = ShortLivedAppServer::spawn_with_binary(&root, &binary).unwrap();
             let result = read_history_inner(&mut client, ThreadId("thread-1".into())).await;
             client.shutdown().await;

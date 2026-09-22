@@ -204,10 +204,12 @@ path 都发送规范的 `initialized`，fake 测试守护 initialize response
 历史，只验证 `kind=list` 或合法空列表不足以证明正文可读；后续页面失败不能算完整
 读取通过。历史读回也不能替代升级后的真实 lifecycle E2E 与桌面正文点击验收。
 
-daemon 按 PATH、常见安装位置的顺序探测候选，跳过版本不匹配的安装并使用首个精确
+daemon 按 PATH、常见安装位置的顺序异步探测候选，只跳过成功读出但不匹配的版本并使用首个精确
 匹配版本。macOS 同时探测 App 自带 executable；即使 `command -v codex` 返回旧版
-Homebrew 安装，也不代表 daemon 使用它。离线 locator 用例须验证跳过不匹配候选，
-并确认 probe 与 spawn 始终绑定同一规范化绝对路径。
+Homebrew 安装，也不代表 daemon 使用它。离线 locator 用例须验证跳过不匹配候选、
+非零退出与非法输出停止查找、慢探测不阻塞 runtime，以及候选共享 5 秒探测预算；
+history 候选查找与 RPC 须共享 28 秒工作预算并预留清理。probe 与 spawn 始终绑定同一
+规范化绝对路径，CLI fake 用例覆盖探测失败不会启动后续系统候选。
 
 升级刷新或同版本复验时，都先在临时目录 fail-closed 生成，并记录本机
 Codex 的实际版本。显式指定要生成快照的 executable，不依赖 PATH 首项：
@@ -315,6 +317,8 @@ AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" AGENTDECK_E2E=1 \
 Cargo 测试中显示为 passed 而非 ignored。
 
 **前置条件：** `codex login` 已完成（测试会真实 spawn daemon 并发送 IPC）。
+Codex E2E 在显式门控后使用 daemon 的候选定位，不因 PATH 中没有 `codex` 而跳过；
+仅安装在受支持 App 路径中的匹配版本也能进入验收。
 
 **断言策略：** E2E 测试只断言响应的契约形态（消息 kind、必要字段存在、退出码等），不断言 agent 返回的具体文本内容，以避免测试因模型输出变化而 flaky。
 

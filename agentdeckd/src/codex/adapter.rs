@@ -402,15 +402,20 @@ mod tests {
     use crate::codex::session::OpenedAppServer;
     use agentdeck_protocol::{InitialTurn, RuntimeOptions, SessionOutcome};
     use async_trait::async_trait;
-    use std::future::pending;
     use std::path::PathBuf;
+    use tokio::sync::watch;
 
     struct PendingFactory;
 
     #[async_trait]
     impl AppServerFactory for PendingFactory {
-        async fn open(&self, _cwd: &Path) -> Result<OpenedAppServer, ProtocolError> {
-            pending().await
+        async fn open(
+            &self,
+            _cwd: &Path,
+            mut cancel: watch::Receiver<bool>,
+        ) -> Result<OpenedAppServer, ProtocolError> {
+            let _ = cancel.wait_for(|canceled| *canceled).await;
+            Err(error("codex-open-canceled", "Codex startup was canceled"))
         }
     }
 
@@ -418,7 +423,14 @@ mod tests {
 
     #[async_trait]
     impl AppServerFactory for FailingFactory {
-        async fn open(&self, _cwd: &Path) -> Result<OpenedAppServer, ProtocolError> {
+        async fn open(
+            &self,
+            _cwd: &Path,
+            cancel: watch::Receiver<bool>,
+        ) -> Result<OpenedAppServer, ProtocolError> {
+            if *cancel.borrow() {
+                return Err(error("codex-open-canceled", "Codex startup was canceled"));
+            }
             Err(error("fake-open-failed", "deterministic factory failure"))
         }
     }

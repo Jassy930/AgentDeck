@@ -1,5 +1,6 @@
 #!/bin/sh
 if [ "$1" = "--version" ]; then
+  [ "${AGENTDECK_FIXTURE_VERSION_ERROR:-}" = 1 ] && exit 97
   printf '%s\n' "$AGENTDECK_FIXTURE_VERSION"
   exit 0
 fi

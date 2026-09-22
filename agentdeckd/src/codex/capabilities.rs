@@ -11,12 +11,15 @@
 //! lifecycle and cumulative assistant streaming only.
 
 use std::collections::BTreeSet;
-use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
+use tokio::process::{Child, Command};
+use tokio::sync::watch;
+use tokio::time::{Instant, timeout_at};
 
-use super::app_server::{SHORT_LIVED_SHUTDOWN_TIMEOUT, signal_process_group};
+use super::app_server::{SHORT_LIVED_SHUTDOWN_TIMEOUT, process_group_exists, signal_process_group};
 
 use agentdeck_protocol::{
     AgentKind, CapabilityId, CodexApprovalPolicy, CodexCapabilities, CodexReasoningEffort,
@@ -24,12 +27,12 @@ use agentdeck_protocol::{
 };
 
 const CODEX_VERSION_FILE: &str = include_str!("../../../protocol/CODEX_VERSION.txt");
-const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-fn unsupported_version_error(message: impl Into<String>) -> ProtocolError {
+fn probe_error(code: &str, message: impl Into<String>) -> ProtocolError {
     ProtocolError {
-        code: "codex-version-unsupported".into(),
+        code: code.into(),
         message: message.into(),
         diagnostic_ref: None,
     }
@@ -81,108 +84,152 @@ where
     match run(binary) {
         Ok((0, stdout)) => {
             let stdout = String::from_utf8(stdout).map_err(|_| {
-                unsupported_version_error("Codex CLI version output is not valid UTF-8")
+                probe_error(
+                    "codex-version-probe-failed",
+                    "Codex CLI version output is not valid UTF-8",
+                )
             })?;
             let actual = stdout.trim();
+            let valid_version = actual.strip_prefix("codex-cli ").is_some_and(|version| {
+                let core = version.split(['-', '+']).next().unwrap_or("");
+                core.split('.').count() == 3
+                    && core
+                        .split('.')
+                        .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+                    && version
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+            });
+            if !valid_version {
+                return Err(probe_error(
+                    "codex-version-probe-failed",
+                    "Codex CLI version output is invalid",
+                ));
+            }
             let expected = supported_codex_version();
             if actual == expected {
                 Ok(actual.to_string())
             } else {
-                Err(unsupported_version_error(format!(
-                    "unsupported Codex CLI version; expected {expected}"
-                )))
+                Err(probe_error(
+                    "codex-version-unsupported",
+                    format!("unsupported Codex CLI version; expected {expected}"),
+                ))
             }
         }
-        Ok((_status, _stdout)) => Err(unsupported_version_error(
+        Ok((_status, _stdout)) => Err(probe_error(
+            "codex-version-probe-failed",
             "Codex CLI version probe exited unsuccessfully",
         )),
-        Err(_error) => Err(unsupported_version_error(
+        Err(_error) => Err(probe_error(
+            "codex-version-probe-failed",
             "Codex CLI version probe could not be executed",
         )),
     }
 }
 
-/// Probe one already-resolved Codex binary and require the exact version
-/// pinned by `protocol/CODEX_VERSION.txt`.
-pub(crate) fn probe_codex_version_at(binary: &Path) -> Result<String, ProtocolError> {
-    probe_codex_version_with_timeout(binary, VERSION_PROBE_TIMEOUT)
+pub(super) fn check_probe_deadline(
+    deadline: Instant,
+    cancel: &watch::Receiver<bool>,
+) -> Result<(), ProtocolError> {
+    if *cancel.borrow() {
+        Err(probe_error(
+            "codex-open-canceled",
+            "Codex startup was canceled",
+        ))
+    } else if Instant::now() >= deadline {
+        Err(probe_error(
+            "codex-version-timeout",
+            "Codex CLI discovery exceeded its time budget",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
-fn probe_codex_version_with_timeout(
+struct VersionProbe {
+    child: Child,
+    process_group_id: u32,
+}
+
+impl Drop for VersionProbe {
+    fn drop(&mut self) {
+        let _ = signal_process_group(self.process_group_id);
+        let _ = self.child.start_kill();
+    }
+}
+
+/// All candidates share one deadline. Cancellation stops discovery only after
+/// the active probe and its process group have been reaped.
+pub(super) async fn probe_codex_version_at(
     binary: &Path,
-    timeout: Duration,
+    deadline: Instant,
+    cancel: &mut watch::Receiver<bool>,
 ) -> Result<String, ProtocolError> {
+    check_probe_deadline(deadline, cancel)?;
     let mut command = Command::new(binary);
     command
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
     #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|_| unsupported_version_error("Codex CLI version probe could not be executed"))?;
-    let process_group_id = child.id();
-    let deadline = Instant::now() + timeout;
-    let result = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Err(_) => {
-                break Err(unsupported_version_error(
-                    "Codex CLI version probe could not be awaited",
-                ));
-            }
-            Ok(None) if Instant::now() >= deadline => {
-                break Err(ProtocolError {
-                    code: "codex-version-timeout".into(),
-                    message: format!("Codex CLI version probe exceeded {timeout:?}"),
-                    diagnostic_ref: None,
-                });
-            }
-            Ok(None) => std::thread::sleep(PROBE_POLL_INTERVAL),
-        }
+    command.process_group(0);
+    let child = command.spawn().map_err(|error| {
+        probe_error(
+            "codex-version-probe-failed",
+            format!("Codex CLI version probe could not be executed: {error}"),
+        )
+    })?;
+    let mut probe = VersionProbe {
+        process_group_id: child.id().expect("new probe pid"),
+        child,
+    };
+    let result = tokio::select! {
+        biased;
+        _ = cancel.changed() => Err(probe_error("codex-open-canceled", "Codex startup was canceled")),
+        result = timeout_at(deadline, probe.child.wait()) => match result {
+            Ok(Ok(status)) => Ok(status),
+            Ok(Err(error)) => Err(probe_error("codex-version-probe-failed", format!("Codex CLI version probe wait failed: {error}"))),
+            Err(_) => Err(probe_error("codex-version-timeout", "Codex CLI discovery exceeded its time budget")),
+        },
     };
 
-    // A launcher can exit while its children retain stdout. Signal the saved
-    // group before reading the pipe, including after a successful probe.
-    let group_signal = signal_process_group(process_group_id);
-    let _ = child.kill();
-    let cleanup_error = |reason| ProtocolError {
-        code: "codex-cleanup-failed".into(),
-        message: format!("Codex CLI version probe cleanup failed: {reason}"),
-        diagnostic_ref: None,
+    // Launchers may leave descendants holding stdout after exiting themselves.
+    let signal = signal_process_group(probe.process_group_id);
+    let _ = probe.child.start_kill();
+    let cleanup = async {
+        probe.child.wait().await?;
+        signal?;
+        while process_group_exists(probe.process_group_id)? {
+            tokio::time::sleep(PROBE_POLL_INTERVAL).await;
+        }
+        let mut stdout = Vec::new();
+        probe
+            .child
+            .stdout
+            .take()
+            .expect("piped version stdout")
+            .read_to_end(&mut stdout)
+            .await?;
+        Ok::<_, std::io::Error>(stdout)
     };
-    let cleanup_deadline = Instant::now() + SHORT_LIVED_SHUTDOWN_TIMEOUT;
-    loop {
-        let reaped = child
-            .try_wait()
-            .map_err(|error| cleanup_error(format!("wait: {error}")))?
-            .is_some();
-        if reaped {
-            break;
-        }
-        if Instant::now() >= cleanup_deadline {
-            return Err(cleanup_error(
-                "process exit was not confirmed in time".into(),
-            ));
-        }
-        std::thread::sleep(PROBE_POLL_INTERVAL);
-    }
-    group_signal.map_err(|error| cleanup_error(format!("signal process group: {error}")))?;
+    let stdout = tokio::time::timeout(SHORT_LIVED_SHUTDOWN_TIMEOUT, cleanup)
+        .await
+        .map_err(|_| {
+            probe_error(
+                "codex-cleanup-failed",
+                "Codex CLI version probe cleanup timed out",
+            )
+        })?
+        .map_err(|error| {
+            probe_error(
+                "codex-cleanup-failed",
+                format!("Codex CLI version probe cleanup failed: {error}"),
+            )
+        })?;
     let status = result?;
-    let mut stdout = Vec::new();
-    let output = child
-        .stdout
-        .take()
-        .expect("piped version stdout")
-        .read_to_end(&mut stdout)
-        .map(|_| (status.code().unwrap_or(-1), stdout))
-        .map_err(|error| error.to_string());
-    probe_codex_version_with_command(binary, |_| output)
+    probe_codex_version_with_command(binary, |_| Ok((status.code().unwrap_or(-1), stdout)))
 }
 
 #[cfg(test)]
@@ -254,7 +301,7 @@ mod tests {
             Err("missing".to_string())
         })
         .unwrap_err();
-        assert_eq!(error.code, "codex-version-unsupported");
+        assert_eq!(error.code, "codex-version-probe-failed");
     }
 
     #[test]
@@ -263,12 +310,17 @@ mod tests {
             Ok((1, supported_codex_version().as_bytes().to_vec())),
             Ok((0, b" \n".to_vec())),
             Ok((0, vec![0xff])),
-            Ok((0, b"codex-cli 0.146.0\n".to_vec())),
+            Ok((0, b"not a version\n".to_vec())),
         ] {
             let error =
                 probe_codex_version_with_command(Path::new("/fake/codex"), |_| result).unwrap_err();
-            assert_eq!(error.code, "codex-version-unsupported");
+            assert_eq!(error.code, "codex-version-probe-failed");
         }
+        let error = probe_codex_version_with_command(Path::new("/fake/codex"), |_| {
+            Ok((0, b"codex-cli 0.146.0\n".to_vec()))
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "codex-version-unsupported");
     }
 
     #[test]
@@ -277,12 +329,12 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn version_probe_reaps_launcher_and_children_on_success_and_timeout() {
+    #[tokio::test]
+    async fn version_probe_reaps_launcher_and_children_on_success_timeout_and_cancel() {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
-        for times_out in [false, true] {
+        for mode in ["success", "timeout", "cancel"] {
             let root = std::env::temp_dir().join(format!(
                 "agentdeck-version-probe-{}-{}",
                 std::process::id(),
@@ -292,7 +344,7 @@ mod tests {
             let binary = root.join("codex");
             let pids_file = root.join("pids");
             let pids_path = pids_file.to_string_lossy().replace('\'', "'\"'\"'");
-            let finish = if times_out {
+            let finish = if mode != "success" {
                 "wait".to_string()
             } else {
                 format!("printf '%s\\n' '{}'", supported_codex_version())
@@ -307,10 +359,33 @@ mod tests {
             fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
 
             let started = Instant::now();
-            let result = probe_codex_version_with_timeout(&binary, Duration::from_secs(2));
+            let (cancel_tx, mut cancel) = watch::channel(false);
+            let (result, ()) = tokio::join!(
+                probe_codex_version_at(
+                    &binary,
+                    Instant::now() + Duration::from_secs(2),
+                    &mut cancel
+                ),
+                async {
+                    if mode == "cancel" {
+                        while !pids_file.exists() {
+                            assert!(started.elapsed() < Duration::from_secs(3));
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        cancel_tx.send(true).unwrap();
+                    }
+                }
+            );
             assert!(started.elapsed() < Duration::from_secs(5));
-            if times_out {
-                assert_eq!(result.unwrap_err().code, "codex-version-timeout");
+            if mode != "success" {
+                assert_eq!(
+                    result.unwrap_err().code,
+                    if mode == "cancel" {
+                        "codex-open-canceled"
+                    } else {
+                        "codex-version-timeout"
+                    }
+                );
             } else {
                 assert_eq!(result.unwrap(), supported_codex_version());
             }
@@ -324,6 +399,7 @@ mod tests {
                 let process = Command::new("/bin/ps")
                     .args(["-o", "pid=", "-p", &pid.to_string()])
                     .output()
+                    .await
                     .unwrap();
                 assert!(
                     process.stdout.is_empty(),

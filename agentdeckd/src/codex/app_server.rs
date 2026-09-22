@@ -5,7 +5,9 @@
 //! Both paths intentionally share binary discovery, PATH repair and wire
 //! framing so GUI launches and history refreshes cannot drift apart.
 
-use crate::codex::capabilities::{probe_codex_version_at, supported_codex_version};
+use crate::codex::capabilities::{
+    VERSION_PROBE_TIMEOUT, check_probe_deadline, probe_codex_version_at, supported_codex_version,
+};
 use agentdeck_protocol::ProtocolError;
 use serde_json::{Value, json};
 use std::io;
@@ -18,7 +20,9 @@ use std::sync::{
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 pub(super) const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(20);
 pub(super) const SHORT_LIVED_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -46,15 +50,23 @@ pub(crate) struct CodexBinary {
 }
 
 impl CodexBinary {
-    pub(crate) fn resolve() -> Result<Self, ProtocolError> {
-        Self::resolve_candidates(codex_candidates())
+    pub(crate) async fn resolve(cancel: &mut watch::Receiver<bool>) -> Result<Self, ProtocolError> {
+        Self::resolve_candidates(
+            codex_candidates(),
+            Instant::now() + VERSION_PROBE_TIMEOUT,
+            cancel,
+        )
+        .await
     }
 
-    fn resolve_candidates(
+    async fn resolve_candidates(
         candidates: impl IntoIterator<Item = PathBuf>,
+        deadline: Instant,
+        cancel: &mut watch::Receiver<bool>,
     ) -> Result<Self, ProtocolError> {
         let mut checked = Vec::new();
         for candidate in candidates {
+            check_probe_deadline(deadline, cancel)?;
             let Some(path) = canonical_executable(&candidate) else {
                 continue;
             };
@@ -62,8 +74,11 @@ impl CodexBinary {
                 continue;
             }
             checked.push(path.clone());
-            match probe_codex_version_at(&path) {
-                Ok(version) => return Ok(Self { path, version }),
+            match probe_codex_version_at(&path, deadline, cancel).await {
+                Ok(version) => {
+                    check_probe_deadline(deadline, cancel)?;
+                    return Ok(Self { path, version });
+                }
                 Err(error) if error.code == "codex-version-unsupported" => continue,
                 Err(error) => return Err(error),
             }
@@ -78,7 +93,7 @@ impl CodexBinary {
     /// callers use [`Self::resolve`]; deterministic tests use this entrypoint
     /// so they never inspect or execute the user's PATH vendor.
     #[cfg(test)]
-    pub(crate) fn resolve_at(path: &Path) -> Result<Self, ProtocolError> {
+    pub(crate) async fn resolve_at(path: &Path) -> Result<Self, ProtocolError> {
         let path = path.canonicalize().map_err(|_| {
             unsupported_version_error("supported Codex CLI executable could not be resolved")
         })?;
@@ -87,7 +102,10 @@ impl CodexBinary {
                 "supported Codex CLI executable could not be resolved",
             ));
         }
-        let version = probe_codex_version_at(&path)?;
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let version =
+            probe_codex_version_at(&path, Instant::now() + VERSION_PROBE_TIMEOUT, &mut cancel)
+                .await?;
         Ok(Self { path, version })
     }
 
@@ -494,8 +512,9 @@ pub(super) struct ShortLivedAppServer {
 }
 
 impl ShortLivedAppServer {
-    pub(super) fn spawn(cwd: &Path) -> Result<Self, ProtocolError> {
-        let binary = CodexBinary::resolve()?;
+    pub(super) async fn spawn(cwd: &Path) -> Result<Self, ProtocolError> {
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let binary = CodexBinary::resolve(&mut cancel).await?;
         Self::spawn_with_binary(cwd, &binary)
     }
 
@@ -784,7 +803,7 @@ done
     #[tokio::test]
     async fn fake_binary_is_probed_and_spawned_by_the_same_canonical_path() {
         let fake = FakeCodex::new(supported_codex_version());
-        let binary = CodexBinary::resolve_at(&fake.executable).unwrap();
+        let binary = CodexBinary::resolve_at(&fake.executable).await.unwrap();
         let canonical = fake.executable.canonicalize().unwrap();
 
         assert!(binary.path().is_absolute());
@@ -835,38 +854,126 @@ done
     }
 
     #[cfg(unix)]
-    #[test]
-    fn resolution_skips_duplicate_and_unsupported_candidates() {
+    #[tokio::test]
+    async fn resolution_skips_duplicate_and_unsupported_candidates() {
         let old = FakeCodex::new("codex-cli 0.145.0");
         let supported = FakeCodex::new(supported_codex_version());
-        let binary = CodexBinary::resolve_candidates([
-            old.executable.clone(),
-            old.executable.clone(),
-            supported.executable.clone(),
-        ])
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let binary = CodexBinary::resolve_candidates(
+            [
+                old.executable.clone(),
+                old.executable.clone(),
+                supported.executable.clone(),
+            ],
+            Instant::now() + VERSION_PROBE_TIMEOUT,
+            &mut cancel,
+        )
+        .await
         .unwrap();
         assert_eq!(binary.path(), supported.executable.canonicalize().unwrap());
         assert_eq!(old.calls().len(), 1);
         assert_eq!(supported.calls().len(), 1);
 
-        let error = CodexBinary::resolve_candidates([old.executable.clone()]).unwrap_err();
+        let error = CodexBinary::resolve_candidates(
+            [old.executable.clone()],
+            Instant::now() + VERSION_PROBE_TIMEOUT,
+            &mut cancel,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.code, "codex-version-unsupported");
         assert!(error.message.contains(supported_codex_version()));
     }
 
     #[cfg(unix)]
-    #[test]
-    fn injected_missing_or_mismatched_binary_uses_stable_error_code() {
+    #[tokio::test]
+    async fn failed_probes_stop_before_the_next_candidate() {
+        for script in [
+            "#!/bin/sh\nexit 97\n",
+            "#!/bin/sh\nprintf 'invalid version\\n'\n",
+            "#!/bin/sh\nprintf '\\377'\n",
+        ] {
+            let failed = FakeCodex::new(supported_codex_version());
+            let supported = FakeCodex::new(supported_codex_version());
+            fs::write(&failed.executable, script).unwrap();
+            let (_cancel_tx, mut cancel) = watch::channel(false);
+            let error = CodexBinary::resolve_candidates(
+                [failed.executable.clone(), supported.executable.clone()],
+                Instant::now() + VERSION_PROBE_TIMEOUT,
+                &mut cancel,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, "codex-version-probe-failed");
+            assert!(
+                !supported.log.exists(),
+                "failed probe must not fall through"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn candidates_share_a_deadline_without_blocking_the_executor() {
+        let first = FakeCodex::new("codex-cli 0.145.0");
+        let slow = FakeCodex::new(supported_codex_version());
+        let untouched = FakeCodex::new(supported_codex_version());
+        let original = fs::read_to_string(&first.executable).unwrap();
+        fs::write(
+            &first.executable,
+            original.replacen("#!/bin/sh", "#!/bin/sh\n/bin/sleep 0.1", 1),
+        )
+        .unwrap();
+        fs::write(&slow.executable, "#!/bin/sh\n/bin/sleep 10\n").unwrap();
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let heartbeat = AtomicBool::new(false);
+        let started = Instant::now();
+        let ((), ()) = tokio::join!(
+            async {
+                let error = CodexBinary::resolve_candidates(
+                    [
+                        first.executable.clone(),
+                        slow.executable.clone(),
+                        untouched.executable.clone(),
+                    ],
+                    started + Duration::from_millis(400),
+                    &mut cancel,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.code, "codex-version-timeout");
+                assert!(
+                    heartbeat.load(Ordering::SeqCst),
+                    "probe blocked the executor"
+                );
+                assert!(started.elapsed() < Duration::from_secs(2));
+                assert!(
+                    !untouched.log.exists(),
+                    "deadline must stop further candidates"
+                );
+            },
+            async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                heartbeat.store(true, Ordering::SeqCst);
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn injected_missing_or_mismatched_binary_uses_stable_error_code() {
         let root = std::env::temp_dir().join(format!(
             "agentdeck-missing-codex-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
-        let missing = CodexBinary::resolve_at(&root.join("codex")).unwrap_err();
+        let missing = CodexBinary::resolve_at(&root.join("codex"))
+            .await
+            .unwrap_err();
         assert_eq!(missing.code, "codex-version-unsupported");
 
         let fake = FakeCodex::new("codex-cli 0.146.0");
-        let mismatch = CodexBinary::resolve_at(&fake.executable).unwrap_err();
+        let mismatch = CodexBinary::resolve_at(&fake.executable).await.unwrap_err();
         assert_eq!(mismatch.code, "codex-version-unsupported");
         assert_eq!(fake.calls().len(), 1, "mismatch must not spawn app-server");
         assert!(fake.calls()[0].ends_with("|--version"));

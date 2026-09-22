@@ -82,7 +82,8 @@ gpui-component = "=0.5.1"
 `Cargo.lock` 锁定；不要在没有验证的情况下追 Git main。
 
 Codex 程序版本固定为 `codex-cli 0.155.0-alpha.9.2`，完整版本写在
-`protocol/CODEX_VERSION.txt`。daemon 依次探测 PATH 和常见安装位置，跳过不匹配版本，
+`protocol/CODEX_VERSION.txt`。daemon 依次异步探测 PATH 和常见安装位置，只跳过成功
+读出但不匹配的版本；执行失败、非法输出、超时或清理失败立即报错。
 使用首个精确匹配的 executable；macOS 候选包括
 `/Applications/ChatGPT.app/Contents/Resources/codex`。版本探测与 app-server 启动使用
 同一个规范化绝对路径，不要求替换 Homebrew 的旧安装。精确版本门禁用于让适配器与

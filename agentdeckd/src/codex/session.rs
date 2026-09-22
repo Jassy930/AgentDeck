@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::Child;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
@@ -103,7 +103,11 @@ impl OpenedAppServer {
 
 #[async_trait]
 pub(crate) trait AppServerFactory: Send + Sync {
-    async fn open(&self, cwd: &Path) -> Result<OpenedAppServer, ProtocolError>;
+    async fn open(
+        &self,
+        cwd: &Path,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<OpenedAppServer, ProtocolError>;
 }
 
 #[derive(Clone, Default)]
@@ -117,8 +121,12 @@ impl ProcessAppServerFactory {
 
 #[async_trait]
 impl AppServerFactory for ProcessAppServerFactory {
-    async fn open(&self, cwd: &Path) -> Result<OpenedAppServer, ProtocolError> {
-        let binary = CodexBinary::resolve()?;
+    async fn open(
+        &self,
+        cwd: &Path,
+        mut cancel: watch::Receiver<bool>,
+    ) -> Result<OpenedAppServer, ProtocolError> {
+        let binary = CodexBinary::resolve(&mut cancel).await?;
         let mut child = spawn_child_with_binary(cwd, &binary)?;
         let stdin = child.stdin.take().ok_or_else(|| ProtocolError {
             code: "codex-spawn-failed".into(),
@@ -405,35 +413,30 @@ impl CodexSessionOwner {
     pub(crate) async fn run(mut self) -> AgentSessionExit {
         let session_id = self.start.session_id.clone();
 
-        // Keep control responsive while a test or future production factory
-        // performs asynchronous pre-spawn work. A queued close wins before the
-        // open future is polled, so it cannot create a child only to tear it
-        // down again.
+        // Cancellation must let the factory reap its version-probe child before
+        // reporting cleanup. Dropping the open future only sends a kill signal.
         let open_cwd = self.start.cwd.clone();
-        let open = self.factory.open(&open_cwd);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let open = self.factory.open(&open_cwd, cancel_rx);
         tokio::pin!(open);
+        let mut closing = false;
+        let mut commands_open = true;
         let opened = loop {
             tokio::select! {
                 biased;
-                command = self.commands.recv() => {
+                command = self.commands.recv(), if commands_open => {
                     match command {
                         Some(SessionCommand::Close { reply }) => {
                             let _ = reply.send(Ok(()));
-                            return AgentSessionExit {
-                                thread_id: self.start.resume_thread_id.clone(),
-                                outcome: SessionOutcome::Closed,
-                                error: None,
-                                cleanup_confirmed: true,
-                            };
+                            closing = true;
+                            let _ = cancel_tx.send(true);
                         }
+                        Some(other) if closing => reject_stopping_command(other),
                         Some(other) => reject_preinitialization_command(other),
                         None => {
-                            return AgentSessionExit {
-                                thread_id: self.start.resume_thread_id.clone(),
-                                outcome: SessionOutcome::Closed,
-                                error: None,
-                                cleanup_confirmed: true,
-                            };
+                            commands_open = false;
+                            closing = true;
+                            let _ = cancel_tx.send(true);
                         }
                     }
                 }
@@ -444,11 +447,17 @@ impl CodexSessionOwner {
         let mut connection = match opened {
             Ok(connection) => connection,
             Err(error) => {
+                let canceled = closing && error.code == "codex-open-canceled";
+                let cleanup_confirmed = error.code != "codex-cleanup-failed";
                 return AgentSessionExit {
                     thread_id: self.start.resume_thread_id.clone(),
-                    outcome: SessionOutcome::Failed,
-                    error: Some(with_diagnostic_ref(error, &session_id)),
-                    cleanup_confirmed: true,
+                    outcome: if canceled {
+                        SessionOutcome::Closed
+                    } else {
+                        SessionOutcome::Failed
+                    },
+                    error: (!canceled).then(|| with_diagnostic_ref(error, &session_id)),
+                    cleanup_confirmed,
                 };
             }
         };
@@ -466,7 +475,14 @@ impl CodexSessionOwner {
             "codex_child_spawned",
             json!({"version": connection.version}),
         );
-        let logical_exit = running.run(&mut connection).await;
+        let logical_exit = if closing {
+            LogicalExit {
+                outcome: SessionOutcome::Closed,
+                error: None,
+            }
+        } else {
+            running.run(&mut connection).await
+        };
         let thread_id = running.thread_id.clone();
         running.diagnostic("codex_cleanup_started", json!({}));
         let cleanup_result = running.shutdown_connection(&mut connection).await;
@@ -985,6 +1001,7 @@ impl RunningOwner {
                         PendingKind::ThreadResume,
                         json!({
                             "threadId": thread_id.0,
+                            "excludeTurns": true,
                             "cwd": self.cwd.display().to_string(),
                             "sandbox": "read-only",
                             "approvalPolicy": "never",
@@ -1793,7 +1810,14 @@ mod tests {
 
     #[async_trait]
     impl AppServerFactory for TestFactory {
-        async fn open(&self, _cwd: &Path) -> Result<OpenedAppServer, ProtocolError> {
+        async fn open(
+            &self,
+            _cwd: &Path,
+            cancel: watch::Receiver<bool>,
+        ) -> Result<OpenedAppServer, ProtocolError> {
+            if *cancel.borrow() {
+                return Err(open_canceled_error());
+            }
             self.opens.fetch_add(1, Ordering::SeqCst);
             self.connection
                 .lock()
@@ -1807,12 +1831,40 @@ mod tests {
         }
     }
 
-    struct PendingOpenFactory;
+    struct PendingOpenFactory {
+        started: StdMutex<Option<oneshot::Sender<()>>>,
+        cleanup: StdMutex<Option<oneshot::Receiver<Result<(), ProtocolError>>>>,
+    }
+
+    fn open_canceled_error() -> ProtocolError {
+        ProtocolError {
+            code: "codex-open-canceled".into(),
+            message: "Codex startup was canceled".into(),
+            diagnostic_ref: None,
+        }
+    }
 
     #[async_trait]
     impl AppServerFactory for PendingOpenFactory {
-        async fn open(&self, _cwd: &Path) -> Result<OpenedAppServer, ProtocolError> {
-            std::future::pending().await
+        async fn open(
+            &self,
+            _cwd: &Path,
+            mut cancel: watch::Receiver<bool>,
+        ) -> Result<OpenedAppServer, ProtocolError> {
+            if *cancel.borrow() {
+                return Err(open_canceled_error());
+            }
+            self.started
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(())
+                .unwrap();
+            let _ = cancel.wait_for(|canceled| *canceled).await;
+            let cleanup = self.cleanup.lock().unwrap().take().unwrap();
+            cleanup.await.unwrap()?;
+            Err(open_canceled_error())
         }
     }
 
@@ -2344,43 +2396,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_rejects_turn_while_factory_is_initializing_and_close_skips_spawn() {
-        let (events_tx, mut events_rx) = mpsc::channel(4);
-        let (commands_tx, commands_rx) = mpsc::channel(4);
-        let owner = CodexSessionOwner::new(
-            start(None),
-            events_tx,
-            commands_rx,
-            Arc::new(PendingOpenFactory),
-        );
-        let run = tokio::spawn(owner.run());
+    async fn owner_close_during_open_waits_for_cleanup_and_keeps_commands_responsive() {
+        for cleanup_fails in [false, true] {
+            let (events_tx, mut events_rx) = mpsc::channel(4);
+            let (commands_tx, commands_rx) = mpsc::channel(4);
+            let (started_tx, started_rx) = oneshot::channel();
+            let (cleanup_tx, cleanup_rx) = oneshot::channel();
+            let owner = CodexSessionOwner::new(
+                start(None),
+                events_tx,
+                commands_rx,
+                Arc::new(PendingOpenFactory {
+                    started: StdMutex::new(Some(started_tx)),
+                    cleanup: StdMutex::new(Some(cleanup_rx)),
+                }),
+            );
+            let run = tokio::spawn(owner.run());
+            tokio::time::timeout(Duration::from_secs(2), started_rx)
+                .await
+                .expect("factory did not start")
+                .unwrap();
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        commands_tx
-            .send(SessionCommand::StartTurn {
-                turn_id: TurnId("turn-during-init".into()),
-                prompt: "must not start".into(),
-                reply: reply_tx,
-            })
-            .await
-            .unwrap();
-        let error = tokio::time::timeout(Duration::from_secs(2), reply_rx)
-            .await
-            .expect("initializing command reply timed out")
-            .unwrap()
-            .unwrap_err();
-        assert_eq!(error.code, "session-not-ready");
+            for closing in [false, true] {
+                if closing {
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    commands_tx
+                        .send(SessionCommand::Close { reply: reply_tx })
+                        .await
+                        .unwrap();
+                    command_reply(reply_rx).await;
+                }
+                let (reply_tx, reply_rx) = oneshot::channel();
+                commands_tx
+                    .send(SessionCommand::StartTurn {
+                        turn_id: TurnId("turn-during-open".into()),
+                        prompt: "must not start".into(),
+                        reply: reply_tx,
+                    })
+                    .await
+                    .unwrap();
+                let error = tokio::time::timeout(Duration::from_secs(2), reply_rx)
+                    .await
+                    .expect("open or cleanup command reply timed out")
+                    .unwrap()
+                    .unwrap_err();
+                assert_eq!(error.code, "session-not-ready");
+                assert!(!run.is_finished(), "owner exited before factory cleanup");
+            }
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        commands_tx
-            .send(SessionCommand::Close { reply: reply_tx })
-            .await
-            .unwrap();
-        command_reply(reply_rx).await;
-        let exit = run.await.unwrap();
-        assert_eq!(exit.outcome, SessionOutcome::Closed);
-        assert!(exit.cleanup_confirmed);
-        assert!(events_rx.try_recv().is_err());
+            cleanup_tx
+                .send(if cleanup_fails {
+                    Err(ProtocolError {
+                        code: "codex-cleanup-failed".into(),
+                        message: "probe cleanup was not confirmed".into(),
+                        diagnostic_ref: None,
+                    })
+                } else {
+                    Ok(())
+                })
+                .unwrap();
+            let exit = tokio::time::timeout(Duration::from_secs(2), run)
+                .await
+                .expect("owner did not finish after factory cleanup")
+                .unwrap();
+            assert_eq!(exit.cleanup_confirmed, !cleanup_fails);
+            if cleanup_fails {
+                assert_eq!(exit.outcome, SessionOutcome::Failed);
+                let error = exit.error.unwrap();
+                assert_eq!(error.code, "codex-cleanup-failed");
+                assert_diagnostic_ref(&error);
+            } else {
+                assert_eq!(exit.outcome, SessionOutcome::Closed);
+                assert!(exit.error.is_none());
+            }
+            assert!(events_rx.try_recv().is_err());
+        }
     }
 
     #[tokio::test]
@@ -3583,6 +3673,7 @@ mod tests {
             assert_eq!(thread_resume["id"], 2);
             assert_eq!(thread_resume["method"], "thread/resume");
             assert_eq!(thread_resume["params"]["threadId"], "thread-resume");
+            assert_eq!(thread_resume["params"]["excludeTurns"], true);
             assert_eq!(thread_resume["params"]["cwd"], "/tmp");
             assert_eq!(thread_resume["params"]["sandbox"], "read-only");
             assert_eq!(thread_resume["params"]["approvalPolicy"], "never");

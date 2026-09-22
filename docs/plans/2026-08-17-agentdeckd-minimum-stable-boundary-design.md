@@ -42,7 +42,8 @@ Issue #3 已把 M0 的 session/turn 生命周期骨架落到 protocol v3 和 Cod
   direct child wait、Unix 进程组有界轮询至 `ESRCH` 与 stderr pump join 完成后，RuntimeHub 先清路由和 handle，再发
   `SessionClosed`。lifecycle command 由单一有序 worker 执行；stdin EOF 会 drain 已读
   命令并关闭 retained session，cleanup 无法确认则 poison 并退出 daemon。
-- locator、版本探测和 spawn 绑定同一绝对 binary，严格要求固定 0.145.0；生产 argv 固定
+- locator、版本探测和 spawn 绑定同一绝对 binary，严格要求 `protocol/CODEX_VERSION.txt`
+  固定的完整版本；生产 argv 固定
   为 `app-server --listen stdio://`。M0 options 固定为 never/read-only/medium、
   `persist=false`、无 MCP，capabilities 不宣称尚未验收的 feature。
 
@@ -113,10 +114,12 @@ codex app-server --listen stdio://
 
 M0 只支持 `protocol/CODEX_VERSION.txt` 固定的 Codex 版本：
 
-- binary locator 先解析一个绝对路径；版本探测和 app-server spawn 必须使用同一路径，
-  不能一个走 shell PATH、另一个走修复后的 GUI PATH。
-- 缺失、版本无法解析或与固定版本不一致时，在 SessionStarted 前以
-  `codex-version-unsupported` 关闭该 session，不尝试猜测兼容。
+- binary locator 在共享 5 秒预算内异步探测 PATH 与常见安装位置的候选，macOS 包含
+  App 自带 executable。只跳过成功读出但不匹配的版本，选择首个精确匹配的规范化
+  绝对路径；版本探测和 app-server spawn 必须使用同一路径。
+- 没有匹配候选时，在 SessionStarted 前以 `codex-version-unsupported` 关闭该 session。
+  执行失败或非法版本输出返回 `codex-version-probe-failed`，超时返回
+  `codex-version-timeout`，清理失败返回 `codex-cleanup-failed`；这些失败不继续查找。
 - 支持新版本前必须由该版本官方命令重生成 schema、审查 diff、更新 fixture 并运行
   真实 E2E；不能只因本机 binary 较新就扩 capabilities。
 - M0 不自动重放失败 prompt。transport/protocol failure 前 vendor 可能已执行副作用，

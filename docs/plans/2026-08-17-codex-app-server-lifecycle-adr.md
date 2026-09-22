@@ -201,18 +201,21 @@ M0 必须显式处理 server request，不能只识别 notification：
 ## 版本策略
 
 M0 只支持 [protocol/CODEX_VERSION.txt](../../protocol/CODEX_VERSION.txt) 固定的
-`codex-cli 0.145.0`。
+Codex 完整版本；上文 0.145.0 的 help 记录是本决策形成时的历史证据。
 
 具体规则：
 
-1. binary locator 返回绝对路径；`--version` 与 `app-server` 必须执行这一路径，避免
-   macOS GUI stripped PATH 下探测一个 binary、实际启动另一个 binary。
-2. 在产生 `SessionStarted` 前比较完整版本。缺失、无法解析或不匹配均返回稳定的
-   `codex-version-unsupported`，不得以 `codex unknown` 继续运行。
+1. binary locator 在共享 5 秒预算内异步探测 PATH 与常见安装位置，macOS 包含 App
+   自带 executable。选定首个完整版本匹配的规范化绝对路径；`--version` 与
+   `app-server` 必须执行这一路径。
+2. 只在成功读出但版本不匹配时继续查找；没有匹配候选返回
+   `codex-version-unsupported`。执行失败或非法输出返回 `codex-version-probe-failed`，
+   超时返回 `codex-version-timeout`，清理失败返回 `codex-cleanup-failed`，均在
+   `SessionStarted` 前结束，不继续查找或以 `codex unknown` 运行。
 3. `protocol/` 中使用该版本的
    `codex app-server generate-json-schema --out <dir>` 生成官方快照。除 Request、Server
    Notification 和 Server Request 外，必须保留握手需要的 `ClientNotification`；
-   0.145.0 的该 schema 明确定义了 `initialized`。
+   该 schema 明确定义了 `initialized`。
 4. 不以宽泛 semver 范围推断兼容。支持新版本前必须生成并审查 schema diff、更新翻译
    fixture，并在同一提交运行真实 Codex E2E。
 5. 只有完成上述证据后，才把新版本加入显式 allowlist 或移动固定版本；capabilities
@@ -302,7 +305,7 @@ M0 验收必须证明一次多轮 session 的 header、各轮事件、失败关�
 Issue #3 已把本 ADR 的 transport 与生命周期主路径落到代码：
 
 1. `CodexBinary` 解析一个规范绝对路径，使用同一路径做 `--version` probe 和 spawn，
-   严格要求 `protocol/CODEX_VERSION.txt` 固定的 0.145.0；生产 argv 明确为
+   严格要求 `protocol/CODEX_VERSION.txt` 固定的完整版本；生产 argv 明确为
    `app-server --listen stdio://`。fake executable 覆盖 binary、版本、argv 和握手帧顺序。
 2. protocol v3 引入 caller-owned `sessionId` / `turnId`、`TurnStart`、`TurnCancel`、
    `SessionClose`、`TurnStarted`、`TurnFinished` 和 `SessionClosed`。Rust schema 与 Swift
@@ -388,8 +391,9 @@ RPC 关联、路由和 terminal 顺序；`session_live` 补充实际 CLI 的 str
   等待到测试超时；若 request 未 resolved，则 session 必须关闭而非回到 `Ready`。
 - 模拟 mid-turn EOF，断言当前 turn 失败、session 不再 ready、原 prompt 没有被自动
   重发。
-- 模拟版本缺失和不匹配，断言在 vendor session 启动前返回
-  `codex-version-unsupported`。
+- 模拟候选版本不匹配，断言继续查找且只启动匹配的 binary；没有匹配候选返回
+  `codex-version-unsupported`。模拟执行失败、非法输出、超时与清理失败，断言返回
+  对应 failure code 且不启动后续候选；慢探测不能阻塞 runtime。
 - 使用临时 `AGENTDECK_DATA_DIR` 跑完整多轮 fixture，断言一个 `runId` 下存在现有
   `runHeader`、各轮事件和 `runFooter`；失败 `diagnosticRef` 非空且能匹配 diagnostic
   line 的现有 `runId`。record 写失败可见但不改变有效 turn outcome。

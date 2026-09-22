@@ -63,6 +63,62 @@ fn cli_live_unwritable_diagnostics_omit_reference_and_preserve_session() {
 }
 
 #[test]
+fn cli_live_failed_version_probe_stops_before_fallback_and_omits_unwritten_diagnostic() {
+    use std::os::unix::fs::PermissionsExt;
+    if !daemon_bound() {
+        return;
+    }
+    let root = temp_root("cli-live-version-probe-failure");
+    std::fs::create_dir(root.join("diagnostic.log")).unwrap();
+    let mut command = fixture_command(&root, &["session", "live"]);
+    let fallback_bin = root.join("fallback-bin");
+    std::fs::create_dir(&fallback_bin).unwrap();
+    let fallback = fallback_bin.join("codex");
+    std::fs::write(
+        &fallback,
+        r#"#!/bin/sh
+printf 'called\n' >> "$AGENTDECK_FIXTURE_FALLBACK_MARKER"
+if [ "$1" = --version ]; then
+  printf '%s\n' "$AGENTDECK_FIXTURE_VERSION"
+  exit 0
+fi
+exit 98
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let marker = root.join("fallback-invoked");
+    command
+        .env("AGENTDECK_FIXTURE_VERSION_ERROR", "1")
+        .env("AGENTDECK_FIXTURE_FALLBACK_MARKER", &marker)
+        .env(
+            "PATH",
+            std::env::join_paths([root.join("bin"), fallback_bin]).unwrap(),
+        );
+    let mut cli = LiveCli::spawn(command, Duration::from_secs(20));
+    cli.send(session_start(&root));
+    loop {
+        let event = cli.next();
+        assert_ne!(
+            event["type"], "sessionStarted",
+            "failed probe must not start"
+        );
+        if event["type"] == "sessionClosed" {
+            assert_eq!(event["outcome"], "failed");
+            assert_eq!(event["error"]["code"], "codex-version-probe-failed");
+            assert!(event["error"]["diagnosticRef"].is_null());
+            break;
+        }
+    }
+    assert!(!cli.finish().success());
+    assert!(
+        !marker.exists(),
+        "a failed probe must not try another binary"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn cli_live_failed_start_with_unwritable_diagnostics_has_no_reference() {
     if !daemon_bound() {
         return;
