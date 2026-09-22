@@ -20,6 +20,10 @@ if [[ "$DESKTOP_TARGET_DIR" != /* ]]; then
   DESKTOP_TARGET_DIR="$ROOT_DIR/$DESKTOP_TARGET_DIR"
 fi
 BUILD_BINARY="$DESKTOP_TARGET_DIR/debug/agentdeck-desktop"
+# 桌面端的历史数据来自同目录的 daemon；bundle 必须自带它。
+DAEMON_NAME="agentdeckd"
+BUILD_DAEMON="$DESKTOP_TARGET_DIR/debug/$DAEMON_NAME"
+APP_DAEMON="$APP_MACOS/$DAEMON_NAME"
 
 cd "$ROOT_DIR"
 
@@ -70,11 +74,21 @@ stop_current_bundle_instances() {
 
 stop_current_bundle_instances
 
+# cargo 不把 MACOSX_DEPLOYMENT_TARGET 计入 fingerprint：普通 `cargo build` /
+# `cargo test` 留下的产物会带默认 minos，因此这里改动入口文件时间戳，强制
+# 本 crate 重新编译链接，保证 bundle 里的 Mach-O 始终是 15.0。
+touch "$ROOT_DIR/agentdeck-desktop/src/main.rs"
+
 MACOSX_DEPLOYMENT_TARGET="$MIN_SYSTEM_VERSION" \
-  cargo build -p agentdeck-desktop --target-dir "$DESKTOP_TARGET_DIR"
+  cargo build -p agentdeck-desktop -p agentdeckd --target-dir "$DESKTOP_TARGET_DIR"
 
 if [[ ! -x "$BUILD_BINARY" ]]; then
   echo "agentdeck-desktop build output not found: $BUILD_BINARY" >&2
+  exit 1
+fi
+
+if [[ ! -x "$BUILD_DAEMON" ]]; then
+  echo "$DAEMON_NAME build output not found: $BUILD_DAEMON" >&2
   exit 1
 fi
 
@@ -83,6 +97,8 @@ mkdir -p "$APP_MACOS" "$APP_RESOURCES"
 cp "$BUILD_BINARY" "$APP_BINARY"
 cp "$ROOT_DIR/assets/brand/AgentDeck.icns" "$APP_RESOURCES/AgentDeck.icns"
 chmod +x "$APP_BINARY"
+cp "$BUILD_DAEMON" "$APP_DAEMON"
+chmod +x "$APP_DAEMON"
 
 cat >"$INFO_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -140,6 +156,11 @@ verify_running_bundle() {
     return 1
   fi
 
+  if [[ ! -x "$APP_DAEMON" ]]; then
+    echo "verify failed: bundle is missing $DAEMON_NAME at $APP_DAEMON" >&2
+    return 1
+  fi
+
   for _ in {1..100}; do
     app_pid=""
     while IFS= read -r candidate_pid; do
@@ -152,6 +173,7 @@ verify_running_bundle() {
 
     if [[ -n "$app_pid" ]]; then
       echo "verify OK: $APP_BINARY pid=$app_pid"
+      echo "verify OK: bundled $DAEMON_NAME=$APP_DAEMON"
       echo "verify OK: LSMinimumSystemVersion=$actual_min_system_version"
       echo "verify OK: Mach-O minos=$binary_min_system_version"
       echo "verify OK: CFBundleIconFile=AgentDeck.icns and bundled icon matches source"

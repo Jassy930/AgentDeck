@@ -18,8 +18,9 @@ AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" \
 cargo run -p agentdeckd -- --diagnostics-report
 ```
 
-当前 GPUI 桌面端没有连接 daemon，也没有 profile、run record 或 diagnostics report
-入口。桌面 selfcheck 成功不能证明 backend 或 vendor CLI 健康。
+当前 GPUI 桌面端通过 daemon 读取 agent 列表与会话历史，尚无 profile、run record 或
+diagnostics report 的 UI 入口。桌面 selfcheck 不连接 daemon，成功不能证明 backend
+或 vendor CLI 健康。
 
 ## 日志位置
 
@@ -56,8 +57,8 @@ stderr fallback，省略 `diagnosticRef`，不返回无法定位的引用，也�
 4. 查看 `byLevel` / `byEvent` 和 `tail` 中最近的错误或告警。
 5. 按 `tail` 里的事件上下文继续执行只读检查。
 
-backend 的 profile 与 `AGENTDECK_DATA_DIR` 规则保持不变；它们不影响当前 GPUI
-桌面壳。
+桌面启动的 daemon 继承 `AGENTDECK_PROFILE` 与 `AGENTDECK_DATA_DIR`，遵循相同的
+backend 数据目录规则；这些变量不改变 vendor 历史来源。
 
 ## Failure Codes
 
@@ -105,7 +106,8 @@ stdout / stderr 直接丢弃，非零退出只返回结构化 failure code、exi
 
 ## 真实 Codex / Claude Code 历史刷新
 
-GPUI 桌面端当前没有历史界面。历史能力只通过 CLI/daemon 独立排查：
+GPUI 桌面端已接入只读历史；来源加载失败会在侧栏显示错误。可通过 CLI/daemon
+独立排查对应来源：
 
 ```bash
 agentdeck history list
@@ -117,7 +119,7 @@ agentdeck history list --agent claude-code --limit 20
 列表和读取分别调用官方 `thread/list`、`thread/read(includeTurns=true)`，不是扫描
 当前 AgentDeck 会话或猜测本地记录格式。
 
-CLI 会为每次历史请求生成唯一 `requestId`；未来桌面接入时必须遵守同一契约。daemon 无论成功还是失败
+CLI 与桌面 client 都为每次历史请求生成唯一 `requestId`。daemon 无论成功还是失败
 都在对应的 history admin 终态回复中原样回显。客户端只消费严格匹配当前
 `requestId` 的回复，忽略其他请求或已超时请求的迟到回复。wire 字段保持可选仅用于
 兼容旧客户端；当前客户端的请求或回复缺少该字段，应按关联链路回归排查。
@@ -125,6 +127,7 @@ CLI 会为每次历史请求生成唯一 `requestId`；未来桌面接入时必�
 | code | 含义 | 下一步 |
 | --- | --- | --- |
 | `codex-version-unsupported` | daemon 找不到可规范化的 `codex` executable、`--version` 探测失败，或版本不等于 `protocol/CODEX_VERSION.txt` 固定值 | 运行 `/usr/bin/which codex` 和 `codex --version`；修复 GUI 启动环境的安装/路径，或安装固定版本后重启 App |
+| `codex-version-timeout` | `codex --version` 超过 5 秒；探测会终止并回收独立进程组，清理预算另为 2 秒 | 检查所定位 executable 或 launcher 是否挂起；不能将它视为版本不匹配或合法空历史 |
 | `codex-spawn-failed` | 已定位 `codex`，但无法启动 `codex app-server`，或子进程标准管道不可用 | 运行 `codex app-server --help`；结合错误中的系统原因检查可执行权限、隔离属性和启动环境 |
 | `codex-rpc-timeout` | 单次 `initialize` / `thread/list` / `thread/read` RPC 超过 20 秒 | 分别执行 Codex list/read 定位卡住的方法；核对 Codex 版本，并暂时禁用异常 MCP 配置后复测 |
 | `codex-history-timeout` | Codex 历史 list/read 的 30 秒总预算内会为进程清理预留 2 秒；工作阶段超时后 daemon 清理短生命周期 app-server 进程组 | 分别执行 Codex list/read 定位卡住的操作；优先排查 app-server 或 MCP helper 卡住 |

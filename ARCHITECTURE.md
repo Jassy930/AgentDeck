@@ -12,21 +12,24 @@ AgentDeck 不做 IDE，不做通用多 agent 聊天界面，不是 Codex Desktop
 
 ```text
 AgentDeck.app
-└─ agentdeck-desktop（Rust / GPUI / gpui-component）
-   ├─ Application + Window
-   ├─ Root + 最小组件树
-   └─ --selfcheck
+├─ agentdeck-desktop（Rust / GPUI / gpui-component）
+│  ├─ Application + Window
+│  ├─ Root + 外壳组件树
+│  ├─ daemon.rs（typed local client：按请求 spawn agentdeckd，JSONL round-trip）
+│  └─ --selfcheck（不连 daemon）
+└─ agentdeckd（bundle 内自带，供上面的 client spawn）
 
-agentdeckd / agentdeck-protocol / agentdeck-cli
-└─ 现有后端与协议，当前尚未接入 GPUI 桌面端
+agentdeck-protocol / agentdeck-cli
+└─ 协议事实源与参考客户端；CLI 与 GUI 互相独立
 
 AgentDeckMobileCore + ios/
 └─ iOS companion 使用的 Swift 共享模型和 UIKit 前端
 ```
 
-下一阶段唯一允许的本机桌面通路是
-`agentdeck-desktop → typed local client → agentdeckd`。在该通路真正落地前，文档和
-selfcheck 都必须明确桌面端没有 backend 能力。
+唯一允许的本机桌面通路是
+`agentdeck-desktop → typed local client → agentdeckd`。该通路已落地，但当前只覆盖
+只读历史（agent list / history list / history read）；session 生命周期、turn、streaming
+和审批仍未接入，selfcheck 也不走这条通路。
 
 Codex 本地 transport 已决定为 `agentdeckd` 直接持有 session-scoped
 `codex app-server --listen stdio://` 子进程；不依赖用户全局 managed daemon/proxy。
@@ -41,7 +44,7 @@ poison 并退出 daemon。protocol v4 增加累计消息的 item identity/state/
 
 ## 分层边界
 
-- `agentdeck-desktop/`：macOS GPUI executable。当前负责窗口、组件根节点、静态外壳布局（侧栏 / 空态 / 会话态 / composer）和桌面 selfcheck；项目与会话均为示例，首页和侧栏共用 `CONNECTORS` 展示两家 Agent 尚未接入。`Shell` 保存当前示例及项目上下文，composer 共用一份草稿；不接数据源，也不得解析 vendor JSON。
+- `agentdeck-desktop/`：macOS GPUI executable。负责窗口、组件根节点、外壳布局（侧栏 / 空态 / 会话态 / composer）和桌面 selfcheck。`daemon.rs` 是唯一的数据入口：只发 `AgentList` 和 `History` 命令，只消费中立类型；侧栏与空态卡片都按 daemon 返回的 `AgentKind` 迭代生成，不硬编码 vendor 分支，也不解析 vendor JSON。阻塞 IPC 一律走 GPUI background executor，UI 线程不等 daemon。
 - `Sources/AgentDeckMobileCore/`：iOS 使用的平台无关 Swift 模型，禁止 import AppKit/UIKit。
 - `agentdeck-protocol/`：本地 IPC 协议事实源 crate。分 trunk / capabilities / vendor 三个模块，`PROTOCOL_VERSION` = 4，`protocol_schema()` 聚合本地 v4 类型。
 - `agentdeckd/src/ipc.rs`：re-export `agentdeck-protocol::*` 壳，保持 daemon 内 `crate::ipc::X` 引用不变。
@@ -95,13 +98,11 @@ poison 并退出 daemon。protocol v4 增加累计消息的 item identity/state/
 ## 依赖方向
 
 ```text
-agentdeck-desktop（当前）
+agentdeck-desktop
   -> GPUI / gpui-component
-
-agentdeck-desktop（下一阶段）
-  -> typed local client
+  -> typed local client（agentdeck-desktop/src/daemon.rs）
   -> agentdeck-protocol
-  -> agentdeckd
+  -> agentdeckd（子进程，JSONL stdio）
 
 daemon main
   -> ipc（re-export agentdeck-protocol）

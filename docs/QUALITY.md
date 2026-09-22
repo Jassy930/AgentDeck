@@ -81,32 +81,45 @@ selfcheck 的成功输出必须是单行 JSON，并明确包含：
 ```
 
 该 selfcheck 只验证 GPUI application、Metal renderer、隐藏窗口、
-`gpui-component::init` 和 `Root`。它不能证明 daemon、IPC 或 vendor CLI
-健康。
+`gpui-component::init` 和 `Root`；它显式不连接 daemon，因此也不能证明 daemon、IPC
+或 vendor CLI 健康。selfcheck 路径一旦开始 spawn daemon，子进程的 stderr 会破坏
+「单行 JSON」这条门禁。
 
 `--verify` 必须读回：
 
 - 实际启动进程的 executable path 等于 `dist/AgentDeck.app/Contents/MacOS/AgentDeck`。
+- `Contents/MacOS/agentdeckd` 存在且可执行（桌面的历史数据靠它）。
 - `Info.plist` 的 `LSMinimumSystemVersion` 为 15.0。
 - Mach-O 的 `minos` 为 15.0。
 - `CFBundleIconFile` 指向 `AgentDeck.icns`，bundle 内图标与 `assets/brand/AgentDeck.icns` 一致。
 
-当前 P0 bundle 不携带、也不启动 `agentdeckd`。
+`cargo` 不把 `MACOSX_DEPLOYMENT_TARGET` 计入 fingerprint，普通 `cargo build` /
+`cargo test` 会留下 `minos=11.0` 的产物；脚本因此在构建前 touch 桌面入口文件强制
+重新链接。改动构建脚本后必须重跑 `--verify` 确认这条仍然成立。
 
 ## 桌面人工冒烟
 
 每个可交互桌面切片完成前至少确认：
 
 - [ ] `AgentDeck.app` 打开真实窗口并成为前台应用。
-- [ ] 侧栏渲染出品牌行、快捷入口、置顶示例、项目示例和本机 Agent 状态五段结构。
-- [ ] 空态渲染居中标题、composer 和两张接入卡片；激活侧栏条目切到会话态，
-      激活“新建会话”切回空态；焦点移入 composer 后，当前条目仍显示选中态。
-- [ ] composer 可直接键入、粘贴中文多行文本；切换形态保留草稿，并显示对应示例项目
-      或“未选择”、Agent 未连接和界面预览说明。
-- [ ] 发送和搜索禁用，模型、审批和沙箱标明暂不可用；首页与侧栏的两家 Agent 状态一致。
+- [ ] 侧栏渲染出品牌行、快捷入口、最近会话和本机 Agent 状态四段结构。
+- [ ] 侧栏的会话来自 daemon：按来源与 `agentdeck history list --agent <kind> --limit 50`
+      对比条目标题、数量（CLI 不指定 limit 时默认总上限为 500）；
+      加载中显示“正在读取会话…”，失败显示 daemon 返回的错误，无结果显示“没有可显示的会话”。
+- [ ] 部分来源失败时，成功来源仍可打开；失败来源在侧栏显示“读取失败”与错误原因，
+      空态卡片同样显示失败，不把它当作 0 条。A→B→A 切换时旧读取结果不覆盖新结果。
+- [ ] 快速切换 A→B→C 时最多一个历史读取在执行，等待中的 B 被 C 替换；切回空态
+      不再启动待查会话。所有来源完成且列表为空时，显示“没有可显示的会话”。
+- [ ] 空态渲染居中标题、composer 和按已注册 agent 生成的卡片；激活侧栏条目切到会话态并
+      加载该会话记录，激活“新建会话”切回空态；焦点移入 composer 后，当前条目仍显示选中态。
+- [ ] composer 可直接键入、粘贴中文多行文本；切换形态保留草稿，并显示当前会话的项目
+      与 agent（空态显示“未选择”）。
+- [ ] 发送和搜索禁用，模型、审批和沙箱标明暂不可用；空态卡片与侧栏 agent 区计数一致。
 - [ ] 空态与会话态顶部双击均遵循系统设置；窗口拖动单独验收。
+- [ ] 最小窗口中的长会话标题省略显示，右侧 agent / 项目信息仍可见。
 - [ ] 重新运行统一脚本能停止旧 bundle 实例并启动最新二进制。
-- [ ] 未实现的 daemon、会话和历史能力没有伪 UI 或成功提示。
+- [ ] 未实现的会话启动、turn、streaming 和审批能力没有伪 UI 或成功提示；桌面显示的
+      历史必须与 daemon 返回一致，不得在 UI 侧补数据或掩盖空结果。
 
 只有实际检查过窗口后才能勾选；进程存在不能替代视觉和交互证据。
 

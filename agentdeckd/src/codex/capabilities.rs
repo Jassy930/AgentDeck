@@ -11,7 +11,12 @@
 //! lifecycle and cumulative assistant streaming only.
 
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use super::app_server::{SHORT_LIVED_SHUTDOWN_TIMEOUT, signal_process_group};
 
 use agentdeck_protocol::{
     AgentKind, CapabilityId, CodexApprovalPolicy, CodexCapabilities, CodexReasoningEffort,
@@ -19,6 +24,8 @@ use agentdeck_protocol::{
 };
 
 const CODEX_VERSION_FILE: &str = include_str!("../../../protocol/CODEX_VERSION.txt");
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 fn unsupported_version_error(message: impl Into<String>) -> ProtocolError {
     ProtocolError {
@@ -98,14 +105,84 @@ where
 /// Probe one already-resolved Codex binary and require the exact version
 /// pinned by `protocol/CODEX_VERSION.txt`.
 pub(crate) fn probe_codex_version_at(binary: &Path) -> Result<String, ProtocolError> {
-    probe_codex_version_with_command(binary, |binary| {
-        use std::process::Command;
-        Command::new(binary)
-            .arg("--version")
-            .output()
-            .map(|out| (out.status.code().unwrap_or(-1), out.stdout))
-            .map_err(|error| error.to_string())
-    })
+    probe_codex_version_with_timeout(binary, VERSION_PROBE_TIMEOUT)
+}
+
+fn probe_codex_version_with_timeout(
+    binary: &Path,
+    timeout: Duration,
+) -> Result<String, ProtocolError> {
+    let mut command = Command::new(binary);
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|_| unsupported_version_error("Codex CLI version probe could not be executed"))?;
+    let process_group_id = child.id();
+    let deadline = Instant::now() + timeout;
+    let result = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Err(_) => {
+                break Err(unsupported_version_error(
+                    "Codex CLI version probe could not be awaited",
+                ));
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                break Err(ProtocolError {
+                    code: "codex-version-timeout".into(),
+                    message: format!("Codex CLI version probe exceeded {timeout:?}"),
+                    diagnostic_ref: None,
+                });
+            }
+            Ok(None) => std::thread::sleep(PROBE_POLL_INTERVAL),
+        }
+    };
+
+    // A launcher can exit while its children retain stdout. Signal the saved
+    // group before reading the pipe, including after a successful probe.
+    let group_signal = signal_process_group(process_group_id);
+    let _ = child.kill();
+    let cleanup_error = |reason| ProtocolError {
+        code: "codex-cleanup-failed".into(),
+        message: format!("Codex CLI version probe cleanup failed: {reason}"),
+        diagnostic_ref: None,
+    };
+    let cleanup_deadline = Instant::now() + SHORT_LIVED_SHUTDOWN_TIMEOUT;
+    loop {
+        let reaped = child
+            .try_wait()
+            .map_err(|error| cleanup_error(format!("wait: {error}")))?
+            .is_some();
+        if reaped {
+            break;
+        }
+        if Instant::now() >= cleanup_deadline {
+            return Err(cleanup_error(
+                "process exit was not confirmed in time".into(),
+            ));
+        }
+        std::thread::sleep(PROBE_POLL_INTERVAL);
+    }
+    group_signal.map_err(|error| cleanup_error(format!("signal process group: {error}")))?;
+    let status = result?;
+    let mut stdout = Vec::new();
+    let output = child
+        .stdout
+        .take()
+        .expect("piped version stdout")
+        .read_to_end(&mut stdout)
+        .map(|_| (status.code().unwrap_or(-1), stdout))
+        .map_err(|error| error.to_string());
+    probe_codex_version_with_command(binary, |_| output)
 }
 
 #[cfg(test)]
@@ -197,5 +274,63 @@ mod tests {
     #[test]
     fn pinned_version_comes_from_protocol_snapshot() {
         assert_eq!(supported_codex_version(), "codex-cli 0.145.0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_reaps_launcher_and_children_on_success_and_timeout() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        for times_out in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "agentdeck-version-probe-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir(&root).unwrap();
+            let binary = root.join("codex");
+            let pids_file = root.join("pids");
+            let pids_path = pids_file.to_string_lossy().replace('\'', "'\"'\"'");
+            let finish = if times_out {
+                "wait".to_string()
+            } else {
+                format!("printf '%s\\n' '{}'", supported_codex_version())
+            };
+            fs::write(
+                &binary,
+                format!(
+                    "#!/bin/sh\n/bin/sleep 10 &\nprintf '%s %s\\n' \"$$\" \"$!\" > '{pids_path}'\n{finish}\n"
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+            let started = Instant::now();
+            let result = probe_codex_version_with_timeout(&binary, Duration::from_secs(2));
+            assert!(started.elapsed() < Duration::from_secs(5));
+            if times_out {
+                assert_eq!(result.unwrap_err().code, "codex-version-timeout");
+            } else {
+                assert_eq!(result.unwrap(), supported_codex_version());
+            }
+            let pids = fs::read_to_string(&pids_file).unwrap();
+            let pids: Vec<u32> = pids
+                .split_whitespace()
+                .map(|pid| pid.parse().unwrap())
+                .collect();
+            assert_eq!(pids.len(), 2);
+            for pid in pids {
+                let process = Command::new("/bin/ps")
+                    .args(["-o", "pid=", "-p", &pid.to_string()])
+                    .output()
+                    .unwrap();
+                assert!(
+                    process.stdout.is_empty(),
+                    "probe process {pid} still exists"
+                );
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 }
