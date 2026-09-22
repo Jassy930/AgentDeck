@@ -10,7 +10,11 @@ while IFS= read -r frame; do
   id=$(printf '%s' "$frame" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$frame" in
     *'"method":"initialize"'*)
-      printf '{"id":%s,"result":{}}\n' "$id" ;;
+      if [ "${AGENTDECK_FIXTURE_START_ERROR:-}" = 1 ]; then
+        printf '{"id":%s,"error":{"code":-32600,"message":"fixture handshake failure"}}\n' "$id"
+      else
+        printf '{"id":%s,"result":{}}\n' "$id"
+      fi ;;
     *'"method":"initialized"'*) initialized=true ;;
     *'"method":"thread/start"'*)
       [ "$initialized" = true ] || exit 11

@@ -81,6 +81,13 @@ gpui-component = "=0.5.1"
 `runtime_shaders` 用于避免本地额外安装 Metal Toolchain。依赖通过仓库根目录的
 `Cargo.lock` 锁定；不要在没有验证的情况下追 Git main。
 
+Codex 程序版本固定为 `codex-cli 0.155.0-alpha.9.2`，完整版本写在
+`protocol/CODEX_VERSION.txt`。daemon 依次探测 PATH 和常见安装位置，跳过不匹配版本，
+使用首个精确匹配的 executable；macOS 候选包括
+`/Applications/ChatGPT.app/Contents/Resources/codex`。版本探测与 app-server 启动使用
+同一个规范化绝对路径，不要求替换 Homebrew 的旧安装。精确版本门禁用于让适配器与
+该版本官方生成的 app-server schema 保持一致；AgentDeck 自身 IPC 仍为 v4。
+
 ## 构建与运行
 
 前置环境：
@@ -163,10 +170,11 @@ desktop 已经通过 typed local client 接入 daemon 的只读历史，下一�
 
 1. 桌面只读历史已落地（侧栏真实会话列表 + 会话记录），实现与坑点见
    [只读历史接入记录](docs/plans/2026-09-22-desktop-history-readonly-implementation.md)。
-   本机 Codex 历史当前返回空列表，Claude Code 的会话标题常带 `<local-command-caveat>`
-   噪声，两者都在 daemon 侧收敛。
-2. 持久 CLI 四轮已在临时配置覆盖环境通过，包含累计 streaming、同 PID/threadId
-   复用、取消后继续、回收与记录读回；继续收敛默认配置兼容及历史列表时延风险，
+   Codex 列表查询包含全部 provider，正文通过固定版本的稳定分页接口读取。
+   升级后的真实历史读回和桌面点击验收边界见实施记录；Claude Code 的会话标题常带
+   `<local-command-caveat>` 噪声，需在 daemon 侧收敛。
+2. 持久 CLI 四轮曾在 0.145.0 的临时配置覆盖环境通过，包含累计 streaming、同 PID/threadId
+   复用、取消后继续、回收与记录读回；升级后的 lifecycle E2E 尚未重跑，
    证据见 [M0 CLI 实施记录](docs/plans/2026-09-21-backend-m0-cli-implementation.md)。
 3. 在此之上给 desktop 接入会话启动与 turn 流（需要把 one-shot round-trip 换成长连接），
    再增加审批、Markdown 和多 agent 能力。

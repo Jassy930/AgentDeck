@@ -242,10 +242,10 @@ mod tests {
         let binary = Path::new("/fake/codex");
         let version = probe_codex_version_with_command(binary, |actual_binary| {
             assert_eq!(actual_binary, binary);
-            Ok((0, b"codex-cli 0.145.0\n".to_vec()))
+            Ok((0, format!("{}\n", supported_codex_version()).into_bytes()))
         })
         .unwrap();
-        assert_eq!(version, "codex-cli 0.145.0");
+        assert_eq!(version, supported_codex_version());
     }
 
     #[test]
@@ -260,7 +260,7 @@ mod tests {
     #[test]
     fn probe_codex_version_rejects_nonzero_empty_malformed_and_mismatch() {
         for result in [
-            Ok((1, b"codex-cli 0.145.0".to_vec())),
+            Ok((1, supported_codex_version().as_bytes().to_vec())),
             Ok((0, b" \n".to_vec())),
             Ok((0, vec![0xff])),
             Ok((0, b"codex-cli 0.146.0\n".to_vec())),
@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn pinned_version_comes_from_protocol_snapshot() {
-        assert_eq!(supported_codex_version(), "codex-cli 0.145.0");
+        assert_eq!(supported_codex_version(), "codex-cli 0.155.0-alpha.9.2");
     }
 
     #[cfg(unix)]

@@ -927,7 +927,7 @@ fn tool_meta(item: &Value) -> AgentItemMeta {
                 .insert("activityKind".to_string(), json!("collaboration"));
         }
         if kind == "subAgentActivity" {
-            if let Some(activity_event @ ("started" | "interacted" | "interrupted")) =
+            if let Some(activity_event @ ("started" | "interacted" | "interrupted" | "completed")) =
                 item.get("kind").and_then(Value::as_str)
             {
                 meta.vendor_extensions
@@ -1552,7 +1552,7 @@ mod tests {
 
     #[test]
     fn shared_tool_mapping_preserves_subagent_activity_without_inventing_status() {
-        for activity_event in ["started", "interacted", "interrupted"] {
+        for activity_event in ["started", "interacted", "interrupted", "completed"] {
             let item = history_item_to_agent_item(&json!({
                 "id": format!("activity-{activity_event}"),
                 "type": "subAgentActivity",

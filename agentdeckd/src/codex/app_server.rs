@@ -5,7 +5,7 @@
 //! Both paths intentionally share binary discovery, PATH repair and wire
 //! framing so GUI launches and history refreshes cannot drift apart.
 
-use crate::codex::capabilities::probe_codex_version_at;
+use crate::codex::capabilities::{probe_codex_version_at, supported_codex_version};
 use agentdeck_protocol::ProtocolError;
 use serde_json::{Value, json};
 use std::io;
@@ -47,9 +47,31 @@ pub(crate) struct CodexBinary {
 
 impl CodexBinary {
     pub(crate) fn resolve() -> Result<Self, ProtocolError> {
-        let path = locate_codex()?;
-        let version = probe_codex_version_at(&path)?;
-        Ok(Self { path, version })
+        Self::resolve_candidates(codex_candidates())
+    }
+
+    fn resolve_candidates(
+        candidates: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<Self, ProtocolError> {
+        let mut checked = Vec::new();
+        for candidate in candidates {
+            let Some(path) = canonical_executable(&candidate) else {
+                continue;
+            };
+            if checked.contains(&path) {
+                continue;
+            }
+            checked.push(path.clone());
+            match probe_codex_version_at(&path) {
+                Ok(version) => return Ok(Self { path, version }),
+                Err(error) if error.code == "codex-version-unsupported" => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(unsupported_version_error(format!(
+            "no matching Codex CLI found on PATH or common locations; expected {}",
+            supported_codex_version()
+        )))
     }
 
     /// Resolve and validate an explicitly injected executable. Production
@@ -182,36 +204,29 @@ pub(super) async fn join_stderr_drain(
     }
 }
 
-/// Locate the `codex` binary even when a macOS GUI process inherited a
+/// Find `codex` candidates even when a macOS GUI process inherited a
 /// stripped PATH.
-pub(crate) fn locate_codex() -> Result<PathBuf, ProtocolError> {
+fn codex_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
     if let Some(path) = std::env::var_os("PATH") {
-        for directory in std::env::split_paths(&path) {
-            let candidate = directory.join("codex");
-            if let Some(path) = canonical_executable(&candidate) {
-                return Ok(path);
-            }
-        }
+        candidates.extend(std::env::split_paths(&path).map(|directory| directory.join("codex")));
     }
 
-    let mut candidates = vec![
+    candidates.extend([
         Path::new("/opt/homebrew/bin/codex").to_path_buf(),
         Path::new("/usr/local/bin/codex").to_path_buf(),
         Path::new("/usr/bin/codex").to_path_buf(),
-    ];
+    ]);
     if let Some(home) = std::env::var_os("HOME") {
         let home = Path::new(&home);
         candidates.push(home.join(".local/bin/codex"));
         candidates.push(home.join(".bun/bin/codex"));
     }
-    for candidate in candidates {
-        if let Some(path) = canonical_executable(&candidate) {
-            return Ok(path);
-        }
-    }
-    Err(unsupported_version_error(
-        "supported Codex CLI executable was not found on PATH or common locations",
-    ))
+    #[cfg(target_os = "macos")]
+    candidates.push(PathBuf::from(
+        "/Applications/ChatGPT.app/Contents/Resources/codex",
+    ));
+    candidates
 }
 
 fn canonical_executable(candidate: &Path) -> Option<PathBuf> {
@@ -768,13 +783,13 @@ done
     #[cfg(unix)]
     #[tokio::test]
     async fn fake_binary_is_probed_and_spawned_by_the_same_canonical_path() {
-        let fake = FakeCodex::new("codex-cli 0.145.0");
+        let fake = FakeCodex::new(supported_codex_version());
         let binary = CodexBinary::resolve_at(&fake.executable).unwrap();
         let canonical = fake.executable.canonicalize().unwrap();
 
         assert!(binary.path().is_absolute());
         assert_eq!(binary.path(), canonical);
-        assert_eq!(binary.version(), "codex-cli 0.145.0");
+        assert_eq!(binary.version(), supported_codex_version());
 
         let mut client = ShortLivedAppServer::spawn_with_binary(&fake.root, &binary).unwrap();
         assert_eq!(client.initialize().await.unwrap(), json!({ "fake": true }));
@@ -817,6 +832,26 @@ done
         .unwrap();
         assert_eq!(next_request["id"], 2);
         assert_eq!(next_request["method"], "fake/ping");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolution_skips_duplicate_and_unsupported_candidates() {
+        let old = FakeCodex::new("codex-cli 0.145.0");
+        let supported = FakeCodex::new(supported_codex_version());
+        let binary = CodexBinary::resolve_candidates([
+            old.executable.clone(),
+            old.executable.clone(),
+            supported.executable.clone(),
+        ])
+        .unwrap();
+        assert_eq!(binary.path(), supported.executable.canonicalize().unwrap());
+        assert_eq!(old.calls().len(), 1);
+        assert_eq!(supported.calls().len(), 1);
+
+        let error = CodexBinary::resolve_candidates([old.executable.clone()]).unwrap_err();
+        assert_eq!(error.code, "codex-version-unsupported");
+        assert!(error.message.contains(supported_codex_version()));
     }
 
     #[cfg(unix)]

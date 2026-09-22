@@ -70,18 +70,18 @@ fn cli_live_failed_start_with_unwritable_diagnostics_has_no_reference() {
     let root = temp_root("cli-live-start-diagnostic-failure");
     std::fs::create_dir(root.join("diagnostic.log")).unwrap();
     let mut command = fixture_command(&root, &["session", "live"]);
-    command.env("AGENTDECK_FIXTURE_VERSION", "codex-cli 0.0.0");
+    command.env("AGENTDECK_FIXTURE_START_ERROR", "1");
     let mut cli = LiveCli::spawn(command, Duration::from_secs(20));
     cli.send(session_start(&root));
     loop {
         let event = cli.next();
         assert_ne!(
             event["type"], "sessionStarted",
-            "invalid version must not start"
+            "failed handshake must not start"
         );
         if event["type"] == "sessionClosed" {
             assert_eq!(event["outcome"], "failed");
-            assert_eq!(event["error"]["code"], "codex-version-unsupported");
+            assert_eq!(event["error"]["code"], "codex-protocol-error");
             assert!(event["error"]["diagnosticRef"].is_null());
             break;
         }

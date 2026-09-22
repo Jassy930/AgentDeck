@@ -110,11 +110,63 @@ PR 评论修复后的验证：
 - Claude Code 会话标题常常是 `<local-command-caveat>Caveat: …`。这是
   `agentdeckd/src/claude_code/history.rs` 的标题抽取问题，应在 daemon 侧修，不要在
   desktop 打补丁。
-- 本机 Codex 历史为空的原因未定位（`AGENTDECKD_STATUS.md` 已记录 Codex history 的
-  超时与配置风险）。
+- Codex 列表为空已定位为 provider 默认过滤，查询现在显式使用 `modelProviders=[]`。
+  正文已适配稳定分页接口，版本与官方 schema 同步升级至 `0.155.0-alpha.9.2`；
+  升级后的真实 lifecycle E2E 与桌面正文点击尚待验收，不能以旧版验收代替。
 - transcript 打开后停在顶部，没有自动滚到最新；同一 `toolUseId` 的 inProgress /
   completed 两条都会渲染。
 - 没有客户端侧超时，依赖 daemon 自己的历史硬超时（见 `daemon.rs` 的 `ponytail:` 注释）。
 - 仍属后续独立切片：启动/继续会话、turn 与 streaming、审批、Markdown 与 diff 渲染、
   会话搜索、按项目分组（CC 的 `cwd` 是从目录名还原的，带 `-` 的路径会还原错，不能
   直接拿来分组）。
+
+## 2026-09-22：Codex 分页正文与版本升级
+
+Goal：读取已存在的 legacy 与 paginated 历史，保持桌面/CLI 的中立历史响应不变。
+
+- `agentdeckd/src/codex/app_server.rs`：依次探测 PATH 和常见安装位置，跳过版本不匹配
+  的候选，使用首个精确匹配版本的规范化绝对路径；probe 与 spawn 使用同一 executable。
+  macOS 增加 `/Applications/ChatGPT.app/Contents/Resources/codex` 候选，Homebrew
+  0.145.0 安装保留不动。history 与 live 均使用稳定 API 握手，不启用 `experimentalApi`。
+- `agentdeckd/src/codex/history.rs`：先 `thread/read(includeTurns=false)` 核对 threadId，
+  再以 `thread/turns/list(itemsView=full, sortDirection=asc, limit=100)` 逐页追加轮次，
+  直到 `nextCursor` 为空。复用原 item 翻译与总 deadline，任一页失败不返回部分历史。
+- `protocol/`：固定完整版本 `codex-cli 0.155.0-alpha.9.2`，同步更新官方默认生成的
+  schema 与 101 项稳定方法枚举。`thread/turns/list` 已进入稳定 API，使用同一套
+  快照；AgentDeck 自身 IPC v4 不变，没有手写 vendor schema。
+- focused fake 子进程用例覆盖完整握手、两页顺序、游标传递/停滞、第二页解码/上游错误，
+  并确认错误不包含 vendor 自由文本。
+
+验收命令：`cargo test --locked -p agentdeckd --lib codex::`、
+`scripts/verify-offline-tests.sh`、绑定当前 checkout daemon 的 CLI selfcheck、
+desktop selfcheck 与真实 bundle verify。历史验收使用 list/read。
+
+升级前 0.145.0 的真实 CLI 读回：legacy 样本 4 轮 / 8 条目，paginated 样本 1 轮 / 1 条目，
+Claude Code 样本 9 轮 / 147 条目。分页历史的另一实测样本前两页可读，但后续页面
+包含固定版本不认识的子代理 `completed` 记录，整次读取按 `codex-protocol-error`
+失败；这不是完整历史读取通过。
+
+升级前上述 focused 测试、完整离线门禁、CLI/desktop selfcheck、格式/文档检查及 bundle verify
+均通过。最终 App 从没有 daemon/data-dir 覆盖的环境启动，CLI 绑定 bundle 内 daemon
+读回 Codex 50 条、Claude Code 46 条。桌面正文尚无本次点击验收证据。
+
+独立对照本机 App 自带的 `0.155.0-alpha.9.2`：相同分页请求成功读取上述新版
+子代理记录，两个 paginated 会话分别返回 3 轮 / 223 条目、30 轮 / 505 条目，
+均无下一页。这证明新版原生接口能读取该批样本；项目已据此同步升级版本与协议基线。
+升级后的 AgentDeck CLI 绑定当前 checkout daemon，显式 `AGENTDECK_E2E=1`：
+
+| 样本 | 读取结果 |
+| --- | --- |
+| 近期分页会话样本 | 4 轮 / 318 条目，127 项非空文本，7 项子代理完成事件 |
+| 较长分页会话样本 | 30 轮 / 505 条目，364 项非空文本，4 项子代理完成事件 |
+
+`subAgentActivity.kind=completed` 已在共享 translator 中保留为 `activityEvent`。
+Codex 列表请求也成功返回 3 条。新 bundle 内 daemon 重读长会话得到相同的
+30 轮 / 505 条目；桌面 bundle 已启动，但正文点击尚无目视验收证据。
+
+升级后 Codex focused 85 项、完整离线门禁（含 desktop tests）、CLI/desktop selfcheck、
+diagnostics report、格式/文档检查及真实 bundle verify 通过。离线门禁首次暴露旧失败
+fixture 的版本不匹配会触发系统候选回退，曾误启动真实 Codex 并进入 `turnStarted`，
+随后由测试退出回收；失败 fixture 已改为受支持版本返回握手错误，最终 marker 门禁通过。
+另一次运行的记录写失败用例遇到空 diagnosticRef，单项及后续完整门禁复跑通过，未改动
+该诊断逻辑。以上均不能替代升级后完整的真实 lifecycle E2E，后者尚未重跑。

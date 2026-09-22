@@ -1883,7 +1883,7 @@ mod tests {
         let (server_output, owner_stdout) = duplex(8192);
         let cleaned = Arc::new(AtomicBool::new(false));
         let connection = OpenedAppServer::for_test(
-            "codex-cli 0.145.0",
+            "codex-cli 0.155.0-alpha.9.2",
             owner_stdin,
             owner_stdout,
             TestProcess {
@@ -2071,7 +2071,7 @@ mod tests {
         let (mut server_output, owner_stdout) = duplex(8192);
         let cleaned = Arc::new(AtomicBool::new(false));
         let connection = OpenedAppServer::for_test(
-            "codex-cli 0.145.0",
+            "codex-cli 0.155.0-alpha.9.2",
             owner_stdin,
             owner_stdout,
             TestProcess {
@@ -2218,7 +2218,7 @@ mod tests {
         let spawn_detail: Value =
             serde_json::from_str(spawned[0]["detail"].as_str().unwrap()).unwrap();
         assert_eq!(spawn_detail["childPid"], 4242);
-        assert_eq!(spawn_detail["version"], "codex-cli 0.145.0");
+        assert_eq!(spawn_detail["version"], "codex-cli 0.155.0-alpha.9.2");
         let turns: Vec<_> = diagnostics
             .iter()
             .filter(|line| line["event"] == "codex_turn_started")
@@ -2302,7 +2302,7 @@ mod tests {
                 start(None),
                 events_tx,
                 commands_rx,
-                "codex-cli 0.145.0".into(),
+                "codex-cli 0.155.0-alpha.9.2".into(),
                 INTERRUPT_TERMINAL_TIMEOUT,
             );
             owner.state = OwnerState::Running;
@@ -2391,7 +2391,7 @@ mod tests {
         let (cleanup_entered_tx, cleanup_entered_rx) = oneshot::channel();
         let (cleanup_release_tx, cleanup_release_rx) = oneshot::channel();
         let connection = OpenedAppServer::for_test(
-            "codex-cli 0.145.0",
+            "codex-cli 0.155.0-alpha.9.2",
             owner_stdin,
             owner_stdout,
             BlockingCleanupProcess {
@@ -3795,7 +3795,7 @@ mod tests {
             start(None),
             events_tx,
             commands_rx,
-            "codex-cli 0.145.0".into(),
+            "codex-cli 0.155.0-alpha.9.2".into(),
             INTERRUPT_TERMINAL_TIMEOUT,
         );
         failed_owner.state = OwnerState::Running;
@@ -3836,7 +3836,7 @@ mod tests {
             start(None),
             events_tx,
             commands_rx,
-            "codex-cli 0.145.0".into(),
+            "codex-cli 0.155.0-alpha.9.2".into(),
             INTERRUPT_TERMINAL_TIMEOUT,
         );
         invalid_owner.state = OwnerState::Running;

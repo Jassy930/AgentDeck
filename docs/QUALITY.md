@@ -192,18 +192,28 @@ RuntimeHub/router 修正；这些离线证据不能升级为真实 Codex E2E。
 
 ## Codex vendor schema 快照
 
-`protocol/ClientRequest.json` 等文件是 Codex app-server 的 vendor 协议快照。Issue #3
-已从固定 0.145.0 官方生成物补入 `protocol/ClientNotification.json`；live session 与
-short-lived history path 都发送规范的 `initialized`，fake 测试守护 initialize response
+`protocol/ClientRequest.json` 等文件是 Codex app-server 的 vendor 协议快照，当前固定为
+`codex-cli 0.155.0-alpha.9.2`，包含完整版本后缀。live session 与 short-lived history
+path 都发送规范的 `initialized`，fake 测试守护 initialize response
 → initialized → thread request 顺序。这套 vendor 快照与 AgentDeck 自身 schemars 生成的
 `protocol/agentdeck/agentdeck-protocol.schema.json` 是两套独立门禁。
 `cargo test` 通过不能证明本机 Codex 版本与 vendor 快照一致。
 
+历史正文使用稳定的 `thread/turns/list`，参数与响应保存在同一套官方默认生成物中，
+无需 `experimentalApi` 或单独的 experimental 快照。真实读取验收必须覆盖 paginated
+历史，只验证 `kind=list` 或合法空列表不足以证明正文可读；后续页面失败不能算完整
+读取通过。历史读回也不能替代升级后的真实 lifecycle E2E 与桌面正文点击验收。
+
+daemon 按 PATH、常见安装位置的顺序探测候选，跳过版本不匹配的安装并使用首个精确
+匹配版本。macOS 同时探测 App 自带 executable；即使 `command -v codex` 返回旧版
+Homebrew 安装，也不代表 daemon 使用它。离线 locator 用例须验证跳过不匹配候选，
+并确认 probe 与 spawn 始终绑定同一规范化绝对路径。
+
 升级刷新或同版本复验时，都先在临时目录 fail-closed 生成，并记录本机
-Codex 的实际版本：
+Codex 的实际版本。显式指定要生成快照的 executable，不依赖 PATH 首项：
 
 ```bash
-CODEX_BIN="$(command -v codex)"
+CODEX_BIN="/Applications/ChatGPT.app/Contents/Resources/codex"
 ACTUAL_VERSION="$("$CODEX_BIN" --version)"
 SCHEMA_DIR="$(mktemp -d /tmp/agentdeck-codex-schema.XXXXXX)"
 "$CODEX_BIN" app-server generate-json-schema --out "$SCHEMA_DIR"
@@ -249,7 +259,8 @@ cmp "$SCHEMA_DIR/committed-v2.normalized.json" \
   "$SCHEMA_DIR/generated-v2.normalized.json"
 ```
 
-确认 method 表行数和内容一致后，运行 `scripts/verify-offline-tests.sh`、
+当前稳定 method 表为 101 项；旧 `thread/rollback` 已替换为 `thread/revert`，正文
+分页进入稳定表。确认 method 表行数和内容一致后，运行 `scripts/verify-offline-tests.sh`、
 `scripts/verify-agent-docs.sh` 和 `git diff --check`。当前稳定合约不使用
 `--experimental`；只有客户端显式启用 `experimentalApi` 时才建立独立实验基线。
 
