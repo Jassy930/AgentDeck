@@ -49,7 +49,7 @@ fn transcript_list() -> ListState {
 /// 选中会话的记录加载状态。
 pub enum Transcript {
     Loading,
-    Ready(Rc<[transcript::TextBlock]>),
+    Ready(Rc<[transcript::Block]>),
     Failed(String),
 }
 
@@ -57,7 +57,7 @@ impl Stage {
     fn finish_read(
         &mut self,
         completed_id: u64,
-        read: Result<Vec<transcript::TextBlock>, String>,
+        read: Result<Vec<transcript::Block>, String>,
     ) -> bool {
         if let Stage::Session {
             transcript,
@@ -598,6 +598,7 @@ impl Shell {
         transcript: &Transcript,
         list: &ListState,
         read_id: u64,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let body = match transcript {
@@ -632,7 +633,8 @@ impl Shell {
                 placeholder("这个会话没有可显示的记录", cx).into_any_element()
             }
             Transcript::Ready(blocks) => {
-                transcript::render(blocks.clone(), list.clone(), read_id).into_any_element()
+                transcript::render(blocks.clone(), list.clone(), read_id, window, cx)
+                    .into_any_element()
             }
         };
 
@@ -725,7 +727,7 @@ fn connector_card(name: &str, status: &str, cx: &App) -> impl IntoElement + use<
 }
 
 impl Render for Shell {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let main = match &self.stage {
             Stage::Empty => self.render_empty(cx).into_any_element(),
             Stage::Session {
@@ -734,7 +736,7 @@ impl Render for Shell {
                 list,
                 read_id,
             } => self
-                .render_session(item, transcript, list, *read_id, cx)
+                .render_session(item, transcript, list, *read_id, window, cx)
                 .into_any_element(),
         };
         let selected: Option<SharedString> = self
@@ -855,7 +857,11 @@ mod tests {
             list: transcript_list(),
             read_id: 3,
         };
-        assert!(stage.finish_read(3, Ok(vec![("助手", "新的 A 记录".into())])));
+        let block = crate::transcript::describe(&agentdeck_protocol::AgentItem::AssistantMessage {
+            text: "新的 A 记录".into(),
+            meta: Default::default(),
+        });
+        assert!(stage.finish_read(3, Ok(vec![block])));
         assert!(!stage.finish_read(1, Err("旧读取超时".into())));
         assert!(!stage.finish_read(1, Ok(vec![])));
         assert!(matches!(
