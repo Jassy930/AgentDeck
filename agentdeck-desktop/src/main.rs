@@ -6,10 +6,15 @@ mod transcript;
 
 use std::env;
 
-use gpui::{App, Application, TitlebarOptions, WindowOptions, point, prelude::*, px, size};
+use gpui::{
+    App, Application, KeyBinding, Menu, MenuItem, TitlebarOptions, WindowOptions, actions, point,
+    prelude::*, px, size,
+};
 use gpui_component::Root;
 
 use shell::Shell;
+
+actions!(agentdeck, [Quit]);
 
 const SELFCHECK_REPORT: &str = r#"{"status":"ok","surface":"desktop","ui":"gpui"}"#;
 
@@ -43,6 +48,12 @@ fn main() {
 
     Application::new().run(move |cx| {
         gpui_component::init(cx);
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        cx.set_menus(vec![Menu {
+            name: "AgentDeck".into(),
+            items: vec![MenuItem::action("退出 AgentDeck", Quit)],
+        }]);
 
         if selfcheck {
             open_main_window(cx, false);
