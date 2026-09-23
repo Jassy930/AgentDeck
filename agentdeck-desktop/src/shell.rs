@@ -597,6 +597,7 @@ impl Shell {
         item: &HistoryListItem,
         transcript: &Transcript,
         list: &ListState,
+        read_id: u64,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let body = match transcript {
@@ -631,7 +632,7 @@ impl Shell {
                 placeholder("这个会话没有可显示的记录", cx).into_any_element()
             }
             Transcript::Ready(blocks) => {
-                transcript::render(blocks.clone(), list.clone()).into_any_element()
+                transcript::render(blocks.clone(), list.clone(), read_id).into_any_element()
             }
         };
 
@@ -731,9 +732,9 @@ impl Render for Shell {
                 item,
                 transcript,
                 list,
-                ..
+                read_id,
             } => self
-                .render_session(item, transcript, list, cx)
+                .render_session(item, transcript, list, *read_id, cx)
                 .into_any_element(),
         };
         let selected: Option<SharedString> = self

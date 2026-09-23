@@ -1,12 +1,15 @@
 //! 会话记录渲染：把中立 `AgentItem` 转成只读文本块。
 //!
-//! 本期只做纯文本。Markdown、diff 高亮、工具折叠和 streaming 都属于后续切片。
+//! 助手与思考按 Markdown 渲染，其余仍是纯文本。diff 高亮、工具折叠和 streaming 属于后续切片。
 
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
 
 use agentdeck_protocol::{AgentItem, HistoryTurn};
-use gpui::{IntoElement, ListState, ParentElement, SharedString, div, list, prelude::*, px};
-use gpui_component::{ActiveTheme, StyledExt, v_flex};
+use gpui::{
+    ElementId, IntoElement, ListState, ParentElement, SharedString, div, list, prelude::*, px,
+};
+use gpui_component::{ActiveTheme, StyledExt, clipboard::Clipboard, text::TextView, v_flex};
 
 /// 单条内容的展示上限；历史里的工具结果可能是几十 KB 的整页文本。
 const BODY_LIMIT: usize = 2_000;
@@ -78,6 +81,13 @@ fn truncate(body: &str) -> String {
     format!("{head}…（已截断）")
 }
 
+/// 只有模型输出按 Markdown 渲染：TextView 会静默丢弃未识别的内联 HTML，
+/// 用户消息里常夹带 `<in-app-browser-context>` 这类注入标签，按 Markdown 会吞字。
+// ponytail: 按标签判断，块类型再多就改成 TextBlock 结构体带 kind。
+fn is_markdown(label: &str) -> bool {
+    matches!(label, "助手" | "思考")
+}
+
 pub fn prepare(turns: Vec<HistoryTurn>) -> Vec<TextBlock> {
     turns
         .into_iter()
@@ -94,10 +104,32 @@ pub fn prepare(turns: Vec<HistoryTurn>) -> Vec<TextBlock> {
 }
 
 /// 只渲染可见区域附近的块：长会话有几百块，逐帧全量排版会拖慢滚动。
-pub fn render(blocks: Rc<[TextBlock]>, state: ListState) -> impl IntoElement {
+///
+/// `read_id` 进入 Markdown 状态的 key：TextView 按 id 缓存解析结果，换会话后同一
+/// 下标若沿用旧 key，会先显示上个会话的内容再延迟 200ms 重新解析。
+pub fn render(blocks: Rc<[TextBlock]>, state: ListState, read_id: u64) -> impl IntoElement {
     // min_h(0)：flex item 默认按内容撑高，不加这行长记录会顶穿底部 composer。
-    list(state, move |ix, _, cx| {
+    list(state, move |ix, window, cx| {
         let (label, body) = &blocks[ix];
+        let body = if is_markdown(label) {
+            TextView::markdown(
+                ElementId::NamedInteger(format!("transcript-{read_id}").into(), ix as u64),
+                body.clone(),
+                window,
+                cx,
+            )
+            .selectable(true)
+            .code_block_actions(|code, _, _| {
+                // 复制按钮的"已复制"状态按 id 存；同一条消息里多个代码块要各自区分。
+                let code = code.code();
+                let mut hasher = DefaultHasher::new();
+                code.hash(&mut hasher);
+                Clipboard::new(ElementId::Integer(hasher.finish())).value(code)
+            })
+            .into_any_element()
+        } else {
+            body.clone().into_any_element()
+        };
         div()
             .w_full()
             .child(
@@ -116,7 +148,14 @@ pub fn render(blocks: Rc<[TextBlock]>, state: ListState) -> impl IntoElement {
                             .text_color(cx.theme().muted_foreground)
                             .child(*label),
                     )
-                    .child(div().text_sm().child(body.clone())),
+                    .child(
+                        div()
+                            .text_sm()
+                            .when(*label == "思考", |text| {
+                                text.text_color(cx.theme().muted_foreground)
+                            })
+                            .child(body),
+                    ),
             )
             .into_any_element()
     })
