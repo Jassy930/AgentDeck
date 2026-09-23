@@ -116,13 +116,15 @@ impl Drop for LiveCli {
 }
 
 pub fn temp_root(label: &str) -> PathBuf {
+    static NEXT_ROOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let root = std::env::temp_dir().join(format!(
-        "agentdeck-{label}-{}-{}",
+        "agentdeck-{label}-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT_ROOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&root).unwrap();
     root

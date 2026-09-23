@@ -10,6 +10,10 @@
   iOS iPhone 17 Simulator 已执行 21 项测试且全部通过。详见 [M0 CLI 实施记录](plans/2026-09-21-backend-m0-cli-implementation.md)。
 - 当前桌面边界：GPUI 桌面已连接 daemon，但只用 `AgentList` 与 `History` 三个只读入口；
   本页其余 backend 能力仍不能视为桌面端可用能力。
+- 运行时策略：复用本机 Codex，macOS 桌面端优先、CLI 兜底，保留精确版本门禁。
+  版本不匹配会显示各候选实际版本、路径和升级责任；历史 RPC/解码失败保留实际运行时
+  信息与方法名，只在方法明确不支持时给出确定提示，其他失败不武断归因为协议。
+  桌面未知历史条目显示不支持提示；自带 Codex 与自动下载暂不实施。
 - 2026-09-23 当前基线：Codex 固定为 `codex-cli 0.155.0-alpha.16`，官方稳定 schema
   同步刷新；AgentDeck IPC 仍为 v4。列表包含全部 provider，正文经稳定的
   `thread/turns/list` 按页读取完整条目，不启用 `experimentalApi`。本版本真实 CLI
@@ -61,7 +65,7 @@ README、架构、诊断和计划文档用于解释目标与不变量；当文�
 | daemon runtime | turn cancel / session close | 部分 | Codex TurnCancel 使用官方 interrupt，健康会话回 Ready；SessionClose 才回收 child。session live 暴露完整控制命令，run/continue 保留自动 close/wait；真实四轮已证明第三轮取消后第四轮成功，最终 child/进程组消失。证据限定于下述覆盖环境，Claude Code 尚未迁移。 | `agentdeckd/src/codex/session.rs`、`agentdeck-cli/src/commands.rs` |
 | admin | ping、协议版本/schema、agent list/capabilities | 较完整 | 已有 typed command 和 CLI 入口，回复由单 writer 输出。 | `agentdeckd/src/runtime/hub.rs`、`agentdeck-cli/src/` |
 | admin | selfcheck | 部分 | `agentdeckd --selfcheck` 验证数据目录、诊断和 record 写入；CLI selfcheck 验证 daemon IPC 与静态 adapter 注册。两者都不证明 vendor CLI 登录、握手、真实 turn 或历史来源健康。 | `agentdeckd/src/main.rs`、`agentdeckd/src/runtime/hub.rs` |
-| Codex | app-server 进程与 JSON-RPC | 部分 | locator 在共享 5 秒预算内异步探测 PATH 与常见安装位置，macOS 包含 ChatGPT.app 自带 executable；只跳过成功读出但不匹配的版本，其他探测失败立即返回。首个精确匹配 `protocol/CODEX_VERSION.txt` 的规范化绝对路径同时用于 probe 与 spawn。live 与 short-lived 路径均在 initialize response 后发送 `initialized`；live close 确认 direct child、进程组与 stderr pump 清理。0.145.0 的真实四轮证据保留，升级后的 lifecycle E2E 尚未重跑。 | `agentdeckd/src/codex/app_server.rs`、`agentdeckd/src/codex/session.rs`、`protocol/ClientNotification.json` |
+| Codex | app-server 进程与 JSON-RPC | 部分 | locator 在共享 5 秒预算内先探测 macOS ChatGPT.app 自带 executable，再探测 PATH 与常见 CLI 位置；跳过不存在或版本不匹配的候选，其他探测失败立即返回。`AGENTDECK_CODEX_BIN` 显式绝对路径覆盖自动查找且不回退。首个精确匹配 `protocol/CODEX_VERSION.txt` 的规范化绝对路径同时用于 probe 与 spawn。live 与 short-lived 路径均在 initialize response 后发送 `initialized`；live close 确认 direct child、进程组与 stderr pump 清理。0.145.0 的真实四轮证据保留，升级后的 lifecycle E2E 尚未重跑。 | `agentdeckd/src/codex/app_server.rs`、`agentdeckd/src/codex/session.rs`、`protocol/ClientNotification.json` |
 | Codex | 新 session | 部分 | `SessionStart` 先完成 initialize → initialized → thread/start|resume，再发 `SessionStarted`、`SessionCapabilities`；可携 initial turn，且启动前校验 caller ID、cwd 和固定 M0 options。0.145.0 曾在临时配置覆盖环境验证新 thread、握手和 prompt，并确认默认配置启动失败时的 cleanup；升级后尚未重新验收。 | `agentdeckd/src/codex/adapter.rs`、`agentdeckd/src/codex/session.rs` |
 | Codex | resume 与 live 后续 turn | 部分 | resume 验证 threadId 和固定选项，并以 `excludeTurns=true` 省去未使用的历史轮次；session live 可在同一 daemon/owner/thread 上启动后续 turn。限定环境的真实四轮及 one-shot run/continue 均通过；run/continue 仍各自新建 daemon，该结果不证明原 session 全部启动配置恢复。 | `agentdeckd/src/codex/session.rs`、`agentdeck-cli/tests/e2e_codex.rs` |
 | Codex | 固定 M0 options / capabilities | 部分 | 仅接受 never/read-only/medium、persistApproval=false、无 MCP；只声明 StreamingMessages。审批、工具展示和正式 coding session 默认配置不在 M0 范围。 | `agentdeckd/src/codex/adapter.rs`、`agentdeckd/src/codex/capabilities.rs` |
@@ -84,7 +88,7 @@ README、架构、诊断和计划文档用于解释目标与不变量；当文�
 | vendor control | session 内控制更新 | 骨架 | typed payload 与路由存在；Codex 返回 requires-new-turn，CC 多数控制返回 requires-new-turn 或 not-supported。 | 两个 adapter 的 `submit_vendor_control` |
 | observability | run record | 较完整 | router 在 spawn 前打开 session record，单 writer 按事件顺序 append，Codex SessionClosed / CC TurnComplete 后写 footer；启动失败或 legacy EOF/cancel 的遗留记录在 writer drain 后收尾。open/append/close 失败发非终态告警，诊断成功落盘时提供引用；连续 append 失败仅首次及终态告警。CLI 仍等待真实 terminal。JSONL/脱敏/数据目录格式保持不变。 | `agentdeckd/src/runtime/router.rs`、`agentdeckd/src/runtime/hub.rs`、`agentdeckd/src/record.rs` |
 | observability | diagnostic log/report | 部分 | Codex lifecycle 已覆盖 spawn/version/PID、RPC、turn outcome、interrupt、cleanup；failure diagnosticRef 仅在成功落盘后返回，对应实际 runId/eventSeq。写失败省略引用并保留 stderr fallback；审批/history 等 M0 外路径尚未贯通。 | `agentdeckd/src/diag.rs`、`agentdeckd/src/codex/session.rs` |
-| quality | 默认测试离线安全 | 较完整 | 真实 session、prompt、history、auth 和 vendor process 测试统一只认 `AGENTDECK_E2E=1`；普通 version/auth probe 使用可注入 fake。marker tripwire 通过临时 HOME 隔离用户 vendor history 与默认 AgentDeck data dir，并验证标准 workspace tests 不执行 PATH 中的 vendor shim；macOS workflow 已配置该门禁，首个 hosted run 已在 2026-08-18 通过。普通 passed 仍不代表真实 E2E 已执行。 | `agentdeckd/tests/support/mod.rs`、`scripts/verify-offline-tests.sh`、`.github/workflows/offline-ci.yml` |
+| quality | 默认测试离线安全 | 较完整 | 真实 session、prompt、history、auth 和 vendor process 测试统一只认 `AGENTDECK_E2E=1`；普通 version/auth probe 使用可注入 fake。marker tripwire 通过临时 HOME 隔离用户 vendor history 与默认 AgentDeck data dir，并通过 `AGENTDECK_CODEX_BIN` 绑定 Codex marker，验证标准 workspace tests 不执行 vendor shim；macOS workflow 已配置该门禁，首个 hosted run 已在 2026-08-18 通过。普通 passed 仍不代表真实 E2E 已执行。 | `agentdeckd/tests/support/mod.rs`、`scripts/verify-offline-tests.sh`、`.github/workflows/offline-ci.yml` |
 | CLI | admin、session、history | 部分 | session live 在一个 daemon 连接上双向转发 typed JSONL，支持顺序多轮、cancel、close、Ping，EOF 有序关闭。run/continue 保持 one-shot；record_write_failed 不终止健康会话。live 是协议驱动入口，尚无交互式审批产品界面。 | `agentdeck-cli/src/commands.rs`、`agentdeck-cli/src/client.rs`、`agentdeck-cli/tests/session_live.rs` |
 | product integration | GPUI desktop → daemon | 部分 | bundle 自带 `agentdeckd`；桌面按请求 spawn 一个 daemon 子进程完成 JSONL round-trip，用 `AgentList` + `History(List/Read)` 驱动侧栏与会话记录，阻塞 IPC 走 background executor，selfcheck 不连 daemon。读取失败支持自动与手动重试，每来源按 50 条扩展，最多 2,000 条。2026-09-23 的 alpha.16 实窗已验收 Codex 正文及 50 → 100 条加载更多，Claude Code 返回 49 条。会话启动、turn、streaming、审批和 vendor 控制仍未接入。 | `agentdeck-desktop/src/daemon.rs`、`agentdeck-desktop/src/shell.rs`、`script/build_and_run.sh` |
 

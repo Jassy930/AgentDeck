@@ -764,12 +764,13 @@ mod tests {
 
     #[test]
     fn admin_round_trip_propagates_history_admin_error_without_waiting() {
+        let message = "Codex 版本尚未验证\n路径：/Applications/ChatGPT.app/Contents/Resources/codex\n实际：codex-cli 99.0.0；已验证：codex-cli 0.155.0-alpha.16\n请升级 AgentDeck";
         let error_reply = serde_json::json!({
             "reply": "history",
             "requestId": "history-request-42",
             "error": {
                 "code": "history-all-sources-failed",
-                "message": "all registered history sources failed",
+                "message": message,
                 "diagnosticRef": null,
             }
         })
@@ -791,9 +792,12 @@ mod tests {
         .unwrap_err();
 
         match err {
-            CliError::Protocol { code, message } => {
+            CliError::Protocol {
+                code,
+                message: actual,
+            } => {
                 assert_eq!(code.as_deref(), Some("history-all-sources-failed"));
-                assert_eq!(message, "all registered history sources failed");
+                assert_eq!(actual, message);
             }
             other => panic!("expected CliError::Protocol, got {other:?}"),
         }

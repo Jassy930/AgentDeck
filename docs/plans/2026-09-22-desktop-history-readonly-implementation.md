@@ -275,3 +275,47 @@ macOS 进程组存在性查询在组仅剩僵尸进程时可能返回 `EPERM`；
   会话态 composer 普通键入与上下键未触发侧栏导航。
 - release 实窗分别验证 `AGENTDECK_DEBUG=0` 不显示 FPS、`=1` 显示 FPS；debug
   bundle 保持默认显示。没有复测 120 FPS 性能或 vendor lifecycle。
+
+## 2026-09-23：桌面端 Codex 优先
+
+- Goal：继续复用本机运行时，macOS 自动查找先探测桌面端的
+  `/Applications/ChatGPT.app/Contents/Resources/codex`，再探测 PATH 与常见 CLI 位置。
+  不存在或版本不匹配时继续查找；执行失败、非法输出、超时与清理失败仍立即报错。
+  `app_server.rs` 的共享定位器同时作用于 history 与 live session。
+- `AGENTDECK_CODEX_BIN` 可显式指定绝对路径，设置后不回退。CLI fake 与离线 marker
+  通过它绑定测试程序，避免桌面端优先后绕过 PATH shim。三个真实测试移除仅凭 PATH
+  判断 Codex 不存在的跳过条件，仍保留 `AGENTDECK_E2E=1` 门禁。
+- 11 项 app-server 定向测试、完整离线门禁、CLI selfcheck、diagnostics report、
+  真实 bundle verify、格式与文档检查通过。真实 list 在 PATH 首位放置执行即失败的
+  marker 时仍返回 3 条且 marker 未执行，证明选择了桌面端运行时；未发送模型 prompt。
+- 离线门禁前两次遇到既有 record-warning 诊断引用用例失败，单项通过；并行测试的
+  临时目录名只依赖 PID 与时钟，存在同名前缀碰撞可能。共享测试 helper 增加进程内
+  序号、失败断言补充目录证据后，完整门禁通过。未修改生产诊断逻辑，旧日志不足以
+  确证前两次失败是否由目录碰撞引起。
+
+## 2026-09-23：外部运行时兼容提示
+
+- Goal：沿用桌面端优先、系统 CLI 兜底与显式路径覆盖，不自带或下载 Codex。
+  继续精确匹配 alpha.16，AgentDeck IPC 仍为 v4。版本不匹配表示“尚未验证”，
+  不能据此宣称协议一定不兼容；版本先后使用已有的 `semver` crate 判断。
+- `capabilities.rs` 与共享定位器保留候选实际版本、规范化路径、已验证版本和中文
+  指引：旧版升级 Codex，新版升级 AgentDeck 或显式选择已验证版本，构建差异使用
+  匹配构建。未安装、非法输出、执行失败与超时仍分别说明，不伪装成空历史。
+- 历史 RPC/解码错误保留方法、错误码与实际运行时信息；`-32601` 提示方法不支持，
+  其他 RPC 错误保留配置、数据与协议几种可能性。跨来源全部失败时完整保留底层
+  message，不改变部分成功时的 best-effort 行为。没有修改 IPC schema。
+- 桌面错误区可滚动查看详情，按钮独立于滚动区；未知历史条目显示中立中文提示与
+  类型，保留前后正常内容。生产代码不展示 vendor 原始错误正文或 raw payload。
+- 90 项 Codex focused、22 项 desktop 单测、完整离线门禁、绑定当前 checkout daemon
+  的 CLI selfcheck、diagnostics report、desktop selfcheck 与 bundle verify 通过。
+  fake CLI 覆盖新旧版本错误的 JSON code/message 与 stderr 指引；fake 分页响应覆盖
+  方法不支持、内部错误与解码失败，均拒绝残缺正文并隐藏 vendor 错误原文。
+- 实窗通过 bundle 内真实 daemon 连接临时 fake Codex：未验证版本提示可滚动读全，
+  改为匹配版本后点击来源重试恢复列表；未知条目中文提示与前后正常文本均已读回。
+- 正文错误区完整显示 `thread/turns/list`、`-32601`、Codex 版本、运行时完整路径与
+  `codex-protocol-error`，重试按钮保持可见；`PRIVATE_VENDOR_DETAIL` 未展示。
+- 已终止临时 fake 实例，清除 Codex、daemon、data-dir 与 profile 覆盖后打开最终
+  bundle。真实窗口显示 Codex 50 条、Claude Code 49 条；点击真实 Codex 会话成功
+  展示用户、助手与工具正文。
+  本轮不发送模型 prompt，alpha.16 完整 lifecycle E2E 仍未验收；也不承诺识别所有
+  不触发 RPC/解码错误的语义漂移。

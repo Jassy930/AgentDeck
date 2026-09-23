@@ -18,6 +18,7 @@ fn fixture_command(root: &Path, args: &[&str]) -> Command {
     let inherited_path = std::env::var_os("PATH").unwrap_or_default();
     let paths = std::iter::once(bin).chain(std::env::split_paths(&inherited_path));
     command
+        .env("AGENTDECK_CODEX_BIN", &codex)
         .env("PATH", std::env::join_paths(paths).unwrap())
         .env(
             "AGENTDECK_FIXTURE_VERSION",
@@ -55,6 +56,42 @@ fn cli_live_reuses_child_streams_cancels_recovers_and_records() {
 #[test]
 fn cli_live_eof_closes_session_and_record_failure_is_nonterminal() {
     assert_record_failure_is_nonterminal(true);
+}
+
+#[test]
+fn cli_history_version_mismatch_preserves_runtime_details() {
+    if !daemon_bound() {
+        return;
+    }
+    for (version, guidance) in [
+        ("codex-cli 0.145.0", "升级 Codex"),
+        ("codex-cli 99.0.0", "升级 AgentDeck"),
+    ] {
+        let root = temp_root("cli-history-version-mismatch");
+        let output = fixture_command(&root, &["history", "list", "--agent", "codex"])
+            .env("AGENTDECK_FIXTURE_VERSION", version)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let reply: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(reply["error"]["code"], "codex-version-unsupported");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        for detail in [
+            version,
+            include_str!("../../protocol/CODEX_VERSION.txt").trim(),
+            guidance,
+            &root
+                .join("bin/codex")
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string(),
+        ] {
+            assert!(stderr.contains(detail), "missing {detail}: {stderr}");
+            assert!(reply["error"]["message"].as_str().unwrap().contains(detail));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]
@@ -179,7 +216,15 @@ fn assert_record_failure_is_nonterminal(diagnostics_writable: bool) {
         .find(|v| v["error"]["code"] == "record_write_failed")
         .unwrap();
     if diagnostics_writable {
-        let reference = warning["error"]["diagnosticRef"].as_str().unwrap();
+        let reference = warning["error"]["diagnosticRef"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing diagnostic reference: root={}, log_is_directory={}, warning={warning}",
+                    root.display(),
+                    root.join("diagnostic.log").is_dir()
+                )
+            });
         let (run_id, sequence) = reference.rsplit_once(':').unwrap();
         let diagnostics = std::fs::read_to_string(root.join("diagnostic.log")).unwrap();
         assert!(

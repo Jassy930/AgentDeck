@@ -80,7 +80,7 @@ fn decode_error(operation: &str, _error: serde_json::Error) -> ProtocolError {
     ProtocolError {
         code: "codex-history-decode-failed".into(),
         message: format!(
-            "decode Codex {operation} response failed; {DECODE_DETAILS_WITHHELD_NOTE}"
+            "无法解析 Codex {operation} 响应，可能存在协议或历史数据格式不兼容；请检查 AgentDeck 更新。{DECODE_DETAILS_WITHHELD_NOTE}"
         ),
         diagnostic_ref: None,
     }
@@ -645,6 +645,10 @@ mod tests {
                 json!({ "error": { "code": -32603, "message": "sk-upstream-secret" } }),
                 Some("codex-protocol-error"),
             ),
+            (
+                json!({ "error": { "code": -32601, "message": "sk-unsupported-secret" } }),
+                Some("codex-protocol-error"),
+            ),
         ];
         for (mut last_reply, expected_error) in cases {
             let root = std::env::temp_dir()
@@ -652,6 +656,7 @@ mod tests {
             std::fs::create_dir(&root).unwrap();
             let executable = root.join("codex");
             let log = root.join("requests.jsonl");
+            let method_unsupported = last_reply["error"]["code"] == -32601;
             last_reply["id"] = json!(4);
             let replies = [
                 json!({ "id": 1, "result": {} }),
@@ -705,9 +710,21 @@ mod tests {
                 );
             }
             if let Some(code) = expected_error {
-                let error = result.expect_err("later-page failure must not return partial history");
+                let error = client.enrich_error(
+                    result.expect_err("later-page failure must not return partial history"),
+                );
                 assert_eq!(error.code, code);
                 assert!(!error.message.contains("sk-"));
+                assert!(error.message.contains("thread/turns/list"));
+                assert!(error.message.contains(binary.version()));
+                assert!(error.message.contains(&binary.path().display().to_string()));
+                if method_unsupported {
+                    assert!(error.message.contains("不支持此方法"));
+                    assert!(error.message.contains("-32601"));
+                } else if code != "codex-history-pagination-stalled" {
+                    assert!(error.message.contains("可能存在"));
+                    assert!(error.message.contains("AgentDeck 更新"));
+                }
             } else {
                 let history = result.unwrap();
                 assert_eq!(history.turns.len(), 2);
@@ -741,10 +758,6 @@ mod tests {
     async fn gated_real_codex_list_and_read_smoke() {
         if std::env::var("AGENTDECK_E2E").as_deref() != Ok("1") {
             eprintln!("SKIP gated_real_codex_list_and_read_smoke: AGENTDECK_E2E != 1");
-            return;
-        }
-        if which::which("codex").is_err() {
-            eprintln!("SKIP gated_real_codex_list_and_read_smoke: codex not in PATH");
             return;
         }
         let items = list_history(None, Some(3))

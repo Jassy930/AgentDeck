@@ -55,11 +55,10 @@ pub fn describe(item: &AgentItem) -> (&'static str, String) {
                 None => name.clone(),
             },
         ),
-        AgentItem::Raw {
-            raw_kind,
-            raw_payload,
-            ..
-        } => ("原始", format!("{raw_kind}\n{raw_payload}")),
+        AgentItem::Raw { raw_kind, .. } => (
+            "暂不支持的内容",
+            format!("类型：{raw_kind}\n当前 AgentDeck 无法展示此内容，请检查更新"),
+        ),
     }
 }
 
@@ -149,6 +148,11 @@ mod tests {
                         result: Some(serde_json::json!({"ok": true})),
                         meta: AgentItemMeta::default(),
                     },
+                    AgentItem::Raw {
+                        raw_kind: "futureItem".into(),
+                        raw_payload: "withheld".into(),
+                        meta: AgentItemMeta::default(),
+                    },
                     message(format!("  {}\n", "字".repeat(BODY_LIMIT + 1))),
                 ],
             },
@@ -158,6 +162,10 @@ mod tests {
             vec![
                 ("你", "首条".into()),
                 ("工具", "read\n{\"ok\":true}".into()),
+                (
+                    "暂不支持的内容",
+                    "类型：futureItem\n当前 AgentDeck 无法展示此内容，请检查更新".into()
+                ),
                 (
                     "你",
                     format!("{}…（已截断）", "字".repeat(BODY_LIMIT)).into()

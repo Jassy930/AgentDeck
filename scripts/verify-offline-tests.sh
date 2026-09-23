@@ -51,6 +51,7 @@ run_workspace_tests() {
     "PATH=$offline_bin:$PATH"
     "AGENTDECK_OFFLINE_MARKER=$offline_marker"
     "AGENTDECK_DAEMON_BIN=$offline_daemon_bin"
+    "AGENTDECK_CODEX_BIN=$offline_bin/codex"
   )
 
   rm -f "$offline_marker"
@@ -83,6 +84,7 @@ run_gated_integration_tests() {
     "AGENTDECK_OFFLINE_MARKER=$offline_marker"
     "AGENTDECK_E2E=$e2e_value"
     "AGENTDECK_DAEMON_BIN=$offline_daemon_bin"
+    "AGENTDECK_CODEX_BIN=$offline_bin/codex"
   )
 
   rm -f "$offline_marker"

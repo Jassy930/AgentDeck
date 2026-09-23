@@ -1,5 +1,6 @@
-//! Gate: `AGENTDECK_E2E=1` — requires BOTH `codex` (with `codex login`) AND
-//! `claude` (with `claude auth login`) to be present in PATH.
+//! Gate: `AGENTDECK_E2E=1` — requires an installed supported Codex (with
+//! `codex login`) and `claude` (with `claude auth login`) in PATH.
+//! The daemon resolves Codex from desktop, CLI or an explicit runtime path.
 //!
 //! Run with:
 //!   cargo build --locked -p agentdeckd --bin agentdeckd
@@ -14,8 +15,8 @@ mod support;
 
 use support::{HISTORY_TIMEOUT, SESSION_TIMEOUT, real_e2e_enabled, run_cli, vendor_available};
 
-fn both_vendors_available() -> bool {
-    vendor_available("codex") && vendor_available("claude")
+fn claude_available() -> bool {
+    vendor_available("claude")
 }
 
 /// Run a session and return `(thread_id, agent_kind_str)`.
@@ -89,8 +90,8 @@ fn e2e_cross_history_merged_list_contains_both_agents() {
         eprintln!("SKIP: set AGENTDECK_E2E=1 to run cross-agent history E2E tests");
         return;
     }
-    if !both_vendors_available() {
-        eprintln!("SKIP: both codex and claude must be in PATH for cross-agent tests");
+    if !claude_available() {
+        eprintln!("SKIP: claude must be in PATH for cross-agent tests");
         return;
     }
 
@@ -185,8 +186,8 @@ fn e2e_cross_history_codex_filter_returns_only_codex() {
         eprintln!("SKIP: set AGENTDECK_E2E=1");
         return;
     }
-    if !both_vendors_available() {
-        eprintln!("SKIP: both codex and claude must be in PATH");
+    if !claude_available() {
+        eprintln!("SKIP: claude must be in PATH");
         return;
     }
 
@@ -220,8 +221,8 @@ fn e2e_cross_history_cc_filter_returns_only_cc() {
         eprintln!("SKIP: set AGENTDECK_E2E=1");
         return;
     }
-    if !both_vendors_available() {
-        eprintln!("SKIP: both codex and claude must be in PATH");
+    if !claude_available() {
+        eprintln!("SKIP: claude must be in PATH");
         return;
     }
 

@@ -603,12 +603,26 @@ impl Shell {
             Transcript::Loading => placeholder("正在读取会话记录…", cx).into_any_element(),
             Transcript::Failed(message) => v_flex()
                 .flex_1()
+                .min_h(px(0.))
+                .px_6()
+                .py_4()
                 .items_center()
                 .justify_center()
                 .gap_3()
-                .child(div().text_sm().child(message.clone()))
+                .child(
+                    div()
+                        .id("transcript-error")
+                        .w_full()
+                        .max_w(px(760.))
+                        .min_w(px(0.))
+                        .min_h(px(0.))
+                        .h(px(240.))
+                        .overflow_y_scroll()
+                        .child(div().w_full().text_sm().child(message.clone())),
+                )
                 .child(
                     Button::new("retry-transcript")
+                        .flex_shrink_0()
                         .label("重试读取")
                         .on_click(cx.listener(|shell, _, _, cx| shell.retry_transcript(cx))),
                 )
