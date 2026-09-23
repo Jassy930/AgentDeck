@@ -366,7 +366,7 @@ mod tests {
         json!({
             "agentNickname": null,
             "agentRole": null,
-            "cliVersion": "0.155.0-alpha.9.2",
+            "cliVersion": "0.155.0-alpha.16",
             "createdAt": 10,
             "cwd": "/tmp/project",
             "ephemeral": false,
@@ -453,7 +453,7 @@ mod tests {
     fn thread_read_reuses_live_item_mapping_and_preserves_turns() {
         let response = json!({
             "thread": {
-                "cliVersion": "0.155.0-alpha.9.2",
+                "cliVersion": "0.155.0-alpha.16",
                 "createdAt": 10,
                 "cwd": "/tmp/project",
                 "ephemeral": false,

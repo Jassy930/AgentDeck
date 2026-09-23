@@ -92,12 +92,12 @@ daemon 会持续 drain Codex app-server 子进程 stderr，避免管道回压卡
 | `codex-interrupt-timeout` | `turn/interrupt` 后未在 grace period 内收到权威 terminal | 等待 failed `SessionClosed` 与 daemon 退出；从保留的 threadId 显式恢复，不要自动重放 |
 | `codex-close-timeout` | close 已开始，但 active turn 未在 close deadline 内收口 | 等待 daemon 执行强制 cleanup；若随后是 failed close，按 cleanup failure 排查 |
 | `codex-disconnected` / `codex-stdout-read-failed` / `codex-stdin-write-failed` | app-server transport 在 terminal 前断开或读写失败 | 将当前 session 视为不可继续；核对 Codex 版本、进程退出原因与对应 diagnosticRef |
-| `codex-malformed-json` / `codex-unmatched-response` / `codex-protocol-error` | vendor frame 无法按固定 schema 解码、response 无对应 request，或 JSON-RPC error | 与 `protocol/` 中 0.155.0-alpha.9.2 官方 schema 对照；不要把该 session 恢复为 Ready |
+| `codex-malformed-json` / `codex-unmatched-response` / `codex-protocol-error` | vendor frame 无法按固定 schema 解码、response 无对应 request，或 JSON-RPC error | 与 `protocol/` 中 0.155.0-alpha.16 官方 schema 对照；不要把该 session 恢复为 Ready |
 | `codex-unsupported-server-request` / `codex-terminal-status-invalid` | app-server 发出 M0 不支持的 server request，或 terminal status 仍是 `inProgress` | 记录可复现方法与固定版本；该 turn/session 会按 protocol failure 收口 |
 | `codex-cleanup-failed` | 无法确认 direct child 已 wait、Unix 进程组已消失或 stderr pump 已停止 | 不再向该 daemon 发新 session；等待 failed `SessionClosed` 后 daemon 退出，检查残留 app-server/helper 进程 |
 | `turn-id-already-used` | client 在同一 session 内复用了已接受的 caller-owned `turnId` | 生成新的 `turnId` 后重试；该拒绝不会写入 vendor 或改变 Ready session |
 
-`initialize` 成功仍可能在 `thread/start` 因用户配置类型不兼容而返回 `codex-protocol-error`；2026-09-21 的 0.145.0 验收曾遇到 `features.context_management` 的 table/bool 冲突，仅用进程级 `-c features.context_management=false` 覆盖完成真实验收，未修改全局配置。当前 0.155.0-alpha.9.2 尚未重跑 lifecycle E2E，详见 [当前验收边界](AGENTDECKD_STATUS.md#当前验收边界)。
+`initialize` 成功仍可能在 `thread/start` 因用户配置类型不兼容而返回 `codex-protocol-error`；2026-09-21 的 0.145.0 验收曾遇到 `features.context_management` 的 table/bool 冲突，仅用进程级 `-c features.context_management=false` 覆盖完成真实验收，未修改全局配置。当前 0.155.0-alpha.16 尚未重跑 lifecycle E2E，详见 [当前验收边界](AGENTDECKD_STATUS.md#当前验收边界)。
 
 Claude Code 历史 archive / rename 子进程遵守同一 K9 边界：daemon 将其
 stdout / stderr 直接丢弃，非零退出只返回结构化 failure code、exit status 和
@@ -124,7 +124,7 @@ agentdeck history list --agent claude-code --limit 20
 
 若列表正常而读取返回 `codex-protocol-error`，需区分分页接口与 vendor 数据兼容性：
 调查中旧 0.145.0 曾拒绝解析部分新版客户端保存的子代理 `completed` 记录（上游
-`-32603`）。当前已将协议与版本升级至 0.155.0-alpha.9.2；仍须核对实际运行版本和
+`-32603`）。当前已将协议与版本升级至 0.155.0-alpha.16；仍须核对实际运行版本和
 逐页读回结果，不能改用摘要或空列表掩盖失败。桌面 selfcheck 和 fake bundle 验证
 均不能证明真实正文可读。
 

@@ -10,10 +10,11 @@
   iOS iPhone 17 Simulator 已执行 21 项测试且全部通过。详见 [M0 CLI 实施记录](plans/2026-09-21-backend-m0-cli-implementation.md)。
 - 当前桌面边界：GPUI 桌面已连接 daemon，但只用 `AgentList` 与 `History` 三个只读入口；
   本页其余 backend 能力仍不能视为桌面端可用能力。
-- 2026-09-22 当前基线：Codex 固定为 `codex-cli 0.155.0-alpha.9.2`，官方稳定 schema
+- 2026-09-23 当前基线：Codex 固定为 `codex-cli 0.155.0-alpha.16`，官方稳定 schema
   同步刷新；AgentDeck IPC 仍为 v4。列表包含全部 provider，正文经稳定的
-  `thread/turns/list` 按页读取完整条目，不启用 `experimentalApi`。升级后的真实历史
-  读回证据见只读历史实施记录；lifecycle E2E 尚未重跑，桌面正文点击尚待验收。
+  `thread/turns/list` 按页读取完整条目，不启用 `experimentalApi`。本版本真实 CLI
+  list/read、桌面正文与 50 → 100 条加载更多已验收，证据见只读历史实施记录；
+  lifecycle E2E 尚未重跑。
 - 当前 Codex 接入：`agentdeckd` 直接启动 `codex app-server` 子进程；不使用 managed
   daemon/proxy。session-scoped owner 与 protocol v4 已实现累计消息、持久 CLI 和生产运行记录；
   真实 vendor 证据必须与离线结果单独记录。
@@ -85,11 +86,11 @@ README、架构、诊断和计划文档用于解释目标与不变量；当文�
 | observability | diagnostic log/report | 部分 | Codex lifecycle 已覆盖 spawn/version/PID、RPC、turn outcome、interrupt、cleanup；failure diagnosticRef 仅在成功落盘后返回，对应实际 runId/eventSeq。写失败省略引用并保留 stderr fallback；审批/history 等 M0 外路径尚未贯通。 | `agentdeckd/src/diag.rs`、`agentdeckd/src/codex/session.rs` |
 | quality | 默认测试离线安全 | 较完整 | 真实 session、prompt、history、auth 和 vendor process 测试统一只认 `AGENTDECK_E2E=1`；普通 version/auth probe 使用可注入 fake。marker tripwire 通过临时 HOME 隔离用户 vendor history 与默认 AgentDeck data dir，并验证标准 workspace tests 不执行 PATH 中的 vendor shim；macOS workflow 已配置该门禁，首个 hosted run 已在 2026-08-18 通过。普通 passed 仍不代表真实 E2E 已执行。 | `agentdeckd/tests/support/mod.rs`、`scripts/verify-offline-tests.sh`、`.github/workflows/offline-ci.yml` |
 | CLI | admin、session、history | 部分 | session live 在一个 daemon 连接上双向转发 typed JSONL，支持顺序多轮、cancel、close、Ping，EOF 有序关闭。run/continue 保持 one-shot；record_write_failed 不终止健康会话。live 是协议驱动入口，尚无交互式审批产品界面。 | `agentdeck-cli/src/commands.rs`、`agentdeck-cli/src/client.rs`、`agentdeck-cli/tests/session_live.rs` |
-| product integration | GPUI desktop → daemon | 部分 | bundle 自带 `agentdeckd`；桌面按请求 spawn 一个 daemon 子进程完成 JSONL round-trip，用 `AgentList` + `History(List/Read)` 驱动侧栏与会话记录，阻塞 IPC 走 background executor，selfcheck 不连 daemon。会话启动、turn、streaming、审批和 vendor 控制仍未接入；早期目视验收覆盖 Claude Code 历史。Codex provider 过滤与分页正文已修正；版本升级后的正文点击尚待验收，真实 CLI 读回不能替代桌面验收。 | `agentdeck-desktop/src/daemon.rs`、`agentdeck-desktop/src/shell.rs`、`script/build_and_run.sh` |
+| product integration | GPUI desktop → daemon | 部分 | bundle 自带 `agentdeckd`；桌面按请求 spawn 一个 daemon 子进程完成 JSONL round-trip，用 `AgentList` + `History(List/Read)` 驱动侧栏与会话记录，阻塞 IPC 走 background executor，selfcheck 不连 daemon。读取失败支持自动与手动重试，每来源按 50 条扩展，最多 2,000 条。2026-09-23 的 alpha.16 实窗已验收 Codex 正文及 50 → 100 条加载更多，Claude Code 返回 49 条。会话启动、turn、streaming、审批和 vendor 控制仍未接入。 | `agentdeck-desktop/src/daemon.rs`、`agentdeck-desktop/src/shell.rs`、`script/build_and_run.sh` |
 
 ## 当前验收边界
 
-- 2026-09-22 升级至 `codex-cli 0.155.0-alpha.9.2` 后尚未重跑真实 lifecycle E2E；
+- 2026-09-23 升级至 `codex-cli 0.155.0-alpha.16` 后尚未重跑真实 lifecycle E2E；
   以下 M0 结果均限定于当时的 0.145.0 与配置覆盖环境，不证明新版本会话生命周期已验收。
 - #4 的累计 streaming、#5 的持久 CLI 和 #6 的生产记录/诊断已经实现，离线 CLI 用例覆盖同一进程四轮、取消恢复、EOF 和记录写失败。
 - 真实四轮 M0 已在 Codex 0.145.0、当前 checkout daemon、`AGENTDECK_E2E=1` 下通过（首版 58.39 秒，PR 修复后复验 50.40 秒）。临时 PATH launcher 使用 `-c features.context_management=false` 覆盖本机不兼容配置；全局配置未改，原生登录未复制。

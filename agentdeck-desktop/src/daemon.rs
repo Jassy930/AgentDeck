@@ -114,6 +114,29 @@ impl Drop for DaemonChild {
     }
 }
 
+fn daemon_command(path: &Path) -> Command {
+    let mut command = Command::new(path);
+    command.stdin(Stdio::piped()).stdout(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // GCD workers block SIGCHLD. Inheriting that mask prevents Tokio in the
+        // daemon from observing child exits; reset only in the forked child.
+        unsafe {
+            command.pre_exec(|| {
+                let mut mask = std::mem::zeroed();
+                if libc::sigemptyset(&mut mask) != 0
+                    || libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut()) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    command
+}
+
 /// 从一行 daemon 输出里取出目标 admin reply。
 ///
 /// `None` 表示这行不是目标 reply 或 requestId 不匹配，继续读下一行。
@@ -155,9 +178,7 @@ fn round_trip(
     expected_request_id: Option<&str>,
 ) -> Result<serde_json::Value> {
     let path = locate_daemon()?;
-    let child = Command::new(&path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+    let child = daemon_command(&path)
         .spawn()
         .map_err(|source| format!("启动 agentdeckd 失败：{source}"))?;
     let mut child = DaemonChild(child);
@@ -226,6 +247,50 @@ pub fn history_read(agent_kind: AgentKind, thread_id: ThreadId) -> Result<Vec<Hi
 #[cfg(test)]
 mod tests {
     use super::{next_history_request_id, reply_payload};
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_does_not_inherit_blocked_child_exit_signals() {
+        use std::os::unix::process::ExitStatusExt;
+        const CHILD: &str = "AGENTDECK_TEST_CHILD_SIGNAL_MASK";
+        if std::env::var_os(CHILD).is_some() {
+            let mut mask = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::sigprocmask(libc::SIG_SETMASK, std::ptr::null(), &mut mask) },
+                0
+            );
+            assert_eq!(unsafe { libc::sigismember(&mask, libc::SIGCHLD) }, 0);
+            return;
+        }
+        let mut mask = unsafe { std::mem::zeroed() };
+        let mut saved = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut mask);
+            libc::sigaddset(&mut mask, libc::SIGCHLD);
+            assert_eq!(libc::pthread_sigmask(libc::SIG_BLOCK, &mask, &mut saved), 0);
+        }
+        let child = super::daemon_command(&std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "daemon::tests::daemon_does_not_inherit_blocked_child_exit_signals",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+        assert_eq!(
+            unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &saved, std::ptr::null_mut()) },
+            0
+        );
+        let output = child.unwrap().wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "child status {:?}: {}{}",
+            output.status.signal(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[cfg(unix)]
     #[test]

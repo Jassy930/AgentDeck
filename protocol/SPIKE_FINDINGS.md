@@ -1,8 +1,8 @@
 # 协议 Spike 发现（Step 0,Eng D7）
 
 首次 framing 实测日期：2026-05-19
-schema 最近刷新日期：2026-09-22
-codex 版本：codex-cli 0.155.0-alpha.9.2（完整版本已固定在 `CODEX_VERSION.txt`）
+schema 最近刷新日期：2026-09-23
+codex 版本：codex-cli 0.155.0-alpha.16（完整版本已固定在 `CODEX_VERSION.txt`）
 
 ## D7 核心问题：wire framing 是什么？
 
@@ -36,9 +36,13 @@ schema；`generate-ts --out DIR` 可生成 TypeScript binding。**不需要逆�
 - `codex_app_server_protocol.v2.schemas.json` — v2 完整 schema
 
 `client-methods.txt` 从 `ClientRequest.json` 的
-`oneOf[*].properties.method.enum[0]` 确定性派生，不手写。0.155.0-alpha.9.2 的默认
+`oneOf[*].properties.method.enum[0]` 确定性派生，不手写。0.155.0-alpha.16 的默认
 生成物包含 101 个稳定方法；派生命令见 `docs/QUALITY.md`。这套 vendor schema
 与 AgentDeck 自身 IPC v4 独立，升级 vendor 快照不改变 IPC 版本。
+
+2026-09-23 从 0.155.0-alpha.9.2 升级至 0.155.0-alpha.16：五个独立 schema 与
+101 个稳定方法均未变化；聚合 schema 仅新增 `AppConfig.omit_tools_from` 和
+`ToolExposureSurface`，不改变当前历史读取或 lifecycle 使用的字段。
 
 ## 关键方法确认
 
@@ -84,7 +88,7 @@ AgentDeck v0.1 只暴露一次性 approve / deny：命令和文件请求映射�
   `ShortLivedAppServer` 都在 initialize response 后、thread request 前发送
   `initialized`，fake executable/duplex 测试守护顺序，官方 `ClientNotification.json`
   同步固定该 wire。0.145.0 已有受限配置环境的真实四轮证据；升级至
-  0.155.0-alpha.9.2 后尚未重跑持久真实 E2E，需重新证明握手、多轮和 close。
+  0.155.0-alpha.16 后尚未重跑持久真实 E2E，需重新证明握手、多轮和 close。
 - **D8 → 强化**：approval 元数据结构化，中立 action 抽象有可靠数据源。
 - **D2 → 实现路径清晰**：daemon 用官方 schema 反序列化 Codex 消息，
   翻译成中立 AgentItem，IPC 传中立 JSON。

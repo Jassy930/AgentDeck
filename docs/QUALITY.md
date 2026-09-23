@@ -193,7 +193,7 @@ RuntimeHub/router 修正；这些离线证据不能升级为真实 Codex E2E。
 ## Codex vendor schema 快照
 
 `protocol/ClientRequest.json` 等文件是 Codex app-server 的 vendor 协议快照，当前固定为
-`codex-cli 0.155.0-alpha.9.2`，包含完整版本后缀。live session 与 short-lived history
+`codex-cli 0.155.0-alpha.16`，包含完整版本后缀。live session 与 short-lived history
 path 都发送规范的 `initialized`，fake 测试守护 initialize response
 → initialized → thread request 顺序。这套 vendor 快照与 AgentDeck 自身 schemars 生成的
 `protocol/agentdeck/agentdeck-protocol.schema.json` 是两套独立门禁。

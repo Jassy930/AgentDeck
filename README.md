@@ -19,9 +19,13 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
   空态（居中标题、圆角 composer、按已注册 agent 生成的接入卡片），以及会话态
   （thread header、会话记录、底部悬浮 composer）。
 - **接入本机 `agentdeckd` 的只读历史**：启动时先问 daemon 注册了哪些 agent，再按
-  agent 分别拉取会话列表（各 50 条），谁先返回谁先进侧栏；点击条目按
+  agent 分别拉取会话列表（首批各显示 50 条），谁先返回谁先进侧栏；各来源可点击
+  “加载更多”，每次扩展 50 条，数量显示为“已加载”。读完或达到每来源 2,000 条上限时
+  明确提示；继续加载或失败时保留已有会话与计数。点击条目按
   `threadId` + `agentKind` 读取该会话的真实记录并渲染为纯文本。加载中、失败和空结果
   都有明确文案；某个来源失败时保留其他来源的会话，并在侧栏显示该来源的错误。
+  只读请求失败后在后台等待 1 秒自动重试一次；仍失败时提供连接、来源列表或正文的
+  重试按钮，加载期间不重复发起同一请求；加载更多失败后重试相同目标数量。
   快速切换时最多执行一个历史读取，只保留最新待查会话；记录文本在后台读取完成时
   转换一次，滚动时复用。侧栏长标题以省略号显示。
 - composer 显示当前会话的项目与 agent，两种形态共用草稿；发送和搜索仍禁用，
@@ -68,6 +72,8 @@ docs/                    架构、诊断、质量规则与计划
 （`agentdeck-desktop/src/daemon.rs`）按请求 spawn 一个 `agentdeckd` 子进程走 JSONL
 stdin/stdout。依赖方向固定为 `desktop → typed local client → agentdeckd`；UI 不直接
 解析 vendor JSON，也不把 daemon 嵌入 GUI 进程，更不依赖 `agentdeck-cli`。
+macOS 启动 daemon 前会在子进程恢复信号接收，避免继承 GPUI 后台线程屏蔽的
+`SIGCHLD`，导致已退出的版本探测进程仍被判为超时。
 
 ## 依赖版本
 
@@ -81,7 +87,7 @@ gpui-component = "=0.5.1"
 `runtime_shaders` 用于避免本地额外安装 Metal Toolchain。依赖通过仓库根目录的
 `Cargo.lock` 锁定；不要在没有验证的情况下追 Git main。
 
-Codex 程序版本固定为 `codex-cli 0.155.0-alpha.9.2`，完整版本写在
+Codex 程序版本固定为 `codex-cli 0.155.0-alpha.16`，完整版本写在
 `protocol/CODEX_VERSION.txt`。daemon 依次异步探测 PATH 和常见安装位置，只跳过成功
 读出但不匹配的版本；执行失败、非法输出、超时或清理失败立即报错。
 使用首个精确匹配的 executable；macOS 候选包括

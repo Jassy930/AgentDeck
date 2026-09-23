@@ -3,12 +3,15 @@
 //! 会话列表和会话记录都来自本机 `agentdeckd`，通过 `daemon` 模块按 agent 拉取；
 //! 本期只读历史，不启动 session、不发 turn。
 
-use agentdeck_protocol::{AgentKind, HistoryListItem, ThreadId};
+use std::time::Duration;
+
+use agentdeck_protocol::{AgentKind, HistoryListItem, MAX_HISTORY_LIST_LIMIT, ThreadId};
 use gpui::{
     App, Context, Entity, IntoElement, ParentElement, SharedString, Window, div, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme, InteractiveElementExt, StyledExt, h_flex, input::InputState, v_flex,
+    ActiveTheme, InteractiveElementExt, StyledExt, button::Button, h_flex, input::InputState,
+    v_flex,
 };
 
 use crate::composer;
@@ -16,9 +19,19 @@ use crate::daemon;
 use crate::sidebar;
 use crate::transcript;
 
-/// 侧栏每个 agent 拉取的会话条数。控制首屏延迟：Codex 的 `thread/list` 按页
-/// 聚合，页数越多越接近 daemon 的历史超时。
+/// 首屏和每次扩展的显示条数；多读一条用于判断是否还有会话。
 const SIDEBAR_LIMIT: usize = 50;
+
+// 只在 background executor 上调用；短暂失败重试一次，持续失败交给用户处理。
+fn read_with_retry<T>(mut read: impl FnMut() -> daemon::Result<T>) -> daemon::Result<T> {
+    match read() {
+        Ok(value) => Ok(value),
+        Err(_) => {
+            std::thread::sleep(Duration::from_secs(1));
+            read()
+        }
+    }
+}
 
 /// 主区当前展示的形态。
 pub enum Stage {
@@ -148,22 +161,76 @@ pub fn agent_label(kind: AgentKind) -> String {
 pub(crate) struct AgentHistory {
     pub kind: AgentKind,
     /// None 表示仍在读取；成功与失败都必须保留来源，不能把失败显示成零条。
-    result: Option<Result<usize, String>>,
+    result: Option<Result<(), String>>,
+    loaded: usize,
+    limit: usize,
+    has_more: bool,
 }
 
 impl AgentHistory {
     fn new(kind: AgentKind) -> Self {
-        Self { kind, result: None }
+        Self {
+            kind,
+            result: None,
+            loaded: 0,
+            limit: SIDEBAR_LIMIT,
+            has_more: false,
+        }
     }
 
-    fn complete(&mut self, listed: &Result<Vec<HistoryListItem>, String>) {
-        self.result = Some(listed.as_ref().map(Vec::len).map_err(Clone::clone));
+    fn request_limit(&self) -> usize {
+        (self.limit + 1).min(MAX_HISTORY_LIST_LIMIT)
+    }
+
+    fn complete(&mut self, listed: &mut Result<Vec<HistoryListItem>, String>) {
+        if let Ok(items) = listed {
+            self.has_more = items.len() > self.limit || items.len() == MAX_HISTORY_LIST_LIMIT;
+            items.truncate(self.limit);
+            self.loaded = items.len();
+        }
+        self.result = Some(listed.as_ref().map(|_| ()).map_err(Clone::clone));
+    }
+
+    pub fn can_load_more(&self) -> bool {
+        matches!(self.result, Some(Ok(()))) && self.has_more && self.limit < MAX_HISTORY_LIST_LIMIT
+    }
+
+    fn load_more(&mut self) -> bool {
+        if !self.can_load_more() {
+            return false;
+        }
+        // ponytail: 复用有上限的列表查询；数据规模超出 2,000 条时再引入 IPC 游标。
+        self.limit = (self.limit + SIDEBAR_LIMIT).min(MAX_HISTORY_LIST_LIMIT);
+        self.result = None;
+        true
+    }
+
+    pub fn list_hint(&self) -> Option<&'static str> {
+        if !matches!(self.result, Some(Ok(()))) {
+            None
+        } else if self.loaded == MAX_HISTORY_LIST_LIMIT {
+            Some("已达 2,000 条上限")
+        } else if !self.has_more {
+            Some("已全部加载")
+        } else {
+            None
+        }
+    }
+
+    fn retry(&mut self) -> bool {
+        if self.error().is_none() {
+            return false;
+        }
+        self.result = None;
+        true
     }
 
     pub fn status(&self) -> String {
         match &self.result {
+            None if self.loaded > 0 => format!("已加载 {} · 加载中…", self.loaded),
             None => "读取中…".to_string(),
-            Some(Ok(count)) => format!("{count} 个会话"),
+            Some(Ok(())) => format!("已加载 {} 个会话", self.loaded),
+            Some(Err(_)) if self.loaded > 0 => format!("已加载 {} · 加载失败", self.loaded),
             Some(Err(_)) => "读取失败".to_string(),
         }
     }
@@ -185,10 +252,7 @@ fn empty_hint(agents: &[AgentHistory], pending: usize, error: Option<&str>) -> S
         }
         .to_string();
     }
-    if agents
-        .iter()
-        .any(|agent| matches!(agent.result, Some(Ok(count)) if count > 0))
-    {
+    if agents.iter().any(|agent| agent.loaded > 0) {
         "选择左侧会话查看记录，或试着输入任务"
     } else if pending > 0 {
         "正在读取会话…"
@@ -250,7 +314,7 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             let agents = cx
                 .background_executor()
-                .spawn(async { daemon::agent_list() })
+                .spawn(async { read_with_retry(daemon::agent_list) })
                 .await;
             this.update(cx, |shell, cx| {
                 shell.pending -= 1;
@@ -271,18 +335,23 @@ impl Shell {
     }
 
     fn load_agent_sessions(&mut self, kind: AgentKind, cx: &mut Context<Self>) {
+        let Some(agent) = self.agents.iter().find(|agent| agent.kind == kind) else {
+            return;
+        };
+        let limit = agent.request_limit();
         self.pending += 1;
         cx.spawn(async move |this, cx| {
-            let listed = cx
+            let mut listed = cx
                 .background_executor()
-                .spawn(async move { daemon::history_list(kind, SIDEBAR_LIMIT) })
+                .spawn(async move { read_with_retry(|| daemon::history_list(kind, limit)) })
                 .await;
             this.update(cx, |shell, cx| {
                 shell.pending -= 1;
                 if let Some(agent) = shell.agents.iter_mut().find(|agent| agent.kind == kind) {
-                    agent.complete(&listed);
+                    agent.complete(&mut listed);
                 }
                 if let Ok(mut items) = listed {
+                    shell.sessions.retain(|item| item.agent_kind != kind);
                     shell.sessions.append(&mut items);
                     shell
                         .sessions
@@ -293,6 +362,48 @@ impl Shell {
             .ok();
         })
         .detach();
+    }
+
+    pub fn retry_connection(&mut self, cx: &mut Context<Self>) {
+        if self.error.take().is_some() {
+            self.load_sessions(cx);
+            cx.notify();
+        }
+    }
+
+    pub fn retry_agent(&mut self, kind: AgentKind, cx: &mut Context<Self>) {
+        if self
+            .agents
+            .iter_mut()
+            .find(|agent| agent.kind == kind)
+            .is_some_and(AgentHistory::retry)
+        {
+            self.load_agent_sessions(kind, cx);
+            cx.notify();
+        }
+    }
+
+    pub fn load_more_agent(&mut self, kind: AgentKind, cx: &mut Context<Self>) {
+        if self
+            .agents
+            .iter_mut()
+            .find(|agent| agent.kind == kind)
+            .is_some_and(AgentHistory::load_more)
+        {
+            self.load_agent_sessions(kind, cx);
+            cx.notify();
+        }
+    }
+
+    fn retry_transcript(&mut self, cx: &mut Context<Self>) {
+        if let Stage::Session {
+            item,
+            transcript: Transcript::Failed(_),
+            ..
+        } = &self.stage
+        {
+            self.open_session(item.clone(), cx);
+        }
     }
 
     pub fn open_session(&mut self, item: HistoryListItem, cx: &mut Context<Self>) {
@@ -321,7 +432,10 @@ impl Shell {
             let read = cx
                 .background_executor()
                 .spawn(async move {
-                    daemon::history_read(request.kind, request.thread_id).map(transcript::prepare)
+                    read_with_retry(|| {
+                        daemon::history_read(request.kind, request.thread_id.clone())
+                    })
+                    .map(transcript::prepare)
                 })
                 .await;
             this.update(cx, |shell, cx| {
@@ -386,11 +500,22 @@ impl Shell {
         &self,
         item: &HistoryListItem,
         transcript: &Transcript,
-        cx: &App,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let body = match transcript {
             Transcript::Loading => placeholder("正在读取会话记录…", cx).into_any_element(),
-            Transcript::Failed(message) => placeholder(message, cx).into_any_element(),
+            Transcript::Failed(message) => v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .child(div().text_sm().child(message.clone()))
+                .child(
+                    Button::new("retry-transcript")
+                        .label("重试读取")
+                        .on_click(cx.listener(|shell, _, _, cx| shell.retry_transcript(cx))),
+                )
+                .into_any_element(),
             Transcript::Ready(blocks) if blocks.is_empty() => {
                 placeholder("这个会话没有可显示的记录", cx).into_any_element()
             }
@@ -511,7 +636,7 @@ impl Render for Shell {
 mod tests {
     use super::{
         AgentHistory, ReadQueue, ReadRequest, Stage, Transcript, agent_label, empty_hint,
-        project_name, session_title,
+        project_name, read_with_retry, session_title,
     };
     use agentdeck_protocol::{AgentKind, HistoryListItem, ThreadId};
 
@@ -581,6 +706,95 @@ mod tests {
     }
 
     #[test]
+    fn read_retry_recovers_once_and_stops_on_persistent_failure() {
+        for failures in [0, 1, 2] {
+            let mut attempts = 0;
+            let result = read_with_retry(|| {
+                attempts += 1;
+                if attempts <= failures {
+                    Err(format!("attempt {attempts}"))
+                } else {
+                    Ok("loaded")
+                }
+            });
+            assert_eq!(attempts, (failures + 1).min(2));
+            if failures == 2 {
+                assert_eq!(result.unwrap_err(), "attempt 2");
+            } else {
+                assert_eq!(result.unwrap(), "loaded");
+            }
+        }
+    }
+
+    #[test]
+    fn failed_source_can_retry_without_restarting_a_pending_or_successful_read() {
+        let mut source = AgentHistory::new(AgentKind::Codex);
+        assert!(!source.retry());
+        source.complete(&mut Err("timeout".into()));
+        assert!(source.retry());
+        assert_eq!(source.status(), "读取中…");
+        assert!(source.error().is_none());
+        assert!(!source.retry());
+        source.complete(&mut Err("still unavailable".into()));
+        assert!(source.retry());
+        source.complete(&mut Ok(vec![item(None)]));
+        assert_eq!(source.status(), "已加载 1 个会话");
+        assert!(!source.retry());
+    }
+
+    #[test]
+    fn load_more_uses_lookahead_and_stops_at_end_or_protocol_limit() {
+        for total in [0, 49, 50, 51, 100, 101, 1_999, 2_000, 2_001] {
+            let mut source = AgentHistory::new(AgentKind::Codex);
+            let mut expected = 50;
+            loop {
+                assert_eq!(source.limit, expected);
+                assert!(!source.load_more());
+                let mut listed = Ok(vec![item(None); total.min(source.request_limit())]);
+                source.complete(&mut listed);
+                assert_eq!(listed.unwrap().len(), total.min(expected));
+                assert_eq!(source.loaded, total.min(expected));
+                if !source.can_load_more() {
+                    assert_eq!(source.loaded, total.min(2_000));
+                    assert_eq!(
+                        source.list_hint(),
+                        Some(if total >= 2_000 {
+                            "已达 2,000 条上限"
+                        } else {
+                            "已全部加载"
+                        })
+                    );
+                    assert!(!source.load_more());
+                    break;
+                }
+                assert!(source.list_hint().is_none());
+                assert!(source.load_more());
+                expected = (expected + 50).min(2_000);
+            }
+        }
+    }
+
+    #[test]
+    fn failed_load_more_keeps_count_and_retries_the_same_limit() {
+        let mut source = AgentHistory::new(AgentKind::Codex);
+        source.complete(&mut Ok(vec![item(None); 51]));
+        assert!(source.load_more());
+        assert_eq!(source.status(), "已加载 50 · 加载中…");
+        assert_eq!(source.request_limit(), 101);
+        assert!(!source.load_more());
+        source.complete(&mut Err("timeout".into()));
+        assert_eq!(source.status(), "已加载 50 · 加载失败");
+        assert_eq!(source.error(), Some("timeout"));
+        assert!(!source.load_more());
+        assert!(source.retry());
+        assert_eq!(source.request_limit(), 101);
+        assert!(!source.retry());
+        source.complete(&mut Ok(vec![item(None); 100]));
+        assert_eq!(source.status(), "已加载 100 个会话");
+        assert_eq!(source.list_hint(), Some("已全部加载"));
+    }
+
+    #[test]
     fn slow_read_only_runs_the_last_pending_selection() {
         let mut reads = ReadQueue::default();
         let first = reads.push(read_request(1, "A")).unwrap();
@@ -611,18 +825,18 @@ mod tests {
     fn each_agent_keeps_its_loading_failure_and_empty_result_distinct() {
         let mut fast = AgentHistory::new(AgentKind::ClaudeCode);
         let mut slow = AgentHistory::new(AgentKind::Codex);
-        fast.complete(&Ok(vec![item(None)]));
-        assert_eq!(fast.status(), "1 个会话");
+        fast.complete(&mut Ok(vec![item(None)]));
+        assert_eq!(fast.status(), "已加载 1 个会话");
         assert_eq!(slow.status(), "读取中…");
 
-        slow.complete(&Err("历史读取超时".into()));
+        slow.complete(&mut Err("历史读取超时".into()));
         assert_eq!(slow.status(), "读取失败");
         assert_eq!(slow.error(), Some("历史读取超时"));
-        assert_eq!(fast.status(), "1 个会话");
+        assert_eq!(fast.status(), "已加载 1 个会话");
         assert_eq!(fast.error(), None);
 
-        fast.complete(&Ok(vec![]));
-        assert_eq!(fast.status(), "0 个会话");
+        fast.complete(&mut Ok(vec![]));
+        assert_eq!(fast.status(), "已加载 0 个会话");
         assert_eq!(slow.error(), Some("历史读取超时"));
     }
 
@@ -632,13 +846,13 @@ mod tests {
             AgentHistory::new(AgentKind::Codex),
             AgentHistory::new(AgentKind::ClaudeCode),
         ];
-        agents[0].complete(&Err("历史读取超时".into()));
+        agents[0].complete(&mut Err("历史读取超时".into()));
         assert_eq!(empty_hint(&agents, 1, None), "正在读取会话…");
 
-        agents[1].complete(&Ok(vec![]));
+        agents[1].complete(&mut Ok(vec![]));
         assert_eq!(empty_hint(&agents, 0, None), "没有可显示的会话");
 
-        agents[1].complete(&Ok(vec![item(None)]));
+        agents[1].complete(&mut Ok(vec![item(None)]));
         assert_eq!(
             empty_hint(&agents, 0, None),
             "选择左侧会话查看记录，或试着输入任务"

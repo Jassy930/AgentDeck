@@ -61,9 +61,12 @@ pub fn render(
         .iter()
         .map(|agent| {
             (
+                agent.kind,
                 agent_label(agent.kind),
                 agent.status(),
                 agent.error().map(str::to_string),
+                agent.can_load_more(),
+                agent.list_hint(),
             )
         })
         .collect();
@@ -139,6 +142,13 @@ pub fn render(
                                 .text_color(cx.theme().sidebar_foreground.opacity(0.72))
                                 .child(text)
                         }))
+                        .when(shell.error.is_some(), |section| {
+                            section.child(
+                                Button::new("retry-connection").label("重试连接").on_click(
+                                    cx.listener(|shell, _, _, cx| shell.retry_connection(cx)),
+                                ),
+                            )
+                        })
                         .child(
                             v_flex()
                                 .id("session-list")
@@ -160,25 +170,61 @@ pub fn render(
                 .border_t_1()
                 .border_color(cx.theme().sidebar_border)
                 .child(section_label("本机 Agent", cx))
-                .children(agents.into_iter().map(|(name, status, error)| {
-                    v_flex()
-                        .px_2()
-                        .text_sm()
-                        .gap_1()
-                        .child(
-                            h_flex().justify_between().child(name).child(
+                .children(agents.into_iter().map(
+                    |(kind, name, status, error, can_load_more, list_hint)| {
+                        v_flex()
+                            .px_2()
+                            .text_sm()
+                            .gap_1()
+                            .child(
+                                v_flex().gap_1().child(name).child(
+                                    div()
+                                        .text_color(cx.theme().sidebar_foreground.opacity(0.72))
+                                        .child(status),
+                                ),
+                            )
+                            .when(can_load_more, |section| {
+                                section.child(
+                                    Button::new(SharedString::from(format!(
+                                        "load-more-{}",
+                                        kind.as_str()
+                                    )))
+                                    .label("加载更多")
+                                    .on_click(cx.listener(move |shell, _, _, cx| {
+                                        shell.load_more_agent(kind, cx)
+                                    })),
+                                )
+                            })
+                            .children(list_hint.map(|hint| {
                                 div()
+                                    .text_xs()
                                     .text_color(cx.theme().sidebar_foreground.opacity(0.72))
-                                    .child(status),
-                            ),
-                        )
-                        .children(error.map(|message| {
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().sidebar_foreground.opacity(0.72))
-                                .child(message)
-                        }))
-                })),
+                                    .child(hint)
+                            }))
+                            .children(error.map(|message| {
+                                v_flex()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().sidebar_foreground.opacity(0.72))
+                                            .child(message),
+                                    )
+                                    .child(
+                                        Button::new(SharedString::from(format!(
+                                            "retry-{}",
+                                            kind.as_str()
+                                        )))
+                                        .label("重试")
+                                        .on_click(
+                                            cx.listener(move |shell, _, _, cx| {
+                                                shell.retry_agent(kind, cx)
+                                            }),
+                                        ),
+                                    )
+                            }))
+                    },
+                )),
         )
 }
 

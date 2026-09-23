@@ -38,6 +38,7 @@ dependencies = [
  "agentdeck-protocol",
  "gpui",
  "gpui-component",
+ "libc",
  "serde_json",
 ]
 
