@@ -325,7 +325,7 @@ mod tests {
 
     #[test]
     fn pinned_version_comes_from_protocol_snapshot() {
-        assert_eq!(supported_codex_version(), "codex-cli 0.155.0-alpha.9.2");
+        assert_eq!(supported_codex_version(), "codex-cli 0.155.0-alpha.16");
     }
 
     #[cfg(unix)]

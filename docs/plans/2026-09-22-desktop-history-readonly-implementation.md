@@ -19,12 +19,22 @@
     需要长连接时再单独引入。
   - daemon 定位：`AGENTDECK_DAEMON_BIN`（必须是绝对可执行路径，不回退）→
     可执行文件同目录（`.app` bundle 内）→ `target/debug` / `target/release`。
+  - macOS 在 child `pre_exec` 中用 `sigemptyset` / `sigprocmask` 恢复空 signal mask，
+    让 daemon 的 Tokio child wait 能接收 `SIGCHLD`，不改变父 GCD worker 的 mask。
 - `agentdeck-desktop/src/shell.rs`：`Shell` 保存合并后的会话与各 agent 的加载结果；
   加载中、成功计数和失败原因分别保留，侧栏与空态共用状态文案。
   `Stage::Session` 持有 `HistoryListItem`、`Transcript`（Loading / Ready / Failed）与
   本次读取序号，切走后重开同一会话也只接受最新读取结果。加载顺序是先 `AgentList`，
   再按 agent 各发一次 `History::List`，谁先返回谁先进侧栏，慢的来源不挡快的。
+  各来源首批显示 50 条，查询时多取 1 条判断是否还有更多；“加载更多”将该来源的
+  显示目标增加 50 条，复用现有 `limit` 查询重读列表，成功后替换同来源条目以避免
+  重复，保留其他来源。加载中或失败时保留已有列表与计数；重试沿用失败请求的目标
+  数量。读完显示“已全部加载”，达到中立协议的每来源 2,000 条上限时明确提示。
   阻塞 IPC 全部走 `cx.background_executor()`。
+  `AgentList`、`History::List` 与 `History::Read` 失败后在后台等待 1 秒自动重试一次；
+  仍失败时分别提供 daemon 连接、来源列表与正文的重试按钮。加载期间不重复触发
+  同一请求；来源重试保留其他来源的列表，正文重试沿用 `ReadQueue` 与 `read_id`，
+  只接受当前会话的最新读取结果。
   会话读取最多执行一个，等待期间只保留最新待查会话；切回空态清空待查项，正在
   执行的读取仍由 daemon 按自身时限完成并清理。
 - `agentdeck-desktop/src/transcript.rs`：把中立 `AgentItem` 映射成「标签 + 正文」
@@ -36,11 +46,18 @@
 - **selfcheck 不连 daemon**。`Shell::new(window, connect_daemon, cx)` 由 `--selfcheck`
   传 `false`，否则隐藏窗口也会 spawn daemon，stderr 会多出 `Broken pipe`，污染
   「成功输出必须是单行 JSON」的门禁。
-- **侧栏每个 agent 只取 50 条**（`SIDEBAR_LIMIT`）。Codex 的 `thread/list` 按页聚合，
-  500 条实测约 27 秒、逼近 daemon 的历史超时；50 条把首屏延迟压回一页。
+- **侧栏每个 agent 首批显示 50 条，按需扩展 50 条**。沿用已有 `limit` 查询与
+  中立协议的 2,000 条上限，没有新增 IPC 字段或依赖。每次多查 1 条判断“加载更多”
+  是否可用，上限处停止扩展并明确提示。Codex 的 `thread/list` 按页聚合，500 条曾
+  实测约 27 秒、逼近 daemon 的历史超时；扩展加载仍受该预算约束，失败保留已有列表。
 - Codex 的候选查找使用异步版本探测，所有候选共享 5 秒探测预算，结束后终止独立
   进程组，并最多用 2 秒确认直接子进程已回收。history 从候选查找开始计入 28 秒
   工作预算，另预留 2 秒清理；超时与清理失败分别返回稳定 failure code。
+- **GPUI 的 macOS GCD worker 会屏蔽 `SIGCHLD`**，`std::process::Command` 会将 mask
+  传给 daemon，导致版本子进程已退出为 defunct，Tokio 仍等到 5 秒超时。2026-09-23
+  对照中，相同环境、cwd 和 stdin EOF 的历史 list 在普通父线程下 1.58 秒成功；
+  Python 父线程屏蔽 `SIGCHLD` 后，同一 daemon 在 5.02 秒返回版本探测超时。
+  修复放在桌面启动子进程的边界；自动重试用于失败后的恢复，不能消除继承的 signal mask。
 - **flex 滚动要 `min_h(0)`**。GPUI 用 taffy，flex item 默认按内容撑高，`overflow_y_scroll`
   单独用不会限制高度，长记录会顶穿底部 composer。transcript 和侧栏列表都加了
   `min_h(px(0.))`，会话区外层再加 `overflow_hidden` 兜底。
@@ -112,8 +129,8 @@ PR 评论修复后的验证：
   `agentdeckd/src/claude_code/history.rs` 的标题抽取问题，应在 daemon 侧修，不要在
   desktop 打补丁。
 - Codex 列表为空已定位为 provider 默认过滤，查询现在显式使用 `modelProviders=[]`。
-  正文已适配稳定分页接口，版本与官方 schema 同步升级至 `0.155.0-alpha.9.2`；
-  升级后的真实 lifecycle E2E 与桌面正文点击尚待验收，不能以旧版验收代替。
+  正文已适配稳定分页接口，版本与官方 schema 同步升级至 `0.155.0-alpha.16`；
+  桌面正文点击已在 2026-09-23 补齐验收；升级后的真实 lifecycle E2E 尚未重跑。
 - transcript 打开后停在顶部，没有自动滚到最新；同一 `toolUseId` 的 inProgress /
   completed 两条都会渲染。
 - 没有客户端侧超时，依赖 daemon 自己的历史硬超时（见 `daemon.rs` 的 `ponytail:` 注释）。
@@ -194,3 +211,50 @@ macOS 进程组存在性查询在组仅剩僵尸进程时可能返回 `EPERM`；
 进程组消失；该修复同时用于版本探测与 live session 的进程组退出确认。
 修复后的 88 项 Codex focused、完整离线门禁、CLI/desktop selfcheck、diagnostics report
 与真实 bundle verify 均通过。
+
+## 2026-09-23：桌面子进程信号与读取重试验收
+
+- 信号继承回归测试先复现失败，再验证 child 恢复 signal mask 后通过；20 项 desktop
+  单测、完整离线门禁、desktop selfcheck、绑定当前 checkout daemon 的 CLI selfcheck、
+  格式与文档检查均通过。真实 bundle verify 从无 daemon/data-dir/profile 覆盖的环境
+  启动 `dist/AgentDeck.app`，使用 bundle 内 daemon。
+- fake daemon 实窗验证了自动重试，以及“重试连接”、来源“重试”和正文“重试读取”
+  三个入口。连续双击没有重复请求，来源重试保留其他来源条目；请求日志确认同一
+  operation/source 没有重叠，requestId 唯一。
+- 切回真实 bundle 后，窗口显示 Codex 50 条、Claude Code 49 条；点击 Codex 会话
+  成功显示用户文本、助手文本和工具内容，补齐此前缺失的桌面正文点击证据。
+- 本次真实验证仅执行历史 list/read，未发送模型 prompt；升级后的完整 lifecycle E2E
+  仍未验收。
+
+## 2026-09-23：加载更多验收
+
+- 本轮仅改桌面加载状态、来源按钮及相关文档，保留此前信号与重试修复。
+  `cargo test --locked -p agentdeck-desktop` 的 22 项测试通过，覆盖恰好 50/100 条、
+  不足一批、2,000 条上限、失败保留计数及按相同目标重试。desktop selfcheck、
+  bundle verify、格式与文档检查通过。
+- fake daemon 的真实窗口验证了 Codex 50 → 加载失败 → 重试至 100 → 125 并显示
+  “已全部加载”；Claude Code 恰好 50 条时直接显示“已全部加载”。已有列表和选中正文
+  始终保留，滚动可见新增的第 125 条。请求日志确认连续双击未重复发起请求，失败
+  自动重试与手动重试均请求 101 条（显示 100 条），下一批才请求 151 条。
+- 最终切回无 daemon/data-dir/profile 覆盖的真实 bundle，Claude Code 返回 49 条。
+  本机 ChatGPT.app 自带 Codex 已变为 `0.155.0-alpha.16`，PATH 中仍为 `0.145.0`；
+  两者均不匹配项目固定的 `0.155.0-alpha.9.2`，窗口显示 `codex-version-unsupported`。
+  因此本轮真实 Codex 增量读取尚未验收，需另行完成版本适配；此前成功读取的回执
+  不代表当前安装环境仍匹配。本轮未发送模型 prompt。
+
+## 2026-09-23：Codex alpha.16 升级验收
+
+- 固定版本同步到本机 `codex-cli 0.155.0-alpha.16`，用该 executable 的官方
+  `app-server generate-json-schema` 在临时目录生成并核对快照。101 个稳定方法及
+  五个独立 schema 不变；聚合 schema 仅新增 `AppConfig.omit_tools_from` 和
+  `ToolExposureSurface`，当前历史与 lifecycle 使用的字段不变，无需调整生产翻译逻辑。
+  版本断言与 fake 数据同步，AgentDeck IPC 仍为 v4。
+- 88 项 Codex focused 测试、完整离线门禁（含 22 项 desktop 测试）、绑定当前 checkout
+  daemon 的 CLI selfcheck、diagnostics report、desktop selfcheck、真实 bundle verify、
+  格式与文档检查均通过。
+- 显式 `AGENTDECK_E2E=1` 的 CLI 真实 list 在约 2.9 秒返回 101 条，选取第 61 条
+  成功读回 4 轮 / 120 条目。重建后的真实窗口先显示 Codex 50 条、Claude Code 49 条，
+  再通过“加载更多”按钮（键盘激活）扩展到 Codex 100 条；点击 Codex 会话正文成功
+  显示，扩展列表后仍保留当前正文。
+- 本轮仅真实历史 list/read，未发送模型 prompt；alpha.16 的完整 lifecycle E2E
+  仍未验收。上述回执补齐上一节因版本不匹配而未完成的真实增量读取验证。
