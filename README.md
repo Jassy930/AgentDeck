@@ -34,6 +34,7 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
   模型、审批和沙箱显示暂不可用。
 - 透明标题栏下为红绿灯留出顶部空间，空态与会话态顶部均按系统偏好处理双击；
   打开窗口后 composer 默认聚焦。
+- 支持通过 `Command+Q` 或 AgentDeck 菜单中的“退出 AgentDeck”退出应用。
 - 提供 `--selfcheck`，验证 GPUI、Metal renderer、隐藏窗口和组件树初始化；该路径
   不连接 daemon，也不触碰本机 vendor 历史。
 - 开发者模式在右上角显示 FPS 与上一帧间隔：debug 构建（含 `build_and_run.sh`
