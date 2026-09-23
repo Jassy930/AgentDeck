@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use agentdeck_protocol::{AgentKind, HistoryListItem, MAX_HISTORY_LIST_LIMIT, ThreadId};
 use gpui::{
-    App, Context, Entity, IntoElement, ListAlignment, ListState, ParentElement, SharedString,
-    Window, div, prelude::*, px,
+    App, Context, Entity, FocusHandle, IntoElement, ListAlignment, ListState, ParentElement,
+    ScrollStrategy, SharedString, UniformListScrollHandle, Window, div, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme, InteractiveElementExt, StyledExt, button::Button, h_flex, input::InputState,
@@ -24,17 +24,6 @@ use crate::transcript;
 
 /// 首屏和每次扩展的显示条数；多读一条用于判断是否还有会话。
 const SIDEBAR_LIMIT: usize = 50;
-
-// 只在 background executor 上调用；短暂失败重试一次，持续失败交给用户处理。
-fn read_with_retry<T>(mut read: impl FnMut() -> daemon::Result<T>) -> daemon::Result<T> {
-    match read() {
-        Ok(value) => Ok(value),
-        Err(_) => {
-            std::thread::sleep(Duration::from_secs(1));
-            read()
-        }
-    }
-}
 
 /// 主区当前展示的形态。
 pub enum Stage {
@@ -301,6 +290,27 @@ impl FrameStats {
     }
 }
 
+fn sidebar_target(
+    sessions: &[HistoryListItem],
+    cursor: Option<&(AgentKind, ThreadId)>,
+    step: isize,
+) -> Option<usize> {
+    let last = sessions.len().checked_sub(1)?;
+    // 两个来源异步加载会重排列表，游标始终按会话身份定位。
+    let current = match cursor {
+        Some((kind, id)) => sessions
+            .iter()
+            .position(|item| item.agent_kind == *kind && item.thread_id == *id),
+        None => Some(0),
+    };
+    match current {
+        Some(index) => Some(index.saturating_add_signed(step).min(last)),
+        None if step == 0 => None,
+        None if step < 0 => Some(last),
+        None => Some(0),
+    }
+}
+
 pub struct Shell {
     stage: Stage,
     /// Some 表示开启开发者模式，右上角显示 FPS。
@@ -312,6 +322,9 @@ pub struct Shell {
     pub(crate) agents: Vec<AgentHistory>,
     /// 所有来源合并后的会话，按最近活动倒序。
     pub(crate) sessions: Vec<HistoryListItem>,
+    pub(crate) sidebar_focus: FocusHandle,
+    pub(crate) sidebar_scroll: UniformListScrollHandle,
+    sidebar_cursor: Option<(AgentKind, ThreadId)>,
     /// 尚未返回的 daemon 请求数；用于区分"还在加载"和"确实没有会话"。
     pub(crate) pending: usize,
     /// AgentList 的失败原因；各来源历史的错误由 AgentHistory 保留。
@@ -345,6 +358,9 @@ impl Shell {
             composer,
             agents: Vec::new(),
             sessions: Vec::new(),
+            sidebar_focus: cx.focus_handle(),
+            sidebar_scroll: UniformListScrollHandle::new(),
+            sidebar_cursor: None,
             pending: 0,
             error: None,
         };
@@ -373,7 +389,7 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             let agents = cx
                 .background_executor()
-                .spawn(async { read_with_retry(daemon::agent_list) })
+                .spawn(async { daemon::agent_list() })
                 .await;
             this.update(cx, |shell, cx| {
                 shell.pending -= 1;
@@ -402,7 +418,7 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             let mut listed = cx
                 .background_executor()
-                .spawn(async move { read_with_retry(|| daemon::history_list(kind, limit)) })
+                .spawn(async move { daemon::history_list(kind, limit) })
                 .await;
             this.update(cx, |shell, cx| {
                 shell.pending -= 1;
@@ -465,8 +481,31 @@ impl Shell {
         }
     }
 
+    pub fn sidebar_cursor_index(&self) -> Option<usize> {
+        sidebar_target(&self.sessions, self.sidebar_cursor.as_ref(), 0)
+    }
+
+    pub fn navigate_sidebar(&mut self, step: isize, cx: &mut Context<Self>) {
+        if let Some(index) = sidebar_target(&self.sessions, self.sidebar_cursor.as_ref(), step) {
+            let item = &self.sessions[index];
+            self.sidebar_cursor = Some((item.agent_kind, item.thread_id.clone()));
+            self.sidebar_scroll
+                .scroll_to_item(index, ScrollStrategy::Top);
+            cx.notify();
+        }
+    }
+
+    pub fn open_sidebar_cursor(&mut self, cx: &mut Context<Self>) {
+        if let Some(index) = self.sidebar_cursor_index() {
+            self.sidebar_scroll
+                .scroll_to_item(index, ScrollStrategy::Top);
+            self.open_session(self.sessions[index].clone(), cx);
+        }
+    }
+
     pub fn open_session(&mut self, item: HistoryListItem, cx: &mut Context<Self>) {
         let (kind, thread_id) = (item.agent_kind, item.thread_id.clone());
+        self.sidebar_cursor = Some((kind, thread_id.clone()));
         self.next_read_id += 1;
         let read_id = self.next_read_id;
         self.stage = Stage::Session {
@@ -492,10 +531,7 @@ impl Shell {
             let read = cx
                 .background_executor()
                 .spawn(async move {
-                    read_with_retry(|| {
-                        daemon::history_read(request.kind, request.thread_id.clone())
-                    })
-                    .map(transcript::prepare)
+                    daemon::history_read(request.kind, request.thread_id).map(transcript::prepare)
                 })
                 .await;
             this.update(cx, |shell, cx| {
@@ -734,9 +770,10 @@ impl Render for Shell {
 
 #[cfg(test)]
 mod tests {
+    use super::sidebar_target;
     use super::{
         AgentHistory, FrameStats, ReadQueue, ReadRequest, Stage, Transcript, agent_label,
-        empty_hint, project_name, read_with_retry, session_title, transcript_list,
+        empty_hint, project_name, session_title, transcript_list,
     };
     use agentdeck_protocol::{AgentKind, HistoryListItem, ThreadId};
 
@@ -767,6 +804,35 @@ mod tests {
 
         stage = Stage::Empty;
         assert_eq!((stage.thread_id(), stage.project_name()), (None, None));
+    }
+
+    #[test]
+    fn sidebar_navigation_tracks_identity_across_reordering_and_clamps_at_the_ends() {
+        let first = item(Some("A"));
+        let mut second = item(Some("B"));
+        second.thread_id = ThreadId("second-thread".into());
+        let mut other_agent = second.clone();
+        other_agent.agent_kind = AgentKind::Codex;
+        let cursor = (second.agent_kind, second.thread_id.clone());
+        let mut sessions = vec![first, second, other_agent];
+
+        assert_eq!(sidebar_target(&[], None, 1), None);
+        assert_eq!(sidebar_target(&sessions, None, 0), Some(0));
+        assert_eq!(sidebar_target(&sessions, None, -1), Some(0));
+        assert_eq!(sidebar_target(&sessions, None, 1), Some(1));
+        assert_eq!(sidebar_target(&sessions, Some(&cursor), -1), Some(0));
+        assert_eq!(sidebar_target(&sessions, Some(&cursor), 1), Some(2));
+
+        sessions.swap(0, 1);
+        assert_eq!(sidebar_target(&sessions, Some(&cursor), 0), Some(0));
+        assert_eq!(sidebar_target(&sessions, Some(&cursor), -1), Some(0));
+        sessions.swap(0, 2);
+        assert_eq!(sidebar_target(&sessions, Some(&cursor), 1), Some(2));
+
+        sessions.pop();
+        assert_eq!(sidebar_target(&sessions, Some(&cursor), 0), None);
+        assert_eq!(sidebar_target(&sessions, Some(&cursor), 1), Some(0));
+        assert_eq!(sidebar_target(&sessions, Some(&cursor), -1), Some(1));
     }
 
     #[test]
@@ -806,27 +872,6 @@ mod tests {
             id,
             kind: AgentKind::Codex,
             thread_id: ThreadId(thread.into()),
-        }
-    }
-
-    #[test]
-    fn read_retry_recovers_once_and_stops_on_persistent_failure() {
-        for failures in [0, 1, 2] {
-            let mut attempts = 0;
-            let result = read_with_retry(|| {
-                attempts += 1;
-                if attempts <= failures {
-                    Err(format!("attempt {attempts}"))
-                } else {
-                    Ok("loaded")
-                }
-            });
-            assert_eq!(attempts, (failures + 1).min(2));
-            if failures == 2 {
-                assert_eq!(result.unwrap_err(), "attempt 2");
-            } else {
-                assert_eq!(result.unwrap(), "loaded");
-            }
         }
     }
 

@@ -8,7 +8,7 @@
 //!
 //! 所有函数都是阻塞的，调用方必须放到 GPUI 的 background executor 上。
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -145,7 +145,10 @@ fn reply_payload(
     expected: &str,
     expected_request_id: Option<&str>,
 ) -> Option<Result<serde_json::Value>> {
-    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let value: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(value) => value,
+        Err(source) => return Some(Err(format!("解析 agentdeckd 回复失败：{source}"))),
+    };
     if value.get("reply")?.as_str()? != expected {
         return None;
     }
@@ -172,51 +175,105 @@ fn reply_payload(
 ///
 /// ponytail: 依赖 daemon 有界的版本探测和历史查询；若需处理整个 daemon 无响应，
 /// 再增加客户端 deadline，当前阻塞读取仍会占用一个 background 线程。
-fn round_trip(
+fn round_trip(command: &ClientCommand, expected_reply: &str) -> Result<serde_json::Value> {
+    let path = locate_daemon()?;
+    retry_transport(|| round_trip_once(&path, command, expected_reply))
+}
+
+fn retry_transport(
+    mut read: impl FnMut() -> io::Result<Result<serde_json::Value>>,
+) -> Result<serde_json::Value> {
+    let result = match read() {
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::Interrupted
+                    | io::ErrorKind::WouldBlock
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::NotConnected
+                    | io::ErrorKind::UnexpectedEof
+            ) =>
+        {
+            std::thread::sleep(Duration::from_secs(1));
+            read()
+        }
+        result => result,
+    };
+    result.map_err(|error| error.to_string())?
+}
+
+// 外层保留可重试的传输错误；内层的 daemon 回复和解析错误必须直接交给用户。
+fn round_trip_once(
+    path: &Path,
     command: &ClientCommand,
     expected_reply: &str,
-    expected_request_id: Option<&str>,
-) -> Result<serde_json::Value> {
-    let path = locate_daemon()?;
-    let child = daemon_command(&path)
-        .spawn()
-        .map_err(|source| format!("启动 agentdeckd 失败：{source}"))?;
+) -> io::Result<Result<serde_json::Value>> {
+    let command = match command {
+        ClientCommand::History(request) => {
+            ClientCommand::History(request.clone().with_request_id(next_history_request_id()))
+        }
+        command => command.clone(),
+    };
+    let expected_request_id = match &command {
+        ClientCommand::History(request) => request.request_id(),
+        _ => None,
+    };
+    let line = match serde_json::to_string(&command) {
+        Ok(line) => line,
+        Err(source) => return Ok(Err(format!("序列化命令失败：{source}"))),
+    };
+    let child = daemon_command(path).spawn().map_err(|source| {
+        io::Error::new(source.kind(), format!("启动 agentdeckd 失败：{source}"))
+    })?;
     let mut child = DaemonChild(child);
 
-    let line =
-        serde_json::to_string(command).map_err(|source| format!("序列化命令失败：{source}"))?;
     {
         // 写完即关闭 stdin：daemon 在回完这条 reply 后自行退出。
-        let mut stdin = child.0.stdin.take().ok_or("agentdeckd stdin 不可用")?;
+        let mut stdin = child
+            .0
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("agentdeckd stdin 不可用"))?;
         stdin
             .write_all(line.as_bytes())
             .and_then(|()| stdin.write_all(b"\n"))
-            .map_err(|source| format!("写入 agentdeckd 失败：{source}"))?;
+            .map_err(|source| {
+                io::Error::new(source.kind(), format!("写入 agentdeckd 失败：{source}"))
+            })?;
     }
 
-    let stdout = child.0.stdout.take().ok_or("agentdeckd stdout 不可用")?;
+    let stdout = child
+        .0
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("agentdeckd stdout 不可用"))?;
     for line in BufReader::new(stdout).lines() {
-        let line = line.map_err(|source| format!("读取 agentdeckd 失败：{source}"))?;
+        let line = line.map_err(|source| {
+            io::Error::new(source.kind(), format!("读取 agentdeckd 失败：{source}"))
+        })?;
         if let Some(payload) = reply_payload(&line, expected_reply, expected_request_id) {
             // 回复 flush 后 daemon 还要排空 writer 并记录 daemon_stop。
             let finished = child.finish(Duration::from_secs(2));
-            return payload.and_then(|value| finished.map(|()| value));
+            return Ok(payload.and_then(|value| finished.map(|()| value)));
         }
     }
-    Err(format!("agentdeckd 在返回 {expected_reply} 前退出"))
+    Err(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        format!("agentdeckd 在返回 {expected_reply} 前退出"),
+    ))
 }
 
 /// daemon 当前注册的 agent；侧栏据此逐个查询历史，不硬编码 vendor。
 pub fn agent_list() -> Result<Vec<AgentKind>> {
-    let mut reply = round_trip(&ClientCommand::AgentList, "agentList", None)?;
+    let mut reply = round_trip(&ClientCommand::AgentList, "agentList")?;
     let agents = reply["agents"].take();
     serde_json::from_value(agents).map_err(|source| format!("解析 agent 列表失败：{source}"))
 }
 
 fn history(request: HistoryRequest) -> Result<HistoryResponse> {
-    let request_id = next_history_request_id();
-    let command = ClientCommand::History(request.with_request_id(&request_id));
-    let mut reply = round_trip(&command, "history", Some(&request_id))?;
+    let mut reply = round_trip(&ClientCommand::History(request), "history")?;
     let response = reply["response"].take();
     serde_json::from_value(response).map_err(|source| format!("解析历史响应失败：{source}"))
 }
@@ -247,6 +304,77 @@ pub fn history_read(agent_kind: AgentKind, thread_id: ThreadId) -> Result<Vec<Hi
 #[cfg(test)]
 mod tests {
     use super::{next_history_request_id, reply_payload};
+
+    #[test]
+    fn transport_retry_recovers_once_and_stops_after_two_attempts() {
+        for failures in 0..=2 {
+            let mut calls = 0;
+            let result = super::retry_transport(|| {
+                calls += 1;
+                if calls <= failures {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "daemon 提前退出",
+                    ))
+                } else {
+                    Ok(Ok(
+                        serde_json::json!({ "reply": "agentList", "agents": [] }),
+                    ))
+                }
+            });
+            assert_eq!(calls, (failures + 1).min(2));
+            assert_eq!(result.is_ok(), failures < 2);
+        }
+    }
+
+    #[test]
+    fn daemon_errors_and_invalid_responses_are_not_retried() {
+        for code in [
+            "history-request-timeout",
+            "codex-history-timeout",
+            "codex-version-timeout",
+            "codex-version-unsupported",
+            "codex-history-decode-failed",
+        ] {
+            let raw = serde_json::json!({
+                "reply": "history",
+                "requestId": "current",
+                "error": { "code": code, "message": "读取失败" }
+            })
+            .to_string();
+            let mut calls = 0;
+            let result = super::retry_transport(|| {
+                calls += 1;
+                Ok(reply_payload(&raw, "history", Some("current")).unwrap())
+            });
+            assert_eq!(calls, 1);
+            assert_eq!(result.unwrap_err(), format!("读取失败（{code}）"));
+        }
+
+        let mut calls = 0;
+        let result = super::retry_transport(|| {
+            calls += 1;
+            Ok(reply_payload("{", "history", Some("current")).unwrap())
+        });
+        assert_eq!(calls, 1);
+        assert!(result.unwrap_err().contains("解析 agentdeckd 回复失败"));
+
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            let mut calls = 0;
+            let result = super::retry_transport(|| {
+                calls += 1;
+                Err(std::io::Error::new(kind, "不可重试"))
+            });
+            assert_eq!(calls, 1);
+            assert_eq!(result.unwrap_err(), "不可重试");
+        }
+    }
 
     #[cfg(unix)]
     #[test]

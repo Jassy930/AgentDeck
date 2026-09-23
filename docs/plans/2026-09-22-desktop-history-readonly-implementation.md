@@ -21,6 +21,8 @@
     可执行文件同目录（`.app` bundle 内）→ `target/debug` / `target/release`。
   - macOS 在 child `pre_exec` 中用 `sigemptyset` / `sigprocmask` 恢复空 signal mask，
     让 daemon 的 Tokio child wait 能接收 `SIGCHLD`，不改变父 GCD worker 的 mask。
+  - 自动重试仅覆盖尚未取得回复的可恢复传输失败，等待 1 秒后再试一次；daemon 的明确
+    错误回复（包括超时）、定位/配置错误与响应解析错误直接返回，不重复历史查询。
 - `agentdeck-desktop/src/shell.rs`：`Shell` 保存合并后的会话与各 agent 的加载结果；
   加载中、成功计数和失败原因分别保留，侧栏与空态共用状态文案。
   `Stage::Session` 持有 `HistoryListItem`、`Transcript`（Loading / Ready / Failed）与
@@ -31,12 +33,14 @@
   重复，保留其他来源。加载中或失败时保留已有列表与计数；重试沿用失败请求的目标
   数量。读完显示“已全部加载”，达到中立协议的每来源 2,000 条上限时明确提示。
   阻塞 IPC 全部走 `cx.background_executor()`。
-  `AgentList`、`History::List` 与 `History::Read` 失败后在后台等待 1 秒自动重试一次；
-  仍失败时分别提供 daemon 连接、来源列表与正文的重试按钮。加载期间不重复触发
+  `AgentList`、`History::List` 与 `History::Read` 共用客户端的传输重试；
+  失败时分别提供 daemon 连接、来源列表与正文的重试按钮。加载期间不重复触发
   同一请求；来源重试保留其他来源的列表，正文重试沿用 `ReadQueue` 与 `read_id`，
   只接受当前会话的最新读取结果。
   会话读取最多执行一个，等待期间只保留最新待查会话；切回空态清空待查项，正在
   执行的读取仍由 daemon 按自身时限完成并清理。
+  侧栏虚拟列表作为一个 Tab 停靠点，上下键移动键盘游标并滚入视野，Return 读取
+  目标会话；游标按来源与 threadId 定位，列表扩展或重新排序不会改变目标身份。
 - `agentdeck-desktop/src/transcript.rs`：把中立 `AgentItem` 映射成「标签 + 正文」
   文本块，单条正文上限 2000 字符；后台读取完成时转换一次，渲染复用最终文本。
 - `script/build_and_run.sh`：bundle 内同时装配 `agentdeckd`，`--verify` 额外断言它存在。
@@ -258,6 +262,19 @@ macOS 进程组存在性查询在组仅剩僵尸进程时可能返回 `EPERM`；
   显示，扩展列表后仍保留当前正文。
 - 本轮仅真实历史 list/read，未发送模型 prompt；alpha.16 的完整 lifecycle E2E
   仍未验收。上述回执补齐上一节因版本不匹配而未完成的真实增量读取验证。
+
+## 2026-09-23：PR #20 重试与键盘导航修复验收
+
+- 25 项 desktop 测试、完整离线门禁、desktop selfcheck、绑定当前 checkout daemon 的
+  CLI selfcheck、格式与文档检查通过。bundle verify 使用显式 fake daemon，验证实际
+  bundle 路径、内置 daemon、图标及 minOS；未运行真实 vendor E2E。
+- fake daemon 实窗中，历史超时只产生一次请求并显示错误与手动重试按钮；提前 EOF
+  在约 1 秒后自动重试一次并成功，两次尝试的 requestId 不同。
+- Tab 进入侧栏后，连续向下导航能越过原先可见的 000–014，滚动并打开 020、025。
+  Tab / Shift-Tab 可离开或重新进入列表；加载更多扩展到 100 条，当前正文保留。
+  会话态 composer 普通键入与上下键未触发侧栏导航。
+- release 实窗分别验证 `AGENTDECK_DEBUG=0` 不显示 FPS、`=1` 显示 FPS；debug
+  bundle 保持默认显示。没有复测 120 FPS 性能或 vendor lifecycle。
 
 ## 2026-09-23：桌面端 Codex 优先
 

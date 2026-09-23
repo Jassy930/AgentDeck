@@ -42,17 +42,49 @@ pub fn render(
         "session-list",
         shell.sessions.len(),
         cx.processor(move |shell, range: Range<usize>, window, cx| {
+            let cursor = shell
+                .sidebar_focus
+                .is_focused(window)
+                .then(|| shell.sidebar_cursor_index())
+                .flatten();
+            let start = range.start;
             shell.sessions[range]
                 .iter()
-                .map(|item| {
+                .enumerate()
+                .map(|(offset, item)| {
                     let is_selected = selected.as_ref().map(SharedString::as_ref)
                         == Some(item.thread_id.0.as_str());
                     // 行间距用 padding：uniform_list 按首行测量行高。
-                    div()
-                        .pb_1()
-                        .child(session_row(item, is_selected, window, cx))
+                    div().pb_1().child(session_row(
+                        item,
+                        is_selected,
+                        cursor == Some(start + offset),
+                        window,
+                        cx,
+                    ))
                 })
                 .collect()
+        }),
+    )
+    .track_scroll(shell.sidebar_scroll.clone())
+    .track_focus(
+        &shell
+            .sidebar_focus
+            .clone()
+            .tab_stop(!shell.sessions.is_empty()),
+    )
+    .on_key_down(
+        cx.listener(|shell, event: &gpui::KeyDownEvent, window, cx| {
+            if !shell.sidebar_focus.is_focused(window) || event.keystroke.modifiers.modified() {
+                return;
+            }
+            match event.keystroke.key.as_str() {
+                "up" => shell.navigate_sidebar(-1, cx),
+                "down" => shell.navigate_sidebar(1, cx),
+                "enter" => shell.open_sidebar_cursor(cx),
+                _ => return,
+            }
+            cx.stop_propagation();
         }),
     );
 
@@ -273,6 +305,7 @@ fn section_label(text: &str, cx: &Context<Shell>) -> impl IntoElement {
 fn session_row(
     item: &HistoryListItem,
     selected: bool,
+    keyboard_cursor: bool,
     window: &Window,
     cx: &mut Context<Shell>,
 ) -> impl IntoElement + use<> {
@@ -284,6 +317,10 @@ fn session_row(
     Button::new(id)
         .ghost()
         .selected(selected)
+        .tab_stop(false)
+        .when(keyboard_cursor, |button| {
+            button.border_color(cx.theme().ring)
+        })
         .w_full()
         .justify_start()
         .child(
@@ -295,5 +332,8 @@ fn session_row(
                 .text_ellipsis()
                 .child(session_title(item)),
         )
-        .on_click(cx.listener(move |shell, _, _, cx| shell.open_session(payload.clone(), cx)))
+        .on_click(cx.listener(move |shell, _, window, cx| {
+            shell.sidebar_focus.focus(window);
+            shell.open_session(payload.clone(), cx);
+        }))
 }
