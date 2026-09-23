@@ -10,6 +10,7 @@
 //! every method offered by the pinned vendor binary. Issue #3 establishes the
 //! lifecycle and cumulative assistant streaming only.
 
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Stdio;
@@ -86,43 +87,55 @@ where
             let stdout = String::from_utf8(stdout).map_err(|_| {
                 probe_error(
                     "codex-version-probe-failed",
-                    "Codex CLI version output is not valid UTF-8",
+                    format!("Codex 版本输出不是有效 UTF-8；路径：{}", binary.display()),
                 )
             })?;
             let actual = stdout.trim();
-            let valid_version = actual.strip_prefix("codex-cli ").is_some_and(|version| {
-                let core = version.split(['-', '+']).next().unwrap_or("");
-                core.split('.').count() == 3
-                    && core
-                        .split('.')
-                        .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
-                    && version
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
-            });
-            if !valid_version {
-                return Err(probe_error(
-                    "codex-version-probe-failed",
-                    "Codex CLI version output is invalid",
-                ));
-            }
+            let actual_version = actual
+                .strip_prefix("codex-cli ")
+                .and_then(|version| semver::Version::parse(version).ok())
+                .ok_or_else(|| {
+                    probe_error(
+                        "codex-version-probe-failed",
+                        format!("Codex 版本输出格式无效；路径：{}", binary.display()),
+                    )
+                })?;
             let expected = supported_codex_version();
             if actual == expected {
                 Ok(actual.to_string())
             } else {
+                let expected_version = semver::Version::parse(
+                    expected
+                        .strip_prefix("codex-cli ")
+                        .expect("pinned Codex prefix"),
+                )
+                .expect("pinned Codex semver");
+                let guidance = match actual_version.cmp_precedence(&expected_version) {
+                    Ordering::Less => "请升级 Codex 桌面端或系统 CLI 到已验证版本。",
+                    Ordering::Greater => {
+                        "请升级 AgentDeck，或将 AGENTDECK_CODEX_BIN 指向已验证版本。"
+                    }
+                    Ordering::Equal => "请使用与已验证版本完全匹配的 Codex 构建。",
+                };
                 Err(probe_error(
                     "codex-version-unsupported",
-                    format!("unsupported Codex CLI version; expected {expected}"),
+                    format!(
+                        "AgentDeck 尚未验证此 Codex 版本；实际：{actual}；已验证：{expected}；路径：{}。{guidance}",
+                        binary.display()
+                    ),
                 ))
             }
         }
-        Ok((_status, _stdout)) => Err(probe_error(
+        Ok((status, _stdout)) => Err(probe_error(
             "codex-version-probe-failed",
-            "Codex CLI version probe exited unsuccessfully",
+            format!(
+                "Codex 版本探测失败，退出码：{status}；路径：{}",
+                binary.display()
+            ),
         )),
         Err(_error) => Err(probe_error(
             "codex-version-probe-failed",
-            "Codex CLI version probe could not be executed",
+            format!("无法执行 Codex 版本探测；路径：{}", binary.display()),
         )),
     }
 }
@@ -298,29 +311,66 @@ mod tests {
     #[test]
     fn probe_codex_version_rejects_injected_spawn_failure() {
         let error = probe_codex_version_with_command(Path::new("/fake/codex"), |_| {
-            Err("missing".to_string())
+            Err("private launch details".to_string())
         })
         .unwrap_err();
         assert_eq!(error.code, "codex-version-probe-failed");
+        assert!(error.message.contains("/fake/codex"));
+        assert!(!error.message.contains("private launch details"));
     }
 
     #[test]
-    fn probe_codex_version_rejects_nonzero_empty_malformed_and_mismatch() {
+    fn probe_codex_version_rejects_nonzero_empty_and_malformed_without_raw_output() {
         for result in [
-            Ok((1, supported_codex_version().as_bytes().to_vec())),
+            Ok((1, b"PRIVATE_VENDOR_OUTPUT".to_vec())),
             Ok((0, b" \n".to_vec())),
             Ok((0, vec![0xff])),
-            Ok((0, b"not a version\n".to_vec())),
+            Ok((0, b"PRIVATE_VENDOR_OUTPUT\n".to_vec())),
+            Ok((0, b"codex-cli 01.155.0\n".to_vec())),
+            Ok((0, b"codex-cli 0.155.0-alpha..16\n".to_vec())),
+            Ok((0, b"codex-cli 0.155.0-alpha.016\n".to_vec())),
+            Ok((0, b"codex-cli 0.155.0-\n".to_vec())),
+            Ok((0, b"codex-cli 0.155.0+\n".to_vec())),
         ] {
             let error =
                 probe_codex_version_with_command(Path::new("/fake/codex"), |_| result).unwrap_err();
             assert_eq!(error.code, "codex-version-probe-failed");
+            assert!(error.message.contains("/fake/codex"));
+            assert!(!error.message.contains("PRIVATE_VENDOR_OUTPUT"));
+            assert!(!error.message.contains("codex-cli "));
         }
-        let error = probe_codex_version_with_command(Path::new("/fake/codex"), |_| {
-            Ok((0, b"codex-cli 0.146.0\n".to_vec()))
-        })
-        .unwrap_err();
-        assert_eq!(error.code, "codex-version-unsupported");
+    }
+
+    #[test]
+    fn probe_codex_version_mismatch_explains_version_path_and_next_step() {
+        for (actual, guidance) in [
+            ("codex-cli 0.146.0", "请升级 Codex 桌面端或系统 CLI"),
+            (
+                "codex-cli 0.155.0-alpha.9.2",
+                "请升级 Codex 桌面端或系统 CLI",
+            ),
+            ("codex-cli 0.155.0-alpha.100", "请升级 AgentDeck"),
+            ("codex-cli 0.155.0", "请升级 AgentDeck"),
+            (
+                "codex-cli 0.155.0-alpha.16+local",
+                "请使用与已验证版本完全匹配的 Codex 构建",
+            ),
+        ] {
+            let error = probe_codex_version_with_command(Path::new("/fake/codex"), |_| {
+                Ok((0, format!("{actual}\n").into_bytes()))
+            })
+            .unwrap_err();
+            assert_eq!(error.code, "codex-version-unsupported");
+            for detail in [
+                "尚未验证",
+                actual,
+                supported_codex_version(),
+                "/fake/codex",
+                guidance,
+            ] {
+                assert!(error.message.contains(detail), "{}", error.message);
+            }
+        }
     }
 
     #[test]

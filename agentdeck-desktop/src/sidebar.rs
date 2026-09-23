@@ -215,6 +215,14 @@ pub fn render(
                                     .gap_1()
                                     .child(
                                         div()
+                                            .id(SharedString::from(format!(
+                                                "error-{}",
+                                                kind.as_str()
+                                            )))
+                                            .w_full()
+                                            .min_w(px(0.))
+                                            .max_h(px(96.))
+                                            .overflow_y_scroll()
                                             .text_xs()
                                             .text_color(cx.theme().sidebar_foreground.opacity(0.72))
                                             .child(message),

@@ -93,12 +93,22 @@ gpui-component = "=0.5.1"
 `Cargo.lock` 锁定；不要在没有验证的情况下追 Git main。
 
 Codex 程序版本固定为 `codex-cli 0.155.0-alpha.16`，完整版本写在
-`protocol/CODEX_VERSION.txt`。daemon 依次异步探测 PATH 和常见安装位置，只跳过成功
-读出但不匹配的版本；执行失败、非法输出、超时或清理失败立即报错。
-使用首个精确匹配的 executable；macOS 候选包括
-`/Applications/ChatGPT.app/Contents/Resources/codex`。版本探测与 app-server 启动使用
+`protocol/CODEX_VERSION.txt`。macOS 自动查找优先探测桌面端的
+`/Applications/ChatGPT.app/Contents/Resources/codex`，其次探测 PATH 和常见 CLI
+安装位置。跳过不存在或版本不匹配的候选，使用首个精确匹配的 executable；
+执行失败、非法输出、超时或清理失败立即报错。版本探测与 app-server 启动使用
 同一个规范化绝对路径，不要求替换 Homebrew 的旧安装。精确版本门禁用于让适配器与
 该版本官方生成的 app-server schema 保持一致；AgentDeck 自身 IPC 仍为 v4。
+
+需要指定某一份运行时时，可设置 `AGENTDECK_CODEX_BIN` 为 Codex 可执行文件的绝对
+路径；设置后只使用该路径，错误时不自动回退。离线测试也通过这个入口绑定假程序。
+AgentDeck 当前复用本机安装，不自带 Codex。
+
+所有候选均不匹配时，提示实际版本、路径、已验证版本和处理方式：旧版提示升级
+Codex，新版提示升级 AgentDeck 或指定已验证的 Codex。版本不匹配只表示尚未验证，
+不等于已确认协议不兼容。历史 RPC/解码失败保留方法名、错误码和实际运行时信息；
+无法识别的条目显示“暂不支持的内容”，其余内容仍可阅读。桌面长错误可滚动查看，
+修复运行时后可直接点击重试。
 
 ## 构建与运行
 

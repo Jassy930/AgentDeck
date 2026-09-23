@@ -357,7 +357,7 @@ impl AgentRouter {
             failed_sources.sort_by_key(|(kind, _)| *kind);
             let failures = failed_sources
                 .iter()
-                .map(|(kind, error)| format!("{}={}", kind.as_str(), error.code))
+                .map(|(kind, error)| format!("{}={}: {}", kind.as_str(), error.code, error.message))
                 .chain(task_failures)
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -631,10 +631,16 @@ mod tests {
         .expect_err("all timed-out sources must produce one aggregate error");
 
         assert_eq!(error.code, "history-all-sources-failed");
-        assert_eq!(
-            error.message,
-            "all registered history sources failed (codex=history-source-timeout, \
-             claude_code=history-source-timeout)"
+        assert!(error.message.contains("codex=history-source-timeout:"));
+        assert!(
+            error
+                .message
+                .contains("claude_code=history-source-timeout:")
+        );
+        assert!(
+            error
+                .message
+                .contains("history source codex exceeded the 20ms router deadline")
         );
     }
 

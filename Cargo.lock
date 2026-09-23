@@ -58,6 +58,7 @@ dependencies = [
  "agentdeck-protocol",
  "async-trait",
  "criterion",
+ "semver",
  "serde",
  "serde_json",
  "tokio",

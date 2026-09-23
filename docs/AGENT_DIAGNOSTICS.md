@@ -128,13 +128,20 @@ agentdeck history list --agent claude-code --limit 20
 逐页读回结果，不能改用摘要或空列表掩盖失败。桌面 selfcheck 和 fake bundle 验证
 均不能证明真实正文可读。
 
-daemon 会依次异步探测 PATH 与常见安装位置，只跳过成功读出但不匹配的版本，选择完整版本精确
-匹配 `protocol/CODEX_VERSION.txt` 的首个 executable。macOS 候选包含
-`/Applications/ChatGPT.app/Contents/Resources/codex`，因此 shell 中的 `codex --version`
+macOS daemon 优先探测桌面端的 `/Applications/ChatGPT.app/Contents/Resources/codex`，
+其次探测 PATH 与常见 CLI 安装位置。跳过不存在或版本不匹配的候选，选择完整版本精确
+匹配 `protocol/CODEX_VERSION.txt` 的首个 executable。因此 shell 中的 `codex --version`
 可能仍显示 Homebrew 的 0.145.0，不能据此认定 daemon 选错版本。probe 与 spawn 使用
 同一规范化绝对路径。执行失败、非法输出、超时或清理失败立即返回，不再尝试其他候选。
 所有候选共享 5 秒探测预算，历史请求的候选查找与 RPC 共享 28 秒工作预算，另预留
 2 秒清理。App 更新后若不再提供固定版本，需要安装匹配版本或同步升级协议。
+若设置 `AGENTDECK_CODEX_BIN`，只使用指定的绝对路径，不执行自动候选查找；路径无效
+返回 `codex-version-probe-failed`，版本不匹配返回 `codex-version-unsupported`，均不回退。
+版本不匹配提示会保留每个已探测候选的规范化路径、实际版本与已验证版本，按版本
+先后提示升级 Codex 或 AgentDeck；这是“尚未验证”的精确版本门禁，不是协议不兼容
+的证明。未找到任何文件时明确提示安装或指定路径。历史 RPC/解码失败会附实际使用的
+路径与版本；`-32601` 明确提示方法不支持，其他 RPC 错误也可能来自配置或历史数据，
+不能一概归因为版本。桌面错误文本支持滚动，重试按钮保持可见。
 
 CLI 与桌面 client 都为每次历史请求生成唯一 `requestId`。daemon 无论成功还是失败
 都在对应的 history admin 终态回复中原样回显。客户端只消费严格匹配当前
@@ -143,7 +150,7 @@ CLI 与桌面 client 都为每次历史请求生成唯一 `requestId`。daemon �
 
 | code | 含义 | 下一步 |
 | --- | --- | --- |
-| `codex-version-unsupported` | daemon 探测候选后没有找到完整版本精确匹配 `protocol/CODEX_VERSION.txt` 的 executable | 核对 PATH 和常见安装位置中各 executable 的 `--version`，包括 macOS App 自带路径；修复安装/路径，或安装固定版本后重启 App |
+| `codex-version-unsupported` | 未找到 Codex，或已探测候选均不是 AgentDeck 已验证的完整版本；提示包含实际版本和路径 | 旧版升级 Codex；新版升级 AgentDeck 或用 `AGENTDECK_CODEX_BIN` 指定已验证版本；未安装则先安装，完成后重试 |
 | `codex-version-probe-failed` | 已存在的候选无法执行、`--version` 非零退出或输出不是合法版本 | 检查该 executable 或 launcher 的权限、退出码及版本输出；修复此候选后重试，不会回退到其他系统安装 |
 | `codex-version-timeout` | 所有候选共享的 5 秒探测预算耗尽；探测会终止并回收独立进程组，清理预算另为 2 秒 | 检查所定位 executable 或 launcher 是否挂起；不能将它视为版本不匹配或合法空历史 |
 | `codex-spawn-failed` | 已定位 `codex`，但无法启动 `codex app-server`，或子进程标准管道不可用 | 使用实际匹配版本的 executable 运行 `app-server --help`；结合错误中的系统原因检查可执行权限、隔离属性和启动环境 |
@@ -153,7 +160,7 @@ CLI 与桌面 client 都为每次历史请求生成唯一 `requestId`。daemon �
 | `codex-history-pagination-stalled` | 列表或正文分页返回了未推进的游标 | 本次读取失败；核对固定版本的分页接口，不能把已读页面当完整结果 |
 | `history-no-sources` | router 中没有注册任何历史来源 | 运行 `agentdeck selfcheck` 和 `agentdeck agent list`，确认 App 使用的是当前打包 daemon 且 adapter 已注册 |
 | `history-source-timeout` | 跨 agent list 中单一来源超过 router 的 30 秒独立 deadline；若另一来源成功，router 会保留其结果并完成 best-effort 回复 | 用带 `--agent` 的 list 命令单独探测慢来源；检查对应 vendor CLI 或 app-server 是否挂起 |
-| `history-all-sources-failed` | 已注册的所有来源都失败；错误消息会列出各来源及其底层 failure code | 分别运行两条带 `--agent` 的 list 命令，按各自底层 code 修复；该错误不能按“历史为空”处理 |
+| `history-all-sources-failed` | 已注册的所有来源都失败；错误消息保留各来源的底层 failure code 与完整说明 | 分别运行两条带 `--agent` 的 list 命令，按各自底层 code 修复；该错误不能按“历史为空”处理 |
 | `history-request-timeout` | 包含双来源合并在内的完整历史请求超过 daemon 的总 deadline | 分别运行两条带 `--agent` 的 list 命令定位慢来源；该请求已被 daemon 终止，不会在下一次刷新中产生迟到 reply |
 
 跨 agent list 是 best-effort：每个来源有独立的 30 秒 deadline；只要至少一个来源
@@ -167,8 +174,9 @@ CLI 与桌面 client 都为每次历史请求生成唯一 `requestId`。daemon �
 
 未知 adapter item 必须在 daemon 侧中立化为 `raw`，并继续进入 run record。
 `rawKind` 只保留最长 64 字节的安全方法/类型标识，`rawPayload` 固定为
-`[vendor payload withheld]`，不携带 vendor 原始 JSON。GPUI 尚未接入 runtime，
-当前通过 CLI、测试和 record 排查。
+`[vendor payload withheld]`，不携带 vendor 原始 JSON。GPUI 历史正文对 raw 显示
+“暂不支持的内容”、类型与检查更新提示，不显示占位 payload，其余条目仍可阅读。
+GPUI 尚未接入会话 runtime，该路径仍通过 CLI、测试和 record 排查。
 
 daemon 写入失败等非致命问题会发出 `warning` 事件。当前选中的 runtime 应显示
 自己的 warning；没有选中 runtime 时才回退显示 legacy session warning。

@@ -368,11 +368,17 @@ mod tests {
 
     #[test]
     fn reply_payload_surfaces_daemon_errors_with_their_code() {
-        let failed = r#"{"reply":"history","requestId":"current","error":{"code":"codex-history-timeout","message":"超时"}}"#;
-        let payload = reply_payload(failed, "history", Some("current")).expect("matching reply");
+        let message = "Codex 版本尚未验证\n路径：/Applications/ChatGPT.app/Contents/Resources/codex\n实际：codex-cli 0.154.0\n支持：codex-cli 0.155.0-alpha.16\n请检查 AgentDeck 更新，或指定受支持的 Codex 路径后重试";
+        let failed = serde_json::json!({
+            "reply": "history",
+            "requestId": "current",
+            "error": { "code": "codex-version-unsupported", "message": message },
+        })
+        .to_string();
+        let payload = reply_payload(&failed, "history", Some("current")).expect("matching reply");
         assert_eq!(
             payload.expect_err("error reply"),
-            "超时（codex-history-timeout）"
+            format!("{message}（codex-version-unsupported）")
         );
     }
 }

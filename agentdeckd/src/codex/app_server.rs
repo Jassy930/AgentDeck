@@ -52,7 +52,7 @@ pub(crate) struct CodexBinary {
 impl CodexBinary {
     pub(crate) async fn resolve(cancel: &mut watch::Receiver<bool>) -> Result<Self, ProtocolError> {
         Self::resolve_candidates(
-            codex_candidates(),
+            codex_candidates(std::env::var_os("AGENTDECK_CODEX_BIN").map(PathBuf::from))?,
             Instant::now() + VERSION_PROBE_TIMEOUT,
             cancel,
         )
@@ -65,6 +65,7 @@ impl CodexBinary {
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<Self, ProtocolError> {
         let mut checked = Vec::new();
+        let mut mismatches = Vec::new();
         for candidate in candidates {
             check_probe_deadline(deadline, cancel)?;
             let Some(path) = canonical_executable(&candidate) else {
@@ -79,14 +80,27 @@ impl CodexBinary {
                     check_probe_deadline(deadline, cancel)?;
                     return Ok(Self { path, version });
                 }
-                Err(error) if error.code == "codex-version-unsupported" => continue,
-                Err(error) => return Err(error),
+                Err(error) if error.code == "codex-version-unsupported" => {
+                    mismatches.push(error.message);
+                }
+                Err(mut error) => {
+                    let path = path.display().to_string();
+                    if !error.message.contains(&path) {
+                        error.message = format!("{}\n探测路径：{path}", error.message);
+                    }
+                    return Err(error);
+                }
             }
         }
-        Err(unsupported_version_error(format!(
-            "no matching Codex CLI found on PATH or common locations; expected {}",
-            supported_codex_version()
-        )))
+        let message = if mismatches.is_empty() {
+            format!(
+                "未找到 Codex 运行时。请安装 Codex 桌面端或 CLI（已验证版本：{}），或用 AGENTDECK_CODEX_BIN 指定可执行文件的绝对路径，然后重试。",
+                supported_codex_version()
+            )
+        } else {
+            mismatches.join("\n\n")
+        };
+        Err(unsupported_version_error(message))
     }
 
     /// Resolve and validate an explicitly injected executable. Production
@@ -222,10 +236,24 @@ pub(super) async fn join_stderr_drain(
     }
 }
 
-/// Find `codex` candidates even when a macOS GUI process inherited a
-/// stripped PATH.
-fn codex_candidates() -> Vec<PathBuf> {
+/// Prefer the desktop runtime; explicit paths also keep CLI fixtures isolated
+/// from installed desktop apps that cannot be shadowed through PATH.
+fn codex_candidates(explicit: Option<PathBuf>) -> Result<Vec<PathBuf>, ProtocolError> {
+    if let Some(path) = explicit {
+        if !path.is_absolute() || !path.is_file() {
+            return Err(ProtocolError {
+                code: "codex-version-probe-failed".into(),
+                message: "AGENTDECK_CODEX_BIN 必须指向已存在的 Codex 可执行文件的绝对路径".into(),
+                diagnostic_ref: None,
+            });
+        }
+        return Ok(vec![path]);
+    }
     let mut candidates = Vec::new();
+    #[cfg(target_os = "macos")]
+    candidates.push(PathBuf::from(
+        "/Applications/ChatGPT.app/Contents/Resources/codex",
+    ));
     if let Some(path) = std::env::var_os("PATH") {
         candidates.extend(std::env::split_paths(&path).map(|directory| directory.join("codex")));
     }
@@ -240,11 +268,7 @@ fn codex_candidates() -> Vec<PathBuf> {
         candidates.push(home.join(".local/bin/codex"));
         candidates.push(home.join(".bun/bin/codex"));
     }
-    #[cfg(target_os = "macos")]
-    candidates.push(PathBuf::from(
-        "/Applications/ChatGPT.app/Contents/Resources/codex",
-    ));
-    candidates
+    Ok(candidates)
 }
 
 fn canonical_executable(candidate: &Path) -> Option<PathBuf> {
@@ -481,16 +505,20 @@ pub(super) async fn request_response(
             };
             if frame.get("id").and_then(Value::as_u64) == Some(id) {
                 if let Some(error) = frame.get("error").filter(|value| !value.is_null()) {
-                    let code = error
-                        .get("code")
-                        .and_then(Value::as_i64)
+                    let vendor_code = error.get("code").and_then(Value::as_i64);
+                    let code = vendor_code
                         .map(|code| format!(" (code {code})"))
                         .unwrap_or_default();
+                    let hint = if vendor_code == Some(-32601) {
+                        "当前 Codex 不支持此方法；请更新 AgentDeck 并核对其支持的 Codex 版本。"
+                    } else {
+                        "请检查 Codex 配置与历史数据；也可能存在协议不兼容，请核对 AgentDeck 更新。"
+                    };
                     return Err(ProtocolError {
                         code: "codex-protocol-error".into(),
                         // The vendor-provided message is intentionally not
                         // forwarded because it may embed a token.
-                        message: format!("codex {method} returned a protocol error{code}"),
+                        message: format!("Codex {method} 请求失败{code}。{hint}"),
                         diagnostic_ref: None,
                     });
                 }
@@ -505,6 +533,7 @@ pub(super) async fn request_response(
 /// A bounded, sequential app-server connection for history and other
 /// request/response-only operations.
 pub(super) struct ShortLivedAppServer {
+    binary: CodexBinary,
     child: Option<Child>,
     stdin: ChildStdin,
     reader: BufReader<ChildStdout>,
@@ -538,6 +567,7 @@ impl ShortLivedAppServer {
         })?;
         let (stderr_tail, stderr_drain) = drain_child_stderr(&mut child)?;
         Ok(Self {
+            binary: binary.clone(),
             child: Some(child),
             stdin,
             reader: BufReader::new(stdout),
@@ -591,7 +621,13 @@ impl ShortLivedAppServer {
         .map_err(map_short_lived_error)
     }
 
-    pub(super) fn enrich_error(&self, error: ProtocolError) -> ProtocolError {
+    pub(super) fn enrich_error(&self, mut error: ProtocolError) -> ProtocolError {
+        error.message = format!(
+            "{}\nCodex：{}\n路径：{}",
+            error.message,
+            self.binary.version(),
+            self.binary.path().display()
+        );
         self.stderr_tail.enrich_error(error)
     }
 
@@ -860,12 +896,51 @@ done
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn resolution_prefers_desktop_and_explicit_paths_exclude_other_candidates() {
+        let desktop = FakeCodex::new(supported_codex_version());
+        let cli = FakeCodex::new(supported_codex_version());
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let binary = CodexBinary::resolve_candidates(
+            [desktop.executable.clone(), cli.executable.clone()],
+            Instant::now() + VERSION_PROBE_TIMEOUT,
+            &mut cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(binary.path(), desktop.executable.canonicalize().unwrap());
+        assert!(!cli.log.exists(), "matching desktop must take priority");
+
+        assert_eq!(
+            codex_candidates(Some(cli.executable.clone())).unwrap(),
+            vec![cli.executable.clone()]
+        );
+        for invalid in [
+            PathBuf::new(),
+            PathBuf::from("codex"),
+            cli.root.join("missing-codex"),
+            cli.root.clone(),
+        ] {
+            assert_eq!(
+                codex_candidates(Some(invalid)).unwrap_err().code,
+                "codex-version-probe-failed"
+            );
+        }
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            codex_candidates(None).unwrap()[0],
+            PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/codex")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn resolution_skips_duplicate_and_unsupported_candidates() {
         let old = FakeCodex::new("codex-cli 0.145.0");
         let supported = FakeCodex::new(supported_codex_version());
         let (_cancel_tx, mut cancel) = watch::channel(false);
         let binary = CodexBinary::resolve_candidates(
             [
+                old.root.join("missing-desktop-codex"),
                 old.executable.clone(),
                 old.executable.clone(),
                 supported.executable.clone(),
@@ -880,7 +955,7 @@ done
         assert_eq!(supported.calls().len(), 1);
 
         let error = CodexBinary::resolve_candidates(
-            [old.executable.clone()],
+            [old.executable.clone(), old.executable.clone()],
             Instant::now() + VERSION_PROBE_TIMEOUT,
             &mut cancel,
         )
@@ -888,6 +963,38 @@ done
         .unwrap_err();
         assert_eq!(error.code, "codex-version-unsupported");
         assert!(error.message.contains(supported_codex_version()));
+        assert!(error.message.contains("codex-cli 0.145.0"));
+        assert!(error.message.contains("升级 Codex"));
+        let old_path = old.executable.canonicalize().unwrap();
+        assert_eq!(
+            error
+                .message
+                .matches(&old_path.display().to_string())
+                .count(),
+            1
+        );
+
+        let newer = FakeCodex::new("codex-cli 99.0.0");
+        let error = CodexBinary::resolve_candidates(
+            [old.executable.clone(), newer.executable.clone()],
+            Instant::now() + VERSION_PROBE_TIMEOUT,
+            &mut cancel,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.message.contains("codex-cli 0.145.0"));
+        assert!(error.message.contains("codex-cli 99.0.0"));
+        assert!(error.message.contains("升级 AgentDeck"));
+
+        let error = CodexBinary::resolve_candidates(
+            [old.root.join("missing")],
+            Instant::now() + VERSION_PROBE_TIMEOUT,
+            &mut cancel,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.message.contains("未找到 Codex 运行时"));
+        assert!(error.message.contains("AGENTDECK_CODEX_BIN"));
     }
 
     #[cfg(unix)]
@@ -910,6 +1017,16 @@ done
             .await
             .unwrap_err();
             assert_eq!(error.code, "codex-version-probe-failed");
+            assert!(
+                error.message.contains(
+                    &failed
+                        .executable
+                        .canonicalize()
+                        .unwrap()
+                        .display()
+                        .to_string()
+                )
+            );
             assert!(
                 !supported.log.exists(),
                 "failed probe must not fall through"

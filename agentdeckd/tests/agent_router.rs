@@ -150,8 +150,8 @@ async fn cross_agent_history_aggregates_all_failures_in_stable_agent_order() {
     assert_eq!(error.code, "history-all-sources-failed");
     assert_eq!(
         error.message,
-        "all registered history sources failed (codex=codex-history-down, \
-         claude_code=cc-history-down)"
+        "all registered history sources failed (codex=codex-history-down: codex history failed, \
+         claude_code=cc-history-down: claude_code history failed)"
     );
 }
 
