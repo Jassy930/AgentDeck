@@ -28,7 +28,10 @@ fn open_main_window(cx: &mut App, show: bool) {
         },
         |window, cx| {
             // 隐藏窗口只出现在 selfcheck 路径；那里不连接 daemon。
-            let view = cx.new(|cx| Shell::new(window, show, cx));
+            // 开发者模式（FPS 叠加层）在 debug 构建默认开启，release 用 AGENTDECK_DEBUG=1 打开。
+            let dev_mode =
+                show && (cfg!(debug_assertions) || env::var_os("AGENTDECK_DEBUG").is_some());
+            let view = cx.new(|cx| Shell::new(window, show, dev_mode, cx));
             cx.new(|cx| Root::new(view, window, cx))
         },
     )

@@ -3,7 +3,8 @@
 //! 会话列表和会话记录都来自本机 `agentdeckd`，通过 `daemon` 模块按 agent 拉取；
 //! 本期只读历史，不启动 session、不发 turn。
 
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use agentdeck_protocol::{AgentKind, HistoryListItem, MAX_HISTORY_LIST_LIMIT, ThreadId};
 use gpui::{
@@ -262,8 +263,33 @@ fn empty_hint(agents: &[AgentHistory], pending: usize, error: Option<&str>) -> S
     .to_string()
 }
 
+/// 开发者模式的帧统计：只记录真实发生的绘制，GPUI 按需重绘，空闲时帧率本来就低。
+#[derive(Default)]
+pub(crate) struct FrameStats {
+    frames: VecDeque<Instant>,
+}
+
+impl FrameStats {
+    /// 记录一帧，返回最近 1s 的帧数和与上一帧的间隔（毫秒）。
+    fn record(&mut self, now: Instant) -> (usize, f64) {
+        let interval = self
+            .frames
+            .back()
+            .map_or(0.0, |last| now.duration_since(*last).as_secs_f64() * 1000.0);
+        self.frames.push_back(now);
+        while let Some(first) = self.frames.front()
+            && now.duration_since(*first) >= Duration::from_secs(1)
+        {
+            self.frames.pop_front();
+        }
+        (self.frames.len(), interval)
+    }
+}
+
 pub struct Shell {
     stage: Stage,
+    /// Some 表示开启开发者模式，右上角显示 FPS。
+    frame_stats: Option<FrameStats>,
     next_read_id: u64,
     reads: ReadQueue,
     composer: Entity<InputState>,
@@ -280,7 +306,12 @@ pub struct Shell {
 impl Shell {
     /// `connect_daemon=false` 用于 selfcheck：只验证 GPUI 起得来，不碰 daemon 和
     /// 本机 vendor 历史。
-    pub fn new(window: &mut Window, connect_daemon: bool, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        window: &mut Window,
+        connect_daemon: bool,
+        dev_mode: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let composer = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("描述任务，预览输入效果…")
@@ -293,6 +324,7 @@ impl Shell {
 
         let mut shell = Self {
             stage: Stage::Empty,
+            frame_stats: dev_mode.then(FrameStats::default),
             next_read_id: 0,
             reads: ReadQueue::default(),
             composer,
@@ -303,6 +335,18 @@ impl Shell {
         };
         if connect_daemon {
             shell.load_sessions(cx);
+        }
+        if dev_mode {
+            // 空闲时每秒补一帧，让 FPS 数字回落到真实值而不是停在最后一次交互。
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(Duration::from_secs(1)).await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
         }
         shell
     }
@@ -623,19 +667,37 @@ impl Render for Shell {
             .thread_id()
             .map(|thread_id| thread_id.0.clone().into());
 
+        let fps = self.frame_stats.as_mut().map(|stats| {
+            let (fps, interval) = stats.record(Instant::now());
+            div()
+                .absolute()
+                .top_2()
+                .right_2()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(gpui::black().opacity(0.6))
+                .text_color(gpui::white())
+                .text_xs()
+                .font_family("Menlo")
+                .child(format!("{fps} fps · {interval:.1} ms"))
+        });
+
         h_flex()
+            .relative()
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(sidebar::render(self, selected, window, cx))
             .child(main)
+            .children(fps)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentHistory, ReadQueue, ReadRequest, Stage, Transcript, agent_label, empty_hint,
+        AgentHistory, FrameStats, ReadQueue, ReadRequest, Stage, Transcript, agent_label, empty_hint,
         project_name, read_with_retry, session_title,
     };
     use agentdeck_protocol::{AgentKind, HistoryListItem, ThreadId};
@@ -875,5 +937,18 @@ mod tests {
     fn agent_label_comes_from_the_neutral_wire_name() {
         assert_eq!(agent_label(AgentKind::Codex), "Codex");
         assert_eq!(agent_label(AgentKind::ClaudeCode), "Claude Code");
+    }
+
+    #[test]
+    fn frame_stats_counts_frames_within_last_second() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut stats = FrameStats::default();
+        assert_eq!(stats.record(start), (1, 0.0));
+        let (fps, interval) = stats.record(start + Duration::from_millis(500));
+        assert_eq!(fps, 2);
+        assert!((interval - 500.0).abs() < 1e-6);
+        // 第一帧已超出 1s 窗口。
+        assert_eq!(stats.record(start + Duration::from_millis(1200)).0, 2);
     }
 }
