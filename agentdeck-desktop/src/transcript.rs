@@ -2,8 +2,10 @@
 //!
 //! 本期只做纯文本。Markdown、diff 高亮、工具折叠和 streaming 都属于后续切片。
 
+use std::rc::Rc;
+
 use agentdeck_protocol::{AgentItem, HistoryTurn};
-use gpui::{App, IntoElement, ParentElement, SharedString, div, prelude::*, px};
+use gpui::{IntoElement, ListState, ParentElement, SharedString, div, list, prelude::*, px};
 use gpui_component::{ActiveTheme, StyledExt, v_flex};
 
 /// 单条内容的展示上限；历史里的工具结果可能是几十 KB 的整页文本。
@@ -92,39 +94,36 @@ pub fn prepare(turns: Vec<HistoryTurn>) -> Vec<TextBlock> {
         .collect()
 }
 
-pub fn render(blocks: &[TextBlock], cx: &App) -> impl IntoElement + use<> {
-    let blocks: Vec<_> = blocks
-        .iter()
-        .map(|(label, body)| {
-            v_flex()
-                .gap_1()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_semibold()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(*label),
-                )
-                .child(div().text_sm().child(body.clone()))
-        })
-        .collect();
-
+/// 只渲染可见区域附近的块：长会话有几百块，逐帧全量排版会拖慢滚动。
+pub fn render(blocks: Rc<[TextBlock]>, state: ListState) -> impl IntoElement {
     // min_h(0)：flex item 默认按内容撑高，不加这行长记录会顶穿底部 composer。
-    div()
-        .id("transcript")
-        .flex_1()
-        .min_h(px(0.))
-        .overflow_y_scroll()
-        .child(
-            v_flex()
-                .w_full()
-                .max_w(px(760.))
-                .mx_auto()
-                .px_6()
-                .py_4()
-                .gap_5()
-                .children(blocks),
-        )
+    list(state, move |ix, _, cx| {
+        let (label, body) = &blocks[ix];
+        div()
+            .w_full()
+            .child(
+                v_flex()
+                    .w_full()
+                    .max_w(px(760.))
+                    .mx_auto()
+                    .px_6()
+                    .when(ix == 0, |block| block.pt_4())
+                    .pb_5()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(*label),
+                    )
+                    .child(div().text_sm().child(body.clone())),
+            )
+            .into_any_element()
+    })
+    .flex_1()
+    .min_h(px(0.))
+    .w_full()
 }
 
 #[cfg(test)]

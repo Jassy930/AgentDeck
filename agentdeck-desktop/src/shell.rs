@@ -4,11 +4,13 @@
 //! 本期只读历史，不启动 session、不发 turn。
 
 use std::collections::VecDeque;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use agentdeck_protocol::{AgentKind, HistoryListItem, MAX_HISTORY_LIST_LIMIT, ThreadId};
 use gpui::{
-    App, Context, Entity, IntoElement, ParentElement, SharedString, Window, div, prelude::*, px,
+    App, Context, Entity, IntoElement, ListAlignment, ListState, ParentElement, SharedString,
+    Window, div, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme, InteractiveElementExt, StyledExt, button::Button, h_flex, input::InputState,
@@ -42,14 +44,23 @@ pub enum Stage {
     Session {
         item: HistoryListItem,
         transcript: Transcript,
+        /// 会话记录的虚拟列表状态（滚动位置、已测量的块高）；每次读取完成时重置。
+        list: ListState,
         read_id: u64,
     },
+}
+
+/// 虚拟列表在可见区上下额外排版的高度，避免快速滚动时出现空白。
+const TRANSCRIPT_OVERDRAW: f32 = 1000.;
+
+fn transcript_list() -> ListState {
+    ListState::new(0, ListAlignment::Top, px(TRANSCRIPT_OVERDRAW))
 }
 
 /// 选中会话的记录加载状态。
 pub enum Transcript {
     Loading,
-    Ready(Vec<transcript::TextBlock>),
+    Ready(Rc<[transcript::TextBlock]>),
     Failed(String),
 }
 
@@ -61,13 +72,17 @@ impl Stage {
     ) -> bool {
         if let Stage::Session {
             transcript,
+            list,
             read_id,
             ..
         } = self
             && *read_id == completed_id
         {
             *transcript = match read {
-                Ok(turns) => Transcript::Ready(turns),
+                Ok(turns) => {
+                    list.reset(turns.len());
+                    Transcript::Ready(turns.into())
+                }
                 Err(message) => Transcript::Failed(message),
             };
             return true;
@@ -457,6 +472,7 @@ impl Shell {
         self.stage = Stage::Session {
             item,
             transcript: Transcript::Loading,
+            list: transcript_list(),
             read_id,
         };
         cx.notify();
@@ -544,6 +560,7 @@ impl Shell {
         &self,
         item: &HistoryListItem,
         transcript: &Transcript,
+        list: &ListState,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let body = match transcript {
@@ -563,7 +580,9 @@ impl Shell {
             Transcript::Ready(blocks) if blocks.is_empty() => {
                 placeholder("这个会话没有可显示的记录", cx).into_any_element()
             }
-            Transcript::Ready(blocks) => transcript::render(blocks, cx).into_any_element(),
+            Transcript::Ready(blocks) => {
+                transcript::render(blocks.clone(), list.clone()).into_any_element()
+            }
         };
 
         v_flex()
@@ -655,12 +674,17 @@ fn connector_card(name: &str, status: &str, cx: &App) -> impl IntoElement + use<
 }
 
 impl Render for Shell {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let main = match &self.stage {
             Stage::Empty => self.render_empty(cx).into_any_element(),
             Stage::Session {
-                item, transcript, ..
-            } => self.render_session(item, transcript, cx).into_any_element(),
+                item,
+                transcript,
+                list,
+                ..
+            } => self
+                .render_session(item, transcript, list, cx)
+                .into_any_element(),
         };
         let selected: Option<SharedString> = self
             .stage
@@ -688,7 +712,7 @@ impl Render for Shell {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .child(sidebar::render(self, selected, window, cx))
+            .child(sidebar::render(self, selected, cx))
             .child(main)
             .children(fps)
     }
@@ -697,8 +721,8 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentHistory, FrameStats, ReadQueue, ReadRequest, Stage, Transcript, agent_label, empty_hint,
-        project_name, read_with_retry, session_title,
+        AgentHistory, FrameStats, ReadQueue, ReadRequest, Stage, Transcript, agent_label,
+        empty_hint, project_name, read_with_retry, session_title, transcript_list,
     };
     use agentdeck_protocol::{AgentKind, HistoryListItem, ThreadId};
 
@@ -721,6 +745,7 @@ mod tests {
         stage = Stage::Session {
             item: item(Some("修复记录收尾")),
             transcript: Transcript::Loading,
+            list: transcript_list(),
             read_id: 1,
         };
         assert_eq!(stage.thread_id().map(|id| id.0.as_str()), Some("7330efa6"));
@@ -738,6 +763,7 @@ mod tests {
         let mut stage = Stage::Session {
             item: other,
             transcript: Transcript::Loading,
+            list: transcript_list(),
             read_id: 2,
         };
         assert!(!stage.finish_read(1, Ok(vec![])));
@@ -745,6 +771,7 @@ mod tests {
         stage = Stage::Session {
             item: first,
             transcript: Transcript::Loading,
+            list: transcript_list(),
             read_id: 3,
         };
         assert!(stage.finish_read(3, Ok(vec![("助手", "新的 A 记录".into())])));
@@ -752,7 +779,8 @@ mod tests {
         assert!(!stage.finish_read(1, Ok(vec![])));
         assert!(matches!(
             &stage,
-            Stage::Session { transcript: Transcript::Ready(turns), .. } if turns.len() == 1
+            Stage::Session { transcript: Transcript::Ready(turns), list, .. }
+                if turns.len() == 1 && list.item_count() == 1
         ));
 
         stage = Stage::Empty;

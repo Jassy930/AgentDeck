@@ -2,12 +2,13 @@
 //!
 //! 会话条目来自 daemon 的跨 agent 历史列表，点击即读取该会话记录。
 
+use std::ops::Range;
 use std::sync::{Arc, LazyLock};
 
 use agentdeck_protocol::HistoryListItem;
 use gpui::{
     Context, Image, ImageFormat, IntoElement, ParentElement, SharedString, Window, div, img,
-    prelude::*, px,
+    prelude::*, px, uniform_list,
 };
 use gpui_component::{
     ActiveTheme, Disableable, InteractiveElementExt, Selectable, StyledExt,
@@ -33,15 +34,27 @@ pub const TRAFFIC_LIGHT_INSET: f32 = 44.;
 pub fn render(
     shell: &Shell,
     selected: Option<SharedString>,
-    window: &Window,
     cx: &mut Context<Shell>,
 ) -> impl IntoElement + use<> {
-    let mut sessions = Vec::with_capacity(shell.sessions.len());
-    for item in &shell.sessions {
-        let is_selected =
-            selected.as_ref().map(SharedString::as_ref) == Some(item.thread_id.0.as_str());
-        sessions.push(session_row(item, is_selected, window, cx));
-    }
+    // 行高一致，用 uniform_list 只渲染可见行；行内容在布局阶段回到 Shell 取。
+    let is_new_session = selected.is_none();
+    let sessions = uniform_list(
+        "session-list",
+        shell.sessions.len(),
+        cx.processor(move |shell, range: Range<usize>, window, cx| {
+            shell.sessions[range]
+                .iter()
+                .map(|item| {
+                    let is_selected = selected.as_ref().map(SharedString::as_ref)
+                        == Some(item.thread_id.0.as_str());
+                    // 行间距用 padding：uniform_list 按首行测量行高。
+                    div()
+                        .pb_1()
+                        .child(session_row(item, is_selected, window, cx))
+                })
+                .collect()
+        }),
+    );
 
     let status = if shell.pending > 0 {
         Some("正在读取会话…".to_string())
@@ -114,7 +127,7 @@ pub fn render(
                         .child(
                             Button::new("new-session")
                                 .ghost()
-                                .selected(selected.is_none())
+                                .selected(is_new_session)
                                 .w_full()
                                 .justify_start()
                                 .label("新建会话")
@@ -150,14 +163,10 @@ pub fn render(
                             )
                         })
                         .child(
-                            v_flex()
-                                .id("session-list")
+                            sessions
                                 .flex_1()
                                 // 同 transcript：flex item 需要 min_h(0) 才会真正滚动。
-                                .min_h(px(0.))
-                                .gap_1()
-                                .overflow_y_scroll()
-                                .children(sessions),
+                                .min_h(px(0.)),
                         ),
                 ),
         )
