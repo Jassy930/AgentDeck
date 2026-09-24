@@ -1,6 +1,7 @@
 //! 会话记录渲染：把中立 `AgentItem` 转成只读块。
 //!
 //! 对话消息直接展开；命令、思考、工具、变更等过程块默认折叠成一行摘要，点击展开。
+//! 连续两个以上的过程块再合成一组，默认只显示一行组摘要。
 //! 助手、思考与过程块正文按 Markdown 渲染（代码走围栏高亮）；用户消息仍是纯文本。
 
 use std::collections::HashSet;
@@ -14,8 +15,13 @@ use gpui::{
     list, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme, Sizable, StyledExt, button::Button, button::ButtonVariants, h_flex,
-    text::TextView, v_flex,
+    ActiveTheme, Sizable, StyledExt,
+    button::Button,
+    button::ButtonVariants,
+    h_flex,
+    scroll::{Scrollbar, ScrollbarShow},
+    text::TextView,
+    v_flex,
 };
 
 /// 单条内容的展示上限；历史里的工具结果可能是几十 KB 的整页文本。
@@ -38,6 +44,8 @@ pub struct Block {
     pub markdown: bool,
     /// 命令失败等需要醒目提示的状态。
     pub failed: bool,
+    /// 所在连续过程块组的 `(起始下标, 块数)`；连续两个以上过程块才成组。
+    pub group: Option<(usize, usize)>,
 }
 
 impl Block {
@@ -55,6 +63,7 @@ impl Block {
             body: body.into(),
             markdown,
             failed: false,
+            group: None,
         }
     }
 
@@ -66,6 +75,7 @@ impl Block {
             body: markdown_fallback::images_as_links(body.trim()).into(),
             markdown: true,
             failed: false,
+            group: None,
         }
     }
 
@@ -294,12 +304,81 @@ fn truncate(body: &str) -> String {
 }
 
 pub fn prepare(turns: Vec<HistoryTurn>) -> Vec<Block> {
-    turns
+    let mut blocks: Vec<Block> = turns
         .into_iter()
         .flat_map(|turn| turn.items)
         .map(|item| describe(&item))
         .filter(|block| !block.is_empty())
-        .collect()
+        .collect();
+    let mut start = 0;
+    while start < blocks.len() {
+        let len = blocks[start..]
+            .iter()
+            .take_while(|block| block.summary.is_some())
+            .count();
+        if len >= 2 {
+            for block in &mut blocks[start..start + len] {
+                block.group = Some((start, len));
+            }
+        }
+        start += len.max(1);
+    }
+    blocks
+}
+
+/// 组摘要：步数加按首次出现顺序的各类计数，如“5 步 · 命令 3 · 思考 2”；另返回失败数。
+fn group_summary(blocks: &[Block]) -> (String, usize) {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for block in blocks {
+        match counts.iter_mut().find(|(label, _)| *label == block.label) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((block.label, 1)),
+        }
+    }
+    let parts: Vec<String> = std::iter::once(format!("{} 步", blocks.len()))
+        .chain(counts.iter().map(|(label, n)| format!("{label} {n}")))
+        .collect();
+    let failed = blocks.iter().filter(|block| block.failed).count();
+    (parts.join(" · "), failed)
+}
+
+/// 折叠行：箭头、标签、截断摘要和可选状态；`failed` 标红状态，`failed_summary` 同时标红摘要。
+#[allow(clippy::too_many_arguments)]
+fn summary_row(
+    id: ElementId,
+    arrow: &'static str,
+    label: &'static str,
+    summary: SharedString,
+    status: Option<SharedString>,
+    failed: bool,
+    failed_summary: bool,
+    cx: &gpui::App,
+) -> gpui::Stateful<gpui::Div> {
+    let (muted, danger) = (cx.theme().muted_foreground, cx.theme().danger);
+    h_flex()
+        .id(id)
+        .gap_2()
+        .min_w(px(0.))
+        .text_sm()
+        .text_color(muted)
+        .child(div().w(px(10.)).flex_shrink_0().child(arrow))
+        .child(div().flex_shrink_0().font_semibold().child(label))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .truncate()
+                .when(failed_summary, |text| text.text_color(danger))
+                .child(summary),
+        )
+        .when_some(status, |header, status| {
+            header.child(
+                div()
+                    .flex_shrink_0()
+                    .when(failed, |text| text.text_color(danger))
+                    .child(status),
+            )
+        })
 }
 
 fn markdown(
@@ -341,99 +420,137 @@ pub fn render(
         cx,
         |_, _| HashSet::<usize>::new(),
     );
-    // min_h(0)：flex item 默认按内容撑高，不加这行长记录会顶穿底部 composer。
-    list(state, move |ix, window, cx| {
+    // 展开的组按起始下标记录；组默认折叠。
+    let groups = window.use_keyed_state(
+        SharedString::from(format!("transcript-groups-{read_id}")),
+        cx,
+        |_, _| HashSet::<usize>::new(),
+    );
+    let list_state = state.clone();
+    // 常驻显示：长会话需要随时看到当前位置，不跟随系统的自动隐藏。
+    let scrollbar = Scrollbar::vertical(&state).scrollbar_show(ScrollbarShow::Always);
+    let rows = list(state, move |ix, window, cx| {
         let block = &blocks[ix];
+        let group_open = block
+            .group
+            .map(|(start, _)| groups.read(cx).contains(&start));
+        // 折叠组里除首块外都渲染成零高度，首块位置改画组摘要。
+        if group_open == Some(false) && block.group.is_some_and(|(start, _)| start != ix) {
+            return div().into_any_element();
+        }
         let md_id = ElementId::NamedInteger(format!("transcript-{read_id}").into(), ix as u64);
         let theme = cx.theme();
-        let (muted, danger, border) = (theme.muted_foreground, theme.danger, theme.border);
+        let (muted, border) = (theme.muted_foreground, theme.border);
 
-        let content =
-            match &block.summary {
-                None => {
-                    let body = if block.markdown {
-                        markdown(md_id, &block.body, window, cx).into_any_element()
-                    } else {
-                        block.body.clone().into_any_element()
-                    };
-                    v_flex()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_semibold()
-                                .text_color(muted)
-                                .child(block.label),
-                        )
-                        .child(div().text_sm().child(body))
-                        .into_any_element()
-                }
-                Some(summary) => {
-                    let expandable = !block.body.is_empty();
-                    let open = expandable && expanded.read(cx).contains(&ix);
-                    let header =
-                        h_flex()
-                            .id(ElementId::NamedInteger(
-                                "transcript-toggle".into(),
-                                ix as u64,
-                            ))
-                            .gap_2()
-                            .min_w(px(0.))
+        let content = match &block.summary {
+            None => {
+                let body = if block.markdown {
+                    markdown(md_id, &block.body, window, cx).into_any_element()
+                } else {
+                    block.body.clone().into_any_element()
+                };
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
                             .text_sm()
+                            .font_semibold()
                             .text_color(muted)
-                            .child(div().w(px(10.)).flex_shrink_0().child(
-                                match (expandable, open) {
-                                    (false, _) => "",
-                                    (true, false) => "▸",
-                                    (true, true) => "▾",
-                                },
-                            ))
-                            .child(div().flex_shrink_0().font_semibold().child(block.label))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .truncate()
-                                    .when(block.failed, |text| text.text_color(danger))
-                                    .child(summary.clone()),
-                            )
-                            .when_some(block.status.clone(), |header, status| {
-                                header.child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .when(block.failed, |text| text.text_color(danger))
-                                        .child(status),
-                                )
-                            })
-                            .when(expandable, |header| {
-                                let expanded = expanded.clone();
-                                header.cursor_pointer().on_click(move |_, _, cx| {
-                                    expanded.update(cx, |set, cx| {
-                                        if !set.remove(&ix) {
-                                            set.insert(ix);
-                                        }
-                                        cx.notify();
-                                    });
-                                })
-                            });
+                            .child(block.label),
+                    )
+                    .child(div().text_sm().child(body))
+                    .into_any_element()
+            }
+            Some(summary) => {
+                let expandable = !block.body.is_empty();
+                let open = expandable && expanded.read(cx).contains(&ix);
+                let header = summary_row(
+                    ElementId::NamedInteger("transcript-toggle".into(), ix as u64),
+                    match (expandable, open) {
+                        (false, _) => "",
+                        (true, false) => "▸",
+                        (true, true) => "▾",
+                    },
+                    block.label,
+                    summary.clone(),
+                    block.status.clone(),
+                    block.failed,
+                    block.failed,
+                    cx,
+                )
+                .when(expandable, |header| {
+                    let expanded = expanded.clone();
+                    header.cursor_pointer().on_click(move |_, _, cx| {
+                        expanded.update(cx, |set, cx| {
+                            if !set.remove(&ix) {
+                                set.insert(ix);
+                            }
+                            cx.notify();
+                        });
+                    })
+                });
+                v_flex()
+                    .gap_2()
+                    .child(header)
+                    .when(open, |this| {
+                        this.child(
+                            div()
+                                .ml(px(4.))
+                                .pl_4()
+                                .border_l_1()
+                                .border_color(border)
+                                .text_sm()
+                                .when(block.label == "思考", |text| text.text_color(muted))
+                                .child(markdown(md_id, &block.body, window, cx)),
+                        )
+                    })
+                    .into_any_element()
+            }
+        };
+        let content = match (block.group, group_open) {
+            (Some((start, len)), Some(open)) => {
+                let indented = div()
+                    .ml(px(4.))
+                    .pl_4()
+                    .border_l_1()
+                    .border_color(border)
+                    .child(content);
+                if start != ix {
+                    indented.into_any_element()
+                } else {
+                    let (summary, failed) = group_summary(&blocks[start..start + len]);
+                    let groups = groups.clone();
+                    let list_state = list_state.clone();
+                    let header = summary_row(
+                        ElementId::NamedInteger("transcript-group".into(), start as u64),
+                        if open { "▾" } else { "▸" },
+                        "过程",
+                        summary.into(),
+                        (failed > 0).then(|| format!("{failed} 个失败").into()),
+                        failed > 0,
+                        false,
+                        cx,
+                    )
+                    .cursor_pointer()
+                    .on_click(move |_, _, cx| {
+                        groups.update(cx, |set, cx| {
+                            if !set.remove(&start) {
+                                set.insert(start);
+                            }
+                            cx.notify();
+                        });
+                        // 组内其余块高度在 0 与实际之间切换，屏幕外的缓存高度需要作废。
+                        list_state.splice(start + 1..start + len, len - 1);
+                    });
                     v_flex()
                         .gap_2()
                         .child(header)
-                        .when(open, |this| {
-                            this.child(
-                                div()
-                                    .ml(px(4.))
-                                    .pl_4()
-                                    .border_l_1()
-                                    .border_color(border)
-                                    .text_sm()
-                                    .when(block.label == "思考", |text| text.text_color(muted))
-                                    .child(markdown(md_id, &block.body, window, cx)),
-                            )
-                        })
+                        .when(open, |this| this.child(indented))
                         .into_any_element()
                 }
-            };
+            }
+            _ => content,
+        };
 
         // 相邻的过程块挤在一起更易扫读；对话消息之间留大间距。
         let gap = if block.summary.is_some() {
@@ -455,14 +572,21 @@ pub fn render(
             )
             .into_any_element()
     })
-    .flex_1()
-    .min_h(px(0.))
-    .w_full()
+    .size_full();
+    // min_h(0)：flex item 默认按内容撑高，不加这行长记录会顶穿底部 composer。
+    div()
+        .relative()
+        .flex_1()
+        .min_h(px(0.))
+        .w_full()
+        .child(rows)
+        // Scrollbar 自身是绝对定位但不带 inset，直接放在列表后面会落到列表下方。
+        .child(div().absolute().inset_0().child(scrollbar))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BODY_LIMIT, Block, describe, fence, is_binary, prepare, truncate};
+    use super::{BODY_LIMIT, Block, describe, fence, group_summary, is_binary, prepare, truncate};
     use agentdeck_protocol::{AgentItem, AgentItemMeta, HistoryTurn, ShellStatus};
 
     fn meta() -> AgentItemMeta {
@@ -615,5 +739,52 @@ mod tests {
         assert_eq!(truncate("短文本"), "短文本");
         let truncated = truncate(&"字".repeat(BODY_LIMIT + 1));
         assert!(truncated.ends_with("…（已截断）"));
+    }
+
+    #[test]
+    fn consecutive_process_blocks_form_groups() {
+        let user = |text: &str| AgentItem::UserMessage {
+            text: text.into(),
+            meta: meta(),
+        };
+        let think = |text: &str| AgentItem::Reasoning {
+            text: text.into(),
+            meta: meta(),
+        };
+        let shell = |status| AgentItem::Shell {
+            command: "ls".into(),
+            status,
+            exit_code: None,
+            duration_ms: None,
+            meta: meta(),
+        };
+        let blocks = prepare(vec![HistoryTurn {
+            items: vec![
+                user("问"),
+                think("想"),
+                shell(ShellStatus::Completed),
+                shell(ShellStatus::Failed),
+                user("再问"),
+                think("单独一个"),
+                user("结束"),
+            ],
+        }]);
+        let groups: Vec<_> = blocks.iter().map(|b| b.group).collect();
+        assert_eq!(
+            groups,
+            vec![
+                None,
+                Some((1, 3)),
+                Some((1, 3)),
+                Some((1, 3)),
+                None,
+                None,
+                None
+            ]
+        );
+        assert_eq!(
+            group_summary(&blocks[1..4]),
+            ("3 步 · 思考 1 · 命令 2".to_string(), 1)
+        );
     }
 }
