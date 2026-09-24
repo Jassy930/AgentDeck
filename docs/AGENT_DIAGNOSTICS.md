@@ -140,9 +140,11 @@ macOS daemon 优先探测桌面端的 `/Applications/ChatGPT.app/Contents/Resour
 返回 `codex-version-probe-failed`；历史版本不匹配只 warning，live session 则返回
 `codex-version-unsupported`，均不回退到其他路径。
 历史 warning 含实际路径、版本与已验证基线，桌面非阻断显示，CLI 写 stderr，stdout
-成功 JSON 保持不变。这不证明协议一定不兼容，也不保证未知格式语义完全保真。
+成功 JSON 保持不变。正文 warning 默认折叠为一行，可展开；列表失败时旧 warning
+清除，已有条目保留。这不证明协议一定不兼容，也不保证未知格式语义完全保真。
 未找到任何文件时明确提示安装或指定路径。历史 RPC/解码失败会附实际使用的
-路径与版本；`-32601` 明确提示方法不支持，其他 RPC 错误也可能来自配置或历史数据，
+路径与版本；运行时版本未验证时，启动或读取失败还会附已验证基线。
+`-32601` 明确提示方法不支持，其他 RPC 错误也可能来自配置或历史数据，
 不能一概归因为版本。桌面错误文本支持滚动，重试按钮保持可见。
 
 CLI 与桌面 client 都为每次历史请求生成唯一 `requestId`。daemon 无论成功还是失败

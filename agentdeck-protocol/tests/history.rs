@@ -151,7 +151,7 @@ fn history_reply_omits_empty_warnings_and_defaults_missing_warnings() {
 fn history_reply_round_trips_success_with_warning() {
     let warning = HistoryWarning {
         agent_kind: AgentKind::Codex,
-        code: "runtime-version-unverified".into(),
+        code: "codex-version-unverified".into(),
         message: "runtime version is not verified".into(),
     };
     let reply = HistoryReply {

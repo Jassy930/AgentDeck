@@ -2162,13 +2162,17 @@ mod tests {
         assert_eq!(reply["response"]["kind"], "list");
         assert!(reply.get("warnings").is_none());
         assert!(reply.get("error").is_none());
+
+        let decoded: HistoryReply = serde_json::from_str(&line).unwrap();
+        assert!(decoded.warnings.is_empty());
+        assert!(matches!(decoded.response, HistoryResponse::List(items) if items.is_empty()));
     }
 
     #[test]
     fn history_warning_keeps_success_response_and_request_id() {
         let warning = agentdeck_protocol::HistoryWarning {
             agent_kind: agentdeck_protocol::AgentKind::Codex,
-            code: "runtime-version-unverified".into(),
+            code: "codex-version-unverified".into(),
             message: "runtime version is not verified".into(),
         };
         let line = history_admin_reply(
@@ -2183,8 +2187,12 @@ mod tests {
         assert_eq!(reply["reply"], "history");
         assert_eq!(reply["requestId"], "history-warning-1");
         assert_eq!(reply["response"]["kind"], "list");
-        assert_eq!(reply["warnings"], serde_json::json!([warning]));
+        assert_eq!(reply["warnings"], serde_json::json!([warning.clone()]));
         assert!(reply.get("error").is_none());
+
+        let decoded: HistoryReply = serde_json::from_str(&line).unwrap();
+        assert_eq!(decoded.warnings, vec![warning]);
+        assert!(matches!(decoded.response, HistoryResponse::List(items) if items.is_empty()));
     }
 
     #[tokio::test]

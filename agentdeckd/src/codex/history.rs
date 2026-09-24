@@ -740,6 +740,10 @@ mod tests {
                 assert!(!error.message.contains("sk-"));
                 assert!(error.message.contains("thread/turns/list"));
                 assert!(error.message.contains(binary.version()));
+                assert!(error.message.contains(&format!(
+                    "已验证：{}",
+                    crate::codex::capabilities::supported_codex_version()
+                )));
                 assert!(error.message.contains(&binary.path().display().to_string()));
                 if method_unsupported {
                     assert!(error.message.contains("不支持此方法"));

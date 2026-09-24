@@ -193,7 +193,7 @@ async fn cross_agent_history_keeps_best_effort_result_when_one_source_succeeds()
 async fn history_preserves_warning_from_successful_empty_source() {
     let warning = HistoryWarning {
         agent_kind: AgentKind::Codex,
-        code: "runtime-version-unverified".into(),
+        code: "codex-version-unverified".into(),
         message: "runtime version is not verified".into(),
     };
     let mut router = AgentRouter::new();

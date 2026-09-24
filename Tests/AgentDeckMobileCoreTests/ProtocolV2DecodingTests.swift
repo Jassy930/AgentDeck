@@ -2,7 +2,7 @@ import AgentDeckMobileCore
 import Foundation
 import XCTest
 
-/// Verifies the v4 wire shapes decode correctly on the Swift side. These
+/// Verifies the v5 wire shapes decode correctly on the Swift side. These
 /// are guardrails for the cross-language IPC seam — daemon emits Rust
 /// `serde_json` output, Swift decodes via `JSONDecoder`; both must agree
 /// on field names, tag discriminators, and enum value renames.
@@ -396,5 +396,56 @@ final class ProtocolV2DecodingTests: XCTestCase {
         XCTAssertEqual(items.count, 1)
         XCTAssertEqual(items[0].threadId, "t1")
         XCTAssertEqual(items[0].agentKind, .codex)
+    }
+
+    func testHistoryReplyRoundTripsWarningFromFullAdminEnvelope() throws {
+        let json = """
+        {"reply":"history","requestId":"history-warning-1",
+         "response":{"kind":"list","value":[]},
+         "warnings":[{"agentKind":"codex","code":"codex-version-unverified",
+                      "message":"runtime version is not verified"}]}
+        """
+        let reply = try JSONDecoder().decode(HistoryReply.self, from: Data(json.utf8))
+        let warning = try XCTUnwrap(reply.warnings.first)
+        XCTAssertEqual(reply.warnings.count, 1)
+        XCTAssertEqual(warning.agentKind, .codex)
+        XCTAssertEqual(warning.code, "codex-version-unverified")
+        XCTAssertEqual(warning.message, "runtime version is not verified")
+        guard case let .list(items) = reply.response else {
+            return XCTFail("expected list")
+        }
+        XCTAssertTrue(items.isEmpty)
+
+        let encoded = try JSONEncoder().encode(reply)
+        let wire = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertNil(wire["reply"])
+        XCTAssertNil(wire["requestId"])
+        let warnings = try XCTUnwrap(wire["warnings"] as? [[String: Any]])
+        XCTAssertEqual(warnings.first?["agentKind"] as? String, "codex")
+
+        let roundTripped = try JSONDecoder().decode(HistoryReply.self, from: encoded)
+        XCTAssertEqual(roundTripped.warnings.count, 1)
+        XCTAssertEqual(roundTripped.warnings[0].code, warning.code)
+        XCTAssertEqual(roundTripped.warnings[0].message, warning.message)
+    }
+
+    func testHistoryReplyDefaultsMissingWarningsAndOmitsEmptyWarnings() throws {
+        let json = """
+        {"reply":"history","requestId":"history-success-1",
+         "response":{"kind":"list","value":[]}}
+        """
+        let reply = try JSONDecoder().decode(HistoryReply.self, from: Data(json.utf8))
+        XCTAssertTrue(reply.warnings.isEmpty)
+
+        let encoded = try JSONEncoder().encode(reply)
+        let wire = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertNil(wire["warnings"])
+
+        let roundTripped = try JSONDecoder().decode(HistoryReply.self, from: encoded)
+        XCTAssertTrue(roundTripped.warnings.isEmpty)
+        guard case let .list(items) = roundTripped.response else {
+            return XCTFail("expected list")
+        }
+        XCTAssertTrue(items.isEmpty)
     }
 }

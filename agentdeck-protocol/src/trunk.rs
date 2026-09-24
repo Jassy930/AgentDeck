@@ -481,8 +481,9 @@ pub struct HistoryWarning {
     pub message: String,
 }
 
+/// Success content projected from an admin reply; transport metadata is ignored.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct HistoryReply {
     pub response: HistoryResponse,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

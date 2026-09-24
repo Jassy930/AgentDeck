@@ -220,6 +220,8 @@ history 候选查找与 RPC 须共享 28 秒工作预算并预留清理。probe 
 历史 warning 测试覆盖未验证版本仍成功、匹配版本无 warning、跨来源空列表保留 warning、
 CLI stdout 不变与 stderr 提示、桌面来源和正文提示，以及实际 RPC/解码失败不返回残缺结果。
 IPC v5 的 warning 类型须同步 schema；真实只读验收仍需本机列表、分页正文与实际窗口。
+回归测试同时覆盖完整 admin 成功回复的 Rust/Swift 解码、warnings 缺省与编码省略、
+列表失败清除旧 warning，以及正文 warning 的默认折叠与展开状态。
 
 升级刷新或同版本复验时，都先在临时目录 fail-closed 生成，并记录本机
 Codex 的实际版本。显式指定要生成快照的 executable，不依赖 PATH 首项：

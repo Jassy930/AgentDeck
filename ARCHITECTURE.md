@@ -125,7 +125,9 @@ agentdeck-cli（参考客户端 / E2E 驱动，与 GUI 互相独立）
 `agentdeck-protocol` crate 是 IPC 协议的唯一事实源：
 
 - `PROTOCOL_VERSION`：当前为 5。v5 增加 `HistoryReply` / `HistoryWarning`，历史成功回复
-  保留顶层 `response` 并可携带同层 `warnings`；失败仍走 `error`。v4 的 `AgentItem` 必须携带 `turnId`、`itemId` 与
+  保留顶层 `response` 并可携带同层 `warnings`；`HistoryReply` 只表示成功内容，忽略
+  `reply` / `requestId` 等 envelope 字段，关联校验和错误识别仍由 client 负责。
+  Swift Core 同步对应 Codable 类型。失败仍走 `error`。v4 的 `AgentItem` 必须携带 `turnId`、`itemId` 与
   `state`（streaming/completed），同 item 的文本是累计快照。v3 引入 caller-owned `sessionId` / `turnId`、显式
   `TurnStart` / `TurnCancel` / `SessionClose` 和两级 terminal；`TurnComplete` 暂只保留给
   尚未迁移的 Claude Code 路径。

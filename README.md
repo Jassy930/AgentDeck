@@ -102,6 +102,8 @@ Codex schema 已验证基线为 `codex-cli 0.155.0-alpha.16`，完整版本写�
 `/Applications/ChatGPT.app/Contents/Resources/codex`，其次探测 PATH 和常见 CLI
 安装位置。历史列表和正文读取跳过不存在的候选，使用首个版本探测成功的 executable；
 版本不同只显示 warning 并继续读取。live session 仍跳过不匹配候选，要求精确匹配。
+两类操作可能选择不同运行时：历史优先当前桌面端，避免旧 CLI 无法读取新版保存的记录；
+live session 涉及发送任务，仍使用经过验证的版本。
 执行失败、非法输出、超时或清理失败立即报错。版本探测与 app-server 启动使用
 同一个规范化绝对路径。AgentDeck 自身 IPC 为 v5，历史成功回复可携带中立的 warnings。
 
@@ -109,7 +111,8 @@ Codex schema 已验证基线为 `codex-cli 0.155.0-alpha.16`，完整版本写�
 路径；设置后只使用该路径，错误时不自动回退。离线测试也通过这个入口绑定假程序。
 AgentDeck 当前复用本机安装，不自带 Codex。
 
-历史 warning 包含实际版本、路径和已验证版本；桌面在来源与正文区域显示，CLI 输出到
+历史 warning 包含实际版本、路径和已验证版本；桌面来源区显示详情，正文顶部默认一行、
+可展开详情，列表请求失败时清除旧 warning 并保留已有列表。CLI 输出到
 stderr，成功 stdout JSON 与退出码保持不变。版本不同表示尚未验证，不代表协议一定
 不兼容。历史启动、RPC、解码或分页失败仍报错，不返回残缺正文；错误保留方法名、
 错误码和实际运行时信息。

@@ -272,11 +272,7 @@ pub fn agent_list() -> Result<Vec<AgentKind>> {
     serde_json::from_value(agents).map_err(|source| format!("解析 agent 列表失败：{source}"))
 }
 
-fn decode_history(mut reply: serde_json::Value) -> Result<HistoryReply> {
-    if let Some(reply) = reply.as_object_mut() {
-        reply.remove("reply");
-        reply.remove("requestId");
-    }
+fn decode_history(reply: serde_json::Value) -> Result<HistoryReply> {
     serde_json::from_value(reply).map_err(|source| format!("解析历史响应失败：{source}"))
 }
 
@@ -497,15 +493,16 @@ mod tests {
     }
 
     #[test]
-    fn history_success_keeps_warnings_and_accepts_replies_without_them() {
+    fn history_success_keeps_warnings_and_accepts_extra_envelope_fields() {
         let warning = serde_json::json!({
             "agentKind": "codex",
-            "code": "codex-version-unsupported",
+            "code": "codex-version-unverified",
             "message": "版本未经验证\n路径：/Applications/Codex.app/Contents/Resources/codex\n实际：codex-cli 0.154.0\n已验证：codex-cli 0.155.0-alpha.9.2",
         });
         let mut reply = serde_json::json!({
             "reply": "history",
             "requestId": "current",
+            "durationMs": 12,
             "response": { "kind": "list", "value": [] },
             "warnings": [warning.clone()],
         });
@@ -544,7 +541,7 @@ mod tests {
             "requestId": "current",
             "error": { "code": "codex-version-unsupported", "message": message },
             "warnings": [{
-                "agentKind": "codex", "code": "codex-version-unsupported", "message": "warning"
+                "agentKind": "codex", "code": "codex-version-unverified", "message": "warning"
             }],
         })
         .to_string();

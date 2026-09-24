@@ -1437,7 +1437,6 @@
     },
     "HistoryReply": {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "additionalProperties": false,
       "definitions": {
         "AgentItem": {
           "oneOf": [
@@ -1992,6 +1991,7 @@
           "type": "string"
         }
       },
+      "description": "Success content projected from an admin reply; transport metadata is ignored.",
       "properties": {
         "response": {
           "$ref": "#/definitions/HistoryResponse"

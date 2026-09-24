@@ -15,7 +15,10 @@ use gpui::{
     ScrollStrategy, SharedString, UniformListScrollHandle, Window, div, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme, InteractiveElementExt, StyledExt, button::Button, h_flex, input::InputState,
+    ActiveTheme, InteractiveElementExt, Sizable, StyledExt,
+    button::{Button, ButtonVariants},
+    h_flex,
+    input::InputState,
     v_flex,
 };
 
@@ -206,6 +209,8 @@ impl AgentHistory {
             items.truncate(self.limit);
             self.loaded = items.len();
             self.warnings = std::mem::take(warnings);
+        } else {
+            self.warnings.clear();
         }
         self.result = Some(listed.as_ref().map(|_| ()).map_err(Clone::clone));
     }
@@ -701,24 +706,53 @@ impl Shell {
                     _ => None,
                 },
                 |section, warnings| {
+                    let expanded = window.use_keyed_state(
+                        SharedString::from(format!("transcript-warning-expanded-{read_id}")),
+                        cx,
+                        |_, _| false,
+                    );
+                    let open = *expanded.read(cx);
                     section.child(
-                        div()
-                            .id(("transcript-warnings", read_id))
+                        v_flex()
                             .w_full()
                             .flex_shrink_0()
-                            .max_h(px(112.))
-                            .overflow_y_scroll()
                             .px_5()
-                            .py_2()
+                            .py_1()
                             .bg(cx.theme().warning.opacity(0.1))
                             .child(
-                                v_flex()
-                                    .gap_1()
-                                    .child(div().text_sm().font_semibold().child("兼容性警告"))
-                                    .children(warnings.iter().map(|warning| {
-                                        div().text_xs().child(warning.message.clone())
-                                    })),
-                            ),
+                                Button::new(("transcript-warning-toggle", read_id))
+                                    .ghost()
+                                    .xsmall()
+                                    .w_full()
+                                    .justify_start()
+                                    .label(if open {
+                                        "▾ 兼容性警告 · 收起详情"
+                                    } else {
+                                        "▸ 兼容性警告 · 展开详情"
+                                    })
+                                    .on_click(move |_, _, cx| {
+                                        expanded.update(cx, |expanded, cx| {
+                                            *expanded = !*expanded;
+                                            cx.notify();
+                                        });
+                                    }),
+                            )
+                            .when(open, |section| {
+                                section.child(
+                                    div()
+                                        .id(("transcript-warnings", read_id))
+                                        .w_full()
+                                        .max_h(px(112.))
+                                        .overflow_y_scroll()
+                                        .px_2()
+                                        .pb_2()
+                                        .child(v_flex().gap_1().children(warnings.iter().map(
+                                            |warning| {
+                                                div().text_xs().child(warning.message.clone())
+                                            },
+                                        ))),
+                                )
+                            }),
                     )
                 },
             )
@@ -825,7 +859,7 @@ mod tests {
     fn warning() -> HistoryWarning {
         HistoryWarning {
             agent_kind: AgentKind::Codex,
-            code: "codex-version-unsupported".into(),
+            code: "codex-version-unverified".into(),
             message: "当前 Codex 版本未经验证，仍继续读取历史".into(),
         }
     }
@@ -1000,7 +1034,8 @@ mod tests {
     #[test]
     fn failed_load_more_keeps_count_and_retries_the_same_limit() {
         let mut source = AgentHistory::new(AgentKind::Codex);
-        source.complete(&mut Ok((vec![item(None); 51], vec![])));
+        source.complete(&mut Ok((vec![item(None); 51], vec![warning()])));
+        assert_eq!(source.warnings, vec![warning()]);
         assert!(source.load_more());
         assert_eq!(source.status(), "已加载 50 · 加载中…");
         assert_eq!(source.request_limit(), 101);
@@ -1008,6 +1043,8 @@ mod tests {
         source.complete(&mut Err("timeout".into()));
         assert_eq!(source.status(), "已加载 50 · 加载失败");
         assert_eq!(source.error(), Some("timeout"));
+        assert!(source.warnings.is_empty());
+        assert_eq!(source.loaded, 50);
         assert!(!source.load_more());
         assert!(source.retry());
         assert_eq!(source.request_limit(), 101);

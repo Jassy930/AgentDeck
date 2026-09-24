@@ -1137,6 +1137,45 @@ public enum HistoryResponse: Codable, Sendable {
     }
 }
 
+public struct HistoryWarning: Codable, Sendable {
+    public let agentKind: AgentKind
+    public let code: String
+    public let message: String
+
+    public init(agentKind: AgentKind, code: String, message: String) {
+        self.agentKind = agentKind
+        self.code = code
+        self.message = message
+    }
+}
+
+/// Success content projected from an admin reply; transport metadata is ignored.
+public struct HistoryReply: Codable, Sendable {
+    public let response: HistoryResponse
+    public let warnings: [HistoryWarning]
+
+    public init(response: HistoryResponse, warnings: [HistoryWarning] = []) {
+        self.response = response
+        self.warnings = warnings
+    }
+
+    private enum CodingKeys: String, CodingKey { case response, warnings }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        response = try c.decode(HistoryResponse.self, forKey: .response)
+        warnings = try c.decodeIfPresent([HistoryWarning].self, forKey: .warnings) ?? []
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(response, forKey: .response)
+        if !warnings.isEmpty {
+            try c.encode(warnings, forKey: .warnings)
+        }
+    }
+}
+
 // MARK: - ClientCommand
 
 /// `#[serde(tag = "command", rename_all = "camelCase")]`

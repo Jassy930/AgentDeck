@@ -57,6 +57,8 @@ impl CodexBinary {
     pub(super) async fn resolve_for_history(
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<Self, ProtocolError> {
+        // 桌面端可能已写入新版历史，回退旧 CLI 会让这些记录无法解析；
+        // 只读历史保留优先运行时，live session 仍独立通过精确版本门禁。
         Self::resolve_with_policy(cancel, false).await
     }
 
@@ -151,6 +153,17 @@ impl CodexBinary {
 
     pub(crate) fn version(&self) -> &str {
         &self.version
+    }
+
+    fn enrich_error(&self, mut error: ProtocolError) -> ProtocolError {
+        error.message = format!(
+            "{}\nCodex：{}\n已验证：{}\n路径：{}",
+            error.message,
+            self.version(),
+            supported_codex_version(),
+            self.path().display()
+        );
+        error
     }
 }
 
@@ -569,15 +582,7 @@ impl ShortLivedAppServer {
     pub(super) async fn spawn_for_history(cwd: &Path) -> Result<Self, ProtocolError> {
         let (_cancel_tx, mut cancel) = watch::channel(false);
         let binary = CodexBinary::resolve_for_history(&mut cancel).await?;
-        Self::spawn_with_binary(cwd, &binary).map_err(|mut error| {
-            error.message = format!(
-                "{}\nCodex：{}\n路径：{}",
-                error.message,
-                binary.version(),
-                binary.path().display()
-            );
-            error
-        })
+        Self::spawn_with_binary(cwd, &binary).map_err(|error| binary.enrich_error(error))
     }
 
     pub(crate) fn spawn_with_binary(
@@ -651,14 +656,9 @@ impl ShortLivedAppServer {
         .map_err(map_short_lived_error)
     }
 
-    pub(super) fn enrich_error(&self, mut error: ProtocolError) -> ProtocolError {
-        error.message = format!(
-            "{}\nCodex：{}\n路径：{}",
-            error.message,
-            self.binary.version(),
-            self.binary.path().display()
-        );
-        self.stderr_tail.enrich_error(error)
+    pub(super) fn enrich_error(&self, error: ProtocolError) -> ProtocolError {
+        self.stderr_tail
+            .enrich_error(self.binary.enrich_error(error))
     }
 
     pub(super) fn version_warning(&self) -> Option<HistoryWarning> {
@@ -1014,6 +1014,23 @@ done
         assert!(warning.message.contains(supported_codex_version()));
         assert!(warning.message.contains(binary.path().to_str().unwrap()));
         client.shutdown().await;
+        let spawn_error =
+            ShortLivedAppServer::spawn_with_binary(&desktop.root.join("missing-cwd"), &binary)
+                .err()
+                .expect("missing cwd must fail to spawn");
+        let spawn_error = binary.enrich_error(spawn_error);
+        assert_eq!(spawn_error.code, "codex-spawn-failed");
+        for detail in [
+            binary.version(),
+            supported_codex_version(),
+            binary.path().to_str().unwrap(),
+        ] {
+            assert!(
+                spawn_error.message.contains(detail),
+                "{}",
+                spawn_error.message
+            );
+        }
         assert_eq!(
             desktop
                 .calls()

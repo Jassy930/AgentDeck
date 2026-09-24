@@ -339,3 +339,23 @@ macOS 进程组存在性查询在组仅剩僵尸进程时可能返回 `EPERM`；
   助手和工具正文，顶部同时显示版本与完整路径。加载更多扩展到 Codex 100 条，
   正文保持显示，来源警告可滚动读全且未累积重复卡片。
 - 本轮只验证真实历史读取，未发送模型 prompt；不承诺未知未来格式的完整语义保真。
+
+## 2026-09-24：历史兼容警告审查修复
+
+- `HistoryReply` 接受完整成功回复中的 transport metadata，desktop 不再手动删除
+  `reply` / `requestId`；内部 response 与 warning 仍严格解码，IPC 保持 v5。
+  Swift mirror 补齐 `HistoryReply` / `HistoryWarning`，缺失 warnings 默认为空，
+  编码空 warnings 时省略该字段。
+- 来源列表请求失败后清除旧 warning，保留已加载列表和重试位置；正文警告默认
+  单行折叠，展开查看详情，切换会话或重新读取后恢复折叠。历史启动及读取失败
+  统一附带实际版本、已验证基线与路径，仍隐藏 vendor 原始错误正文。
+- 完整离线门禁、91 项 Codex focused、30 项 desktop 测试、Swift 105 项测试、
+  iPhone 17 模拟器 21 项测试通过；绑定当前 checkout daemon 的 CLI selfcheck、
+  diagnostics report、desktop selfcheck、真实 bundle verify、格式与文档检查通过。
+- 真实 bundle 连接本机后端，Codex `0.155.0-alpha.16.3` 的历史正文可读；正文
+  warning 默认折叠，展开后显示实际版本、已验证版本与完整路径。
+  同一 bundle 连接临时 fake daemon，确认切换会话后默认折叠；加载更多失败后
+  来源旧 warning 消失，50 条列表与当前正文保留；点击重试后恢复到 75 条且无
+  来源 warning。Tab / Shift-Tab 可聚焦正文警告按钮，Enter / Space 可展开或收起。
+  fake 回复附带额外 `durationMs`，客户端仍可读取。
+- 真实验收仅覆盖只读历史，未发送模型 prompt。
