@@ -17,6 +17,13 @@ while IFS= read -r frame; do
         printf '{"id":%s,"result":{}}\n' "$id"
       fi ;;
     *'"method":"initialized"'*) initialized=true ;;
+    *'"method":"thread/list"'*)
+      [ "$initialized" = true ] || exit 11
+      if [ "${AGENTDECK_FIXTURE_HISTORY_ERROR:-}" = 1 ]; then
+        printf '{"id":%s,"error":{"code":-32601,"message":"fixture method missing"}}\n' "$id"
+      else
+        printf '{"id":%s,"result":{"data":[],"nextCursor":null}}\n' "$id"
+      fi ;;
     *'"method":"thread/start"'*)
       [ "$initialized" = true ] || exit 11
       printf '{"id":%s,"result":{"thread":{"id":"fixture-thread"}}}\n' "$id" ;;

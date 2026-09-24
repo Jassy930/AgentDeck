@@ -208,14 +208,18 @@ path 都发送规范的 `initialized`，fake 测试守护 initialize response
 历史，只验证 `kind=list` 或合法空列表不足以证明正文可读；后续页面失败不能算完整
 读取通过。历史读回也不能替代升级后的真实 lifecycle E2E 与桌面正文点击验收。
 
-daemon 在 macOS 先探测桌面端 App 自带 executable，再探测 PATH 和常见 CLI 安装位置，
-跳过不存在或版本不匹配的候选，使用首个精确匹配版本。即使 `command -v codex` 返回旧版
-Homebrew 安装，也不代表 daemon 使用它。离线 locator 用例须验证跳过不匹配候选、
+daemon 在 macOS 先探测桌面端 App 自带 executable，再探测 PATH 和常见 CLI 安装位置。
+历史 list/read 使用首个探测成功的候选，版本不同时携带 warning；live session 仍跳过
+不匹配候选，要求精确匹配。`command -v codex` 不代表 daemon 实际使用的路径。
+离线 locator 用例须分别验证两种策略，以及
 非零退出与非法输出停止查找、慢探测不阻塞 runtime，以及候选共享 5 秒探测预算；
 history 候选查找与 RPC 须共享 28 秒工作预算并预留清理。probe 与 spawn 始终绑定同一
 规范化绝对路径，CLI fake 用例覆盖探测失败不会启动后续系统候选。
 `AGENTDECK_CODEX_BIN` 显式绝对路径覆盖自动查找，错误时不回退；CLI fake 必须用它绑定
 假程序，离线门禁用它绑定 Codex marker，防止桌面端优先查找绕过 PATH 中的 shim。
+历史 warning 测试覆盖未验证版本仍成功、匹配版本无 warning、跨来源空列表保留 warning、
+CLI stdout 不变与 stderr 提示、桌面来源和正文提示，以及实际 RPC/解码失败不返回残缺结果。
+IPC v5 的 warning 类型须同步 schema；真实只读验收仍需本机列表、分页正文与实际窗口。
 
 升级刷新或同版本复验时，都先在临时目录 fail-closed 生成，并记录本机
 Codex 的实际版本。显式指定要生成快照的 executable，不依赖 PATH 首项：

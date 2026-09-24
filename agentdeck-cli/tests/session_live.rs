@@ -59,27 +59,28 @@ fn cli_live_eof_closes_session_and_record_failure_is_nonterminal() {
 }
 
 #[test]
-fn cli_history_version_mismatch_preserves_runtime_details() {
+fn cli_history_version_mismatch_warns_and_preserves_stdout() {
     if !daemon_bound() {
         return;
     }
-    for (version, guidance) in [
-        ("codex-cli 0.145.0", "升级 Codex"),
-        ("codex-cli 99.0.0", "升级 AgentDeck"),
-    ] {
+    for version in ["codex-cli 0.145.0", "codex-cli 99.0.0"] {
         let root = temp_root("cli-history-version-mismatch");
         let output = fixture_command(&root, &["history", "list", "--agent", "codex"])
             .env("AGENTDECK_FIXTURE_VERSION", version)
             .output()
             .unwrap();
-        assert!(!output.status.success());
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let reply: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(reply["error"]["code"], "codex-version-unsupported");
+        assert_eq!(reply, serde_json::json!({"kind": "list", "value": []}));
         let stderr = String::from_utf8(output.stderr).unwrap();
         for detail in [
             version,
             include_str!("../../protocol/CODEX_VERSION.txt").trim(),
-            guidance,
+            "已继续读取历史",
             &root
                 .join("bin/codex")
                 .canonicalize()
@@ -88,10 +89,44 @@ fn cli_history_version_mismatch_preserves_runtime_details() {
                 .to_string(),
         ] {
             assert!(stderr.contains(detail), "missing {detail}: {stderr}");
-            assert!(reply["error"]["message"].as_str().unwrap().contains(detail));
         }
+        assert!(
+            stderr.contains("warning [codex-version-unverified]"),
+            "{stderr}"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[test]
+fn cli_history_verified_version_is_quiet_and_rpc_failures_still_fail() {
+    if !daemon_bound() {
+        return;
+    }
+    let root = temp_root("cli-history-warning-errors");
+    let success = fixture_command(&root, &["history", "list", "--agent", "codex"])
+        .output()
+        .unwrap();
+    assert!(
+        success.status.success(),
+        "{}",
+        String::from_utf8_lossy(&success.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&success.stderr).contains("warning ["));
+
+    let failure = fixture_command(&root, &["history", "list", "--agent", "codex"])
+        .env("AGENTDECK_FIXTURE_VERSION", "codex-cli 99.0.0")
+        .env("AGENTDECK_FIXTURE_HISTORY_ERROR", "1")
+        .output()
+        .unwrap();
+    assert!(!failure.status.success());
+    let reply: serde_json::Value = serde_json::from_slice(&failure.stdout).unwrap();
+    assert_eq!(reply["error"]["code"], "codex-protocol-error");
+    let message = reply["error"]["message"].as_str().unwrap();
+    assert!(message.contains("thread/list"), "{message}");
+    assert!(message.contains("codex-cli 99.0.0"), "{message}");
+    assert!(message.contains("-32601"), "{message}");
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

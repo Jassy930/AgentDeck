@@ -82,10 +82,10 @@ impl Agent for DelayedHistoryAgent {
         Ok(())
     }
 
-    async fn handle_history(&self, _: HistoryRequest) -> Result<HistoryResponse, ProtocolError> {
+    async fn handle_history(&self, _: HistoryRequest) -> Result<HistoryReply, ProtocolError> {
         self.gate.wait().await;
         tokio::time::sleep(self.delay).await;
-        Ok(HistoryResponse::List(Vec::new()))
+        Ok(HistoryResponse::List(Vec::new()).into())
     }
 }
 
@@ -141,7 +141,7 @@ async fn router_queries_both_history_sources_concurrently() {
     .expect("both delayed history sources must succeed");
     let elapsed = started.elapsed();
 
-    assert!(matches!(response, HistoryResponse::List(items) if items.is_empty()));
+    assert!(matches!(response.response, HistoryResponse::List(items) if items.is_empty()));
     assert!(
         elapsed < Duration::from_millis(250),
         "two 100ms sources should complete concurrently, elapsed={elapsed:?}"
@@ -164,7 +164,7 @@ async fn router_cross_agent_history_list_merges_without_error() {
         limit: None,
     };
     let result = r.handle_history(req).await.expect("merge must not error");
-    let items = match result {
+    let items = match result.response {
         HistoryResponse::List(v) => v,
         other => panic!("expected List variant, got {other:?}"),
     };
@@ -200,7 +200,7 @@ async fn router_codex_list_returns_real_history_or_empty() {
         .handle_history(req)
         .await
         .expect("real Codex list must not error");
-    match result {
+    match result.response {
         HistoryResponse::List(items) => {
             assert!(items.len() <= 3);
             assert!(items.iter().all(|item| item.agent_kind == AgentKind::Codex));
@@ -227,7 +227,7 @@ async fn router_codex_read_returns_real_history_when_available() {
         })
         .await
         .expect("real Codex list must succeed");
-    let HistoryResponse::List(items) = listed else {
+    let HistoryResponse::List(items) = listed.response else {
         panic!("expected list response");
     };
     let Some(first) = items.first() else {
@@ -243,7 +243,7 @@ async fn router_codex_read_returns_real_history_when_available() {
         })
         .await
         .expect("real Codex read must succeed");
-    let HistoryResponse::Read(detail) = read else {
+    let HistoryResponse::Read(detail) = read.response else {
         panic!("expected read response");
     };
     assert_eq!(detail.thread_id, expected);
@@ -262,7 +262,7 @@ async fn router_cc_unarchive_is_noop_ack() {
         agent_kind: AgentKind::ClaudeCode,
     };
     let result = r.handle_history(req).await.expect("cc unarchive must Ack");
-    assert!(matches!(result, HistoryResponse::Ack));
+    assert!(matches!(result.response, HistoryResponse::Ack));
 }
 
 /// Requesting an unregistered agent kind through the router yields a

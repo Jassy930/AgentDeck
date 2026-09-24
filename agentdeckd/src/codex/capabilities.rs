@@ -77,6 +77,7 @@ pub fn supported_approval_policies() -> Vec<CodexApprovalPolicy> {
 /// default test suite use a fake binary without consulting the user's PATH.
 pub(crate) fn probe_codex_version_with_command<F>(
     binary: &Path,
+    require_verified: bool,
     run: F,
 ) -> Result<String, ProtocolError>
 where
@@ -101,7 +102,7 @@ where
                     )
                 })?;
             let expected = supported_codex_version();
-            if actual == expected {
+            if !require_verified || actual == expected {
                 Ok(actual.to_string())
             } else {
                 let expected_version = semver::Version::parse(
@@ -177,6 +178,7 @@ pub(super) async fn probe_codex_version_at(
     binary: &Path,
     deadline: Instant,
     cancel: &mut watch::Receiver<bool>,
+    require_verified: bool,
 ) -> Result<String, ProtocolError> {
     check_probe_deadline(deadline, cancel)?;
     let mut command = Command::new(binary);
@@ -242,7 +244,9 @@ pub(super) async fn probe_codex_version_at(
             )
         })?;
     let status = result?;
-    probe_codex_version_with_command(binary, |_| Ok((status.code().unwrap_or(-1), stdout)))
+    probe_codex_version_with_command(binary, require_verified, |_| {
+        Ok((status.code().unwrap_or(-1), stdout))
+    })
 }
 
 #[cfg(test)]
@@ -300,7 +304,7 @@ mod tests {
     #[test]
     fn probe_codex_version_accepts_injected_success() {
         let binary = Path::new("/fake/codex");
-        let version = probe_codex_version_with_command(binary, |actual_binary| {
+        let version = probe_codex_version_with_command(binary, true, |actual_binary| {
             assert_eq!(actual_binary, binary);
             Ok((0, format!("{}\n", supported_codex_version()).into_bytes()))
         })
@@ -310,7 +314,7 @@ mod tests {
 
     #[test]
     fn probe_codex_version_rejects_injected_spawn_failure() {
-        let error = probe_codex_version_with_command(Path::new("/fake/codex"), |_| {
+        let error = probe_codex_version_with_command(Path::new("/fake/codex"), true, |_| {
             Err("private launch details".to_string())
         })
         .unwrap_err();
@@ -332,12 +336,18 @@ mod tests {
             Ok((0, b"codex-cli 0.155.0-\n".to_vec())),
             Ok((0, b"codex-cli 0.155.0+\n".to_vec())),
         ] {
-            let error =
-                probe_codex_version_with_command(Path::new("/fake/codex"), |_| result).unwrap_err();
-            assert_eq!(error.code, "codex-version-probe-failed");
-            assert!(error.message.contains("/fake/codex"));
-            assert!(!error.message.contains("PRIVATE_VENDOR_OUTPUT"));
-            assert!(!error.message.contains("codex-cli "));
+            for require_verified in [true, false] {
+                let error = probe_codex_version_with_command(
+                    Path::new("/fake/codex"),
+                    require_verified,
+                    |_| result.clone(),
+                )
+                .unwrap_err();
+                assert_eq!(error.code, "codex-version-probe-failed");
+                assert!(error.message.contains("/fake/codex"));
+                assert!(!error.message.contains("PRIVATE_VENDOR_OUTPUT"));
+                assert!(!error.message.contains("codex-cli "));
+            }
         }
     }
 
@@ -356,7 +366,7 @@ mod tests {
                 "请使用与已验证版本完全匹配的 Codex 构建",
             ),
         ] {
-            let error = probe_codex_version_with_command(Path::new("/fake/codex"), |_| {
+            let error = probe_codex_version_with_command(Path::new("/fake/codex"), true, |_| {
                 Ok((0, format!("{actual}\n").into_bytes()))
             })
             .unwrap_err();
@@ -414,7 +424,8 @@ mod tests {
                 probe_codex_version_at(
                     &binary,
                     Instant::now() + Duration::from_secs(2),
-                    &mut cancel
+                    &mut cancel,
+                    true,
                 ),
                 async {
                     if mode == "cancel" {

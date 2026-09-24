@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use agentdeck_protocol::{
-    AgentKind, ClientCommand, HistoryListItem, HistoryRequest, HistoryResponse, HistoryTurn,
-    ThreadId,
+    AgentKind, ClientCommand, HistoryListItem, HistoryReply, HistoryRequest, HistoryResponse,
+    HistoryTurn, HistoryWarning, ThreadId,
 };
 
 /// 与 CLI 一致的显式覆盖入口：一旦设置就必须指向绝对路径的可执行文件，不回退。
@@ -272,31 +272,45 @@ pub fn agent_list() -> Result<Vec<AgentKind>> {
     serde_json::from_value(agents).map_err(|source| format!("解析 agent 列表失败：{source}"))
 }
 
-fn history(request: HistoryRequest) -> Result<HistoryResponse> {
-    let mut reply = round_trip(&ClientCommand::History(request), "history")?;
-    let response = reply["response"].take();
-    serde_json::from_value(response).map_err(|source| format!("解析历史响应失败：{source}"))
+fn decode_history(mut reply: serde_json::Value) -> Result<HistoryReply> {
+    if let Some(reply) = reply.as_object_mut() {
+        reply.remove("reply");
+        reply.remove("requestId");
+    }
+    serde_json::from_value(reply).map_err(|source| format!("解析历史响应失败：{source}"))
 }
 
-pub fn history_list(agent_kind: AgentKind, limit: usize) -> Result<Vec<HistoryListItem>> {
-    match history(HistoryRequest::List {
+fn history(request: HistoryRequest) -> Result<HistoryReply> {
+    decode_history(round_trip(&ClientCommand::History(request), "history")?)
+}
+
+pub fn history_list(
+    agent_kind: AgentKind,
+    limit: usize,
+) -> Result<(Vec<HistoryListItem>, Vec<HistoryWarning>)> {
+    let reply = history(HistoryRequest::List {
         request_id: None,
         agent_kind: Some(agent_kind),
         cwd_filter: None,
         limit: Some(limit),
-    })? {
-        HistoryResponse::List(items) => Ok(items),
+    })?;
+    match reply.response {
+        HistoryResponse::List(items) => Ok((items, reply.warnings)),
         other => Err(format!("历史列表返回了意外的响应：{other:?}")),
     }
 }
 
-pub fn history_read(agent_kind: AgentKind, thread_id: ThreadId) -> Result<Vec<HistoryTurn>> {
-    match history(HistoryRequest::Read {
+pub fn history_read(
+    agent_kind: AgentKind,
+    thread_id: ThreadId,
+) -> Result<(Vec<HistoryTurn>, Vec<HistoryWarning>)> {
+    let reply = history(HistoryRequest::Read {
         request_id: None,
         thread_id,
         agent_kind,
-    })? {
-        HistoryResponse::Read(response) => Ok(response.turns),
+    })?;
+    match reply.response {
+        HistoryResponse::Read(response) => Ok((response.turns, reply.warnings)),
         other => Err(format!("历史读取返回了意外的响应：{other:?}")),
     }
 }
@@ -483,6 +497,34 @@ mod tests {
     }
 
     #[test]
+    fn history_success_keeps_warnings_and_accepts_replies_without_them() {
+        let warning = serde_json::json!({
+            "agentKind": "codex",
+            "code": "codex-version-unsupported",
+            "message": "版本未经验证\n路径：/Applications/Codex.app/Contents/Resources/codex\n实际：codex-cli 0.154.0\n已验证：codex-cli 0.155.0-alpha.9.2",
+        });
+        let mut reply = serde_json::json!({
+            "reply": "history",
+            "requestId": "current",
+            "response": { "kind": "list", "value": [] },
+            "warnings": [warning.clone()],
+        });
+        let payload = reply_payload(&reply.to_string(), "history", Some("current"))
+            .unwrap()
+            .unwrap();
+        let decoded = super::decode_history(payload).unwrap();
+        assert!(matches!(
+            decoded.response,
+            agentdeck_protocol::HistoryResponse::List(_)
+        ));
+        assert_eq!(decoded.warnings.len(), 1);
+        assert_eq!(decoded.warnings[0].message, warning["message"]);
+
+        reply.as_object_mut().unwrap().remove("warnings");
+        assert!(super::decode_history(reply).unwrap().warnings.is_empty());
+    }
+
+    #[test]
     fn history_replies_without_the_expected_request_id_are_ignored() {
         for raw in [
             r#"{"reply":"history","response":{"kind":"list","value":[]}}"#,
@@ -501,6 +543,9 @@ mod tests {
             "reply": "history",
             "requestId": "current",
             "error": { "code": "codex-version-unsupported", "message": message },
+            "warnings": [{
+                "agentKind": "codex", "code": "codex-version-unsupported", "message": "warning"
+            }],
         })
         .to_string();
         let payload = reply_payload(&failed, "history", Some("current")).expect("matching reply");

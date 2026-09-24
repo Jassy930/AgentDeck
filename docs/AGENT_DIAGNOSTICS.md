@@ -129,17 +129,19 @@ agentdeck history list --agent claude-code --limit 20
 均不能证明真实正文可读。
 
 macOS daemon 优先探测桌面端的 `/Applications/ChatGPT.app/Contents/Resources/codex`，
-其次探测 PATH 与常见 CLI 安装位置。跳过不存在或版本不匹配的候选，选择完整版本精确
-匹配 `protocol/CODEX_VERSION.txt` 的首个 executable。因此 shell 中的 `codex --version`
-可能仍显示 Homebrew 的 0.145.0，不能据此认定 daemon 选错版本。probe 与 spawn 使用
+其次探测 PATH 与常见 CLI 安装位置。历史 list/read 跳过不存在的候选，选择首个版本探测
+成功的 executable；与 `protocol/CODEX_VERSION.txt` 不同时仅返回
+`codex-version-unverified` warning 并继续读取。live session 仍逐候选寻找精确匹配。
+因此 shell 中的 `codex --version` 不代表 daemon 实际使用的版本。probe 与 spawn 使用
 同一规范化绝对路径。执行失败、非法输出、超时或清理失败立即返回，不再尝试其他候选。
 所有候选共享 5 秒探测预算，历史请求的候选查找与 RPC 共享 28 秒工作预算，另预留
-2 秒清理。App 更新后若不再提供固定版本，需要安装匹配版本或同步升级协议。
+2 秒清理。App 更新后历史读取会继续尝试，实际失败再按对应错误排查。
 若设置 `AGENTDECK_CODEX_BIN`，只使用指定的绝对路径，不执行自动候选查找；路径无效
-返回 `codex-version-probe-failed`，版本不匹配返回 `codex-version-unsupported`，均不回退。
-版本不匹配提示会保留每个已探测候选的规范化路径、实际版本与已验证版本，按版本
-先后提示升级 Codex 或 AgentDeck；这是“尚未验证”的精确版本门禁，不是协议不兼容
-的证明。未找到任何文件时明确提示安装或指定路径。历史 RPC/解码失败会附实际使用的
+返回 `codex-version-probe-failed`；历史版本不匹配只 warning，live session 则返回
+`codex-version-unsupported`，均不回退到其他路径。
+历史 warning 含实际路径、版本与已验证基线，桌面非阻断显示，CLI 写 stderr，stdout
+成功 JSON 保持不变。这不证明协议一定不兼容，也不保证未知格式语义完全保真。
+未找到任何文件时明确提示安装或指定路径。历史 RPC/解码失败会附实际使用的
 路径与版本；`-32601` 明确提示方法不支持，其他 RPC 错误也可能来自配置或历史数据，
 不能一概归因为版本。桌面错误文本支持滚动，重试按钮保持可见。
 
@@ -150,7 +152,8 @@ CLI 与桌面 client 都为每次历史请求生成唯一 `requestId`。daemon �
 
 | code | 含义 | 下一步 |
 | --- | --- | --- |
-| `codex-version-unsupported` | 未找到 Codex，或已探测候选均不是 AgentDeck 已验证的完整版本；提示包含实际版本和路径 | 旧版升级 Codex；新版升级 AgentDeck 或用 `AGENTDECK_CODEX_BIN` 指定已验证版本；未安装则先安装，完成后重试 |
+| `codex-version-unverified`（warning） | 历史读取使用的版本不同于已验证基线，继续执行读取 | 可继续查看；若实际读取失败，再根据对应错误检查 AgentDeck / Codex 更新 |
+| `codex-version-unsupported` | 未找到 Codex，或 live session 的候选均不匹配已验证版本；历史不会仅因版本不同返回此错误 | 未安装则先安装；live session 使用已验证版本，或更新 AgentDeck 后重试 |
 | `codex-version-probe-failed` | 已存在的候选无法执行、`--version` 非零退出或输出不是合法版本 | 检查该 executable 或 launcher 的权限、退出码及版本输出；修复此候选后重试，不会回退到其他系统安装 |
 | `codex-version-timeout` | 所有候选共享的 5 秒探测预算耗尽；探测会终止并回收独立进程组，清理预算另为 2 秒 | 检查所定位 executable 或 launcher 是否挂起；不能将它视为版本不匹配或合法空历史 |
 | `codex-spawn-failed` | 已定位 `codex`，但无法启动 `codex app-server`，或子进程标准管道不可用 | 使用实际匹配版本的 executable 运行 `app-server --help`；结合错误中的系统原因检查可执行权限、隔离属性和启动环境 |

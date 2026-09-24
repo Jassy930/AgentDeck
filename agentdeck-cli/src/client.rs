@@ -1,4 +1,4 @@
-//! v4 client API — sends `ClientCommand` JSONL, reads `ServerEvent` JSONL
+//! v5 client API — sends `ClientCommand` JSONL, reads `ServerEvent` JSONL
 //! and admin reply side-channel.
 //!
 //! ## Admin reply parsing
@@ -17,13 +17,14 @@
 //!
 //! Admin replies for `History` commands wrap the typed `HistoryResponse`
 //! envelope under `"response"` within `{"reply":"history","response":{...}}`.
+//! Successful replies may also carry non-blocking `"warnings"`.
 //! A failed request uses the same terminal reply with a typed `"error"`
 //! field, which is surfaced immediately with its daemon error code.
 
 use crate::output::CliError;
 use crate::transport::{AsyncProcessTransport, ProcessTransport, SyncTransport, split_async};
 use agentdeck_protocol::{
-    ActionDecision, AgentKind, ClientCommand, HistoryRequest, HistoryResponse, InitialTurn,
+    ActionDecision, AgentKind, ClientCommand, HistoryReply, HistoryRequest, InitialTurn,
     ProtocolError, ServerEvent, SessionCapabilities, SessionId, SessionStart, ThreadId, TurnId,
     VendorControlPayload, VendorSessionOptions,
 };
@@ -298,7 +299,7 @@ impl Client {
         serde_json::from_value::<SessionCapabilities>(caps_val).map_err(CliError::Json)
     }
 
-    pub fn history(&mut self, req: HistoryRequest) -> Result<HistoryResponse, CliError> {
+    pub fn history(&mut self, req: HistoryRequest) -> Result<HistoryReply, CliError> {
         let request_id = format!(
             "cli-history-{}-{}",
             std::process::id(),
@@ -321,7 +322,14 @@ impl Client {
                 code: None,
                 message: "missing response field in history reply".into(),
             })?;
-        serde_json::from_value::<HistoryResponse>(resp_val).map_err(CliError::Json)
+        Ok(HistoryReply {
+            response: serde_json::from_value(resp_val)?,
+            warnings: serde_json::from_value(
+                v.get("warnings")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([])),
+            )?,
+        })
     }
 }
 
@@ -565,8 +573,12 @@ mod tests {
     }
 
     fn selfcheck_reply() -> String {
-        r#"{"reply":"selfcheck","ok":true,"protocolVersion":4,"agents":["codex","claude_code"]}"#
-            .to_string()
+        serde_json::json!({
+            "reply": "selfcheck", "ok": true,
+            "protocolVersion": agentdeck_protocol::PROTOCOL_VERSION,
+            "agents": ["codex", "claude_code"],
+        })
+        .to_string()
     }
 
     fn error_event(msg: &str) -> String {
@@ -758,8 +770,11 @@ mod tests {
     fn history_parses_empty_list_response() {
         let raw = r#"{"reply":"history","response":{"kind":"list","value":[]}}"#;
         let v: serde_json::Value = serde_json::from_str(raw).unwrap();
-        let resp: HistoryResponse = serde_json::from_value(v["response"].clone()).unwrap();
-        assert!(matches!(resp, HistoryResponse::List(ref items) if items.is_empty()));
+        let resp: agentdeck_protocol::HistoryResponse =
+            serde_json::from_value(v["response"].clone()).unwrap();
+        assert!(
+            matches!(resp, agentdeck_protocol::HistoryResponse::List(ref items) if items.is_empty())
+        );
     }
 
     #[test]

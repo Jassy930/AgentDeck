@@ -112,6 +112,7 @@ pub fn render(
                 agent.error().map(str::to_string),
                 agent.can_load_more(),
                 agent.list_hint(),
+                agent.warnings.clone(),
             )
         })
         .collect();
@@ -212,7 +213,7 @@ pub fn render(
                 .border_color(cx.theme().sidebar_border)
                 .child(section_label("本机 Agent", cx))
                 .children(agents.into_iter().map(
-                    |(kind, name, status, error, can_load_more, list_hint)| {
+                    |(kind, name, status, error, can_load_more, list_hint, warnings)| {
                         v_flex()
                             .px_2()
                             .text_sm()
@@ -242,6 +243,35 @@ pub fn render(
                                     .text_color(cx.theme().sidebar_foreground.opacity(0.72))
                                     .child(hint)
                             }))
+                            .when(!warnings.is_empty(), |section| {
+                                section.child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "warnings-{}",
+                                            kind.as_str()
+                                        )))
+                                        .w_full()
+                                        .min_w(px(0.))
+                                        .max_h(px(96.))
+                                        .overflow_y_scroll()
+                                        .p_2()
+                                        .rounded_md()
+                                        .bg(cx.theme().warning.opacity(0.1))
+                                        .child(
+                                            v_flex()
+                                                .gap_1()
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .font_semibold()
+                                                        .child("兼容性警告"),
+                                                )
+                                                .children(warnings.into_iter().map(|warning| {
+                                                    div().text_xs().child(warning.message)
+                                                })),
+                                        ),
+                                )
+                            })
                             .children(error.map(|message| {
                                 v_flex()
                                     .gap_1()

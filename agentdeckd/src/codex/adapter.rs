@@ -11,8 +11,9 @@ use crate::codex::session::{
 };
 use agentdeck_protocol::{
     ActionDecision, AgentKind, CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode,
-    CodexSessionOptions, HistoryRequest, HistoryResponse, ProtocolError, SessionCapabilities,
-    SessionId, SessionStart, ThreadId, TurnId, VendorControlPayload, VendorSessionOptions,
+    CodexSessionOptions, HistoryReply, HistoryRequest, HistoryResponse, ProtocolError,
+    SessionCapabilities, SessionId, SessionStart, ThreadId, TurnId, VendorControlPayload,
+    VendorSessionOptions,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -279,35 +280,26 @@ impl Agent for CodexAdapter {
     /// Route neutral history requests through Codex's official app-server
     /// history APIs. These short-lived processes are independent of the one
     /// M0 live-session slot.
-    async fn handle_history(
-        &self,
-        request: HistoryRequest,
-    ) -> Result<HistoryResponse, ProtocolError> {
+    async fn handle_history(&self, request: HistoryRequest) -> Result<HistoryReply, ProtocolError> {
         use crate::codex::history;
         match request {
             HistoryRequest::List {
                 cwd_filter, limit, ..
-            } => {
-                let items = history::list_history(cwd_filter.as_deref(), limit).await?;
-                Ok(HistoryResponse::List(items))
-            }
-            HistoryRequest::Read { thread_id, .. } => {
-                let response = history::read_history(&thread_id).await?;
-                Ok(HistoryResponse::Read(response))
-            }
+            } => history::list_history(cwd_filter.as_deref(), limit).await,
+            HistoryRequest::Read { thread_id, .. } => history::read_history(&thread_id).await,
             HistoryRequest::Archive { thread_id, .. } => {
                 history::archive(&thread_id).await?;
-                Ok(HistoryResponse::Ack)
+                Ok(HistoryResponse::Ack.into())
             }
             HistoryRequest::Unarchive { thread_id, .. } => {
                 history::unarchive(&thread_id).await?;
-                Ok(HistoryResponse::Ack)
+                Ok(HistoryResponse::Ack.into())
             }
             HistoryRequest::Rename {
                 thread_id, title, ..
             } => {
                 history::rename(&thread_id, &title).await?;
-                Ok(HistoryResponse::Ack)
+                Ok(HistoryResponse::Ack.into())
             }
         }
     }

@@ -40,9 +40,9 @@ use crate::agent::{Agent, AgentEventSender, AgentSessionHandle};
 use crate::claude_code::translate::ClaudeCodeTranslator;
 use agentdeck_protocol::{
     ActionDecision, ActionDecisionKind, AgentKind, ClaudeCodePermissionMode,
-    ClaudeCodeSessionOptions, ClaudeCodeVendorControl, HistoryRequest, HistoryResponse,
-    InitialTurn, ProtocolError, ServerEvent, SessionCapabilities, SessionId, SessionStart,
-    ThreadId, TurnId, VendorControlPayload, VendorSessionOptions,
+    ClaudeCodeSessionOptions, ClaudeCodeVendorControl, HistoryReply, HistoryRequest,
+    HistoryResponse, InitialTurn, ProtocolError, ServerEvent, SessionCapabilities, SessionId,
+    SessionStart, ThreadId, TurnId, VendorControlPayload, VendorSessionOptions,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -633,38 +633,35 @@ impl Agent for ClaudeCodeAdapter {
     /// is a no-op for CC because `claude rm` is soft and
     /// `claude --resume <id>` keeps working regardless of archived
     /// state (spec § 5.6).
-    async fn handle_history(
-        &self,
-        request: HistoryRequest,
-    ) -> Result<HistoryResponse, ProtocolError> {
+    async fn handle_history(&self, request: HistoryRequest) -> Result<HistoryReply, ProtocolError> {
         use crate::claude_code::history;
         match request {
             HistoryRequest::List {
                 cwd_filter, limit, ..
             } => {
                 let items = history::list_history(cwd_filter.as_deref(), limit).await?;
-                Ok(HistoryResponse::List(items))
+                Ok(HistoryResponse::List(items).into())
             }
             HistoryRequest::Read { thread_id, .. } => {
                 let resp = history::read_history(&thread_id).await?;
-                Ok(HistoryResponse::Read(resp))
+                Ok(HistoryResponse::Read(resp).into())
             }
             HistoryRequest::Archive { thread_id, .. } => {
                 history::archive(&thread_id).await?;
-                Ok(HistoryResponse::Ack)
+                Ok(HistoryResponse::Ack.into())
             }
             HistoryRequest::Unarchive { .. } => {
                 // CC: `claude rm` is soft; --resume always finds the
                 // jsonl back. Unarchive is therefore a guaranteed
                 // no-op — return Ack so the UI can fold the action
                 // away without surfacing an error.
-                Ok(HistoryResponse::Ack)
+                Ok(HistoryResponse::Ack.into())
             }
             HistoryRequest::Rename {
                 thread_id, title, ..
             } => {
                 history::rename(&thread_id, &title).await?;
-                Ok(HistoryResponse::Ack)
+                Ok(HistoryResponse::Ack.into())
             }
         }
     }

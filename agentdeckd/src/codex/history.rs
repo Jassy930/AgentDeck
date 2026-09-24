@@ -8,8 +8,8 @@
 use crate::codex::app_server::{SHORT_LIVED_SHUTDOWN_TIMEOUT, ShortLivedAppServer};
 use crate::codex::translate::history_item_to_agent_item;
 use agentdeck_protocol::{
-    AgentKind, HistoryListItem, HistoryReadResponse, HistoryTurn, ProtocolError, ThreadId,
-    effective_history_list_limit,
+    AgentKind, HistoryListItem, HistoryReadResponse, HistoryReply, HistoryResponse, HistoryTurn,
+    ProtocolError, ThreadId, effective_history_list_limit,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -179,13 +179,13 @@ fn decode_thread_list_page(
 pub async fn list_history(
     cwd_filter: Option<&Path>,
     limit: Option<usize>,
-) -> Result<Vec<HistoryListItem>, ProtocolError> {
+) -> Result<HistoryReply, ProtocolError> {
     let cwd_filter = cwd_filter.map(Path::to_path_buf);
     let started = tokio::time::Instant::now();
     let mut client = with_history_deadline(
         "list",
         history_work_timeout(),
-        ShortLivedAppServer::spawn(&runtime_cwd()?),
+        ShortLivedAppServer::spawn_for_history(&runtime_cwd()?),
     )
     .await?;
     let result = with_history_deadline(
@@ -195,7 +195,12 @@ pub async fn list_history(
     )
     .await;
     client.shutdown().await;
-    result.map_err(|error| client.enrich_error(error))
+    result
+        .map(|items| HistoryReply {
+            response: HistoryResponse::List(items),
+            warnings: client.version_warning().into_iter().collect(),
+        })
+        .map_err(|error| client.enrich_error(error))
 }
 
 async fn list_history_inner(
@@ -267,12 +272,12 @@ fn decode_thread_read(
 
 /// Read all persisted turns/items for one Codex thread. The item payloads are
 /// mapped through the same completed-item translator as live sessions.
-pub async fn read_history(thread_id: &ThreadId) -> Result<HistoryReadResponse, ProtocolError> {
+pub async fn read_history(thread_id: &ThreadId) -> Result<HistoryReply, ProtocolError> {
     let started = tokio::time::Instant::now();
     let mut client = with_history_deadline(
         "read",
         history_work_timeout(),
-        ShortLivedAppServer::spawn(&runtime_cwd()?),
+        ShortLivedAppServer::spawn_for_history(&runtime_cwd()?),
     )
     .await?;
     let result = with_history_deadline(
@@ -282,7 +287,12 @@ pub async fn read_history(thread_id: &ThreadId) -> Result<HistoryReadResponse, P
     )
     .await;
     client.shutdown().await;
-    result.map_err(|error| client.enrich_error(error))
+    result
+        .map(|response| HistoryReply {
+            response: HistoryResponse::Read(response),
+            warnings: client.version_warning().into_iter().collect(),
+        })
+        .map_err(|error| client.enrich_error(error))
 }
 
 async fn read_history_inner(
@@ -666,7 +676,7 @@ mod tests {
             ];
             let mut script = format!(
                 "#!/bin/sh\nif [ \"$1\" = '--version' ]; then\n  printf '%s\\n' '{}'\n  exit 0\nfi\n",
-                crate::codex::capabilities::supported_codex_version()
+                "codex-cli 99.0.0"
             );
             for (index, reply) in replies.iter().enumerate() {
                 script.push_str(&format!(
@@ -683,8 +693,21 @@ mod tests {
             script.push_str("while IFS= read -r frame; do :; done\n");
             std::fs::write(&executable, script).unwrap();
             std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let binary = CodexBinary::resolve_at(&executable).await.unwrap();
+            let binary = CodexBinary::resolve_at(&executable, false).await.unwrap();
             let mut client = ShortLivedAppServer::spawn_with_binary(&root, &binary).unwrap();
+            let warning = client
+                .version_warning()
+                .expect("unverified runtime warning");
+            assert_eq!(warning.agent_kind, AgentKind::Codex);
+            assert_eq!(warning.code, "codex-version-unverified");
+            for detail in [
+                "codex-cli 99.0.0",
+                crate::codex::capabilities::supported_codex_version(),
+                executable.to_str().unwrap(),
+                "已继续读取历史",
+            ] {
+                assert!(warning.message.contains(detail), "{}", warning.message);
+            }
             let result = read_history_inner(&mut client, ThreadId("thread-1".into())).await;
             client.shutdown().await;
             let requests: Vec<Value> = std::fs::read_to_string(&log)
@@ -760,15 +783,21 @@ mod tests {
             eprintln!("SKIP gated_real_codex_list_and_read_smoke: AGENTDECK_E2E != 1");
             return;
         }
-        let items = list_history(None, Some(3))
+        let reply = list_history(None, Some(3))
             .await
             .expect("real Codex thread/list should succeed");
+        let HistoryResponse::List(items) = reply.response else {
+            panic!("expected history list response");
+        };
         assert!(items.len() <= 3);
         assert!(items.iter().all(|item| item.agent_kind == AgentKind::Codex));
         if let Some(first) = items.first() {
-            let detail = read_history(&first.thread_id)
+            let reply = read_history(&first.thread_id)
                 .await
                 .expect("real Codex thread/read should succeed");
+            let HistoryResponse::Read(detail) = reply.response else {
+                panic!("expected history read response");
+            };
             assert_eq!(detail.thread_id, first.thread_id);
             assert_eq!(detail.agent_kind, AgentKind::Codex);
         }

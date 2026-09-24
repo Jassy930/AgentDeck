@@ -473,7 +473,32 @@ pub enum HistoryResponse {
     Ack,
 }
 
-// ── ClientCommand — all v4 client-to-server commands ────────────────────────
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HistoryWarning {
+    pub agent_kind: AgentKind,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HistoryReply {
+    pub response: HistoryResponse,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<HistoryWarning>,
+}
+
+impl From<HistoryResponse> for HistoryReply {
+    fn from(response: HistoryResponse) -> Self {
+        Self {
+            response,
+            warnings: Vec::new(),
+        }
+    }
+}
+
+// ── ClientCommand — all v5 client-to-server commands ────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "command", rename_all = "camelCase", deny_unknown_fields)]
