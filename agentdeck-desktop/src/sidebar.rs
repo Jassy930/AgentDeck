@@ -412,6 +412,7 @@ fn session_row(
 ) -> impl IntoElement + use<> {
     let id: SharedString = item.thread_id.0.clone().into();
     let payload = item.clone();
+    let title = session_title(item);
     // Button 的内部 label 容器不会收缩，扣除 padding、边框、图标与 gap_2。
     let title_width = px(WIDTH - 3. - AGENT_ICON_SIZE) - window.rem_size() * 4.;
 
@@ -424,7 +425,7 @@ fn session_row(
         })
         .w_full()
         .justify_start()
-        .tooltip(agent_label(item.agent_kind))
+        .tooltip(format!("{title}\n{}", item.cwd.display()))
         .child(agent_icon(item.agent_kind))
         .child(
             div()
@@ -433,7 +434,7 @@ fn session_row(
                 .whitespace_normal()
                 .line_clamp(1)
                 .text_ellipsis()
-                .child(session_title(item)),
+                .child(title),
         )
         .on_click(cx.listener(move |shell, _, window, cx| {
             shell.sidebar_focus.focus(window);
