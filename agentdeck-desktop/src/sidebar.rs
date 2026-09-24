@@ -7,16 +7,18 @@ use std::sync::{Arc, LazyLock};
 
 use agentdeck_protocol::{AgentKind, HistoryListItem};
 use gpui::{
-    Bounds, Context, Image, ImageFormat, IntoElement, ParentElement, SharedString, Window, canvas,
-    div, fill, img, point, prelude::*, px, rgb, size, uniform_list,
+    App, Bounds, Context, FontWeight, Image, ImageFormat, IntoElement, ParentElement, Pixels,
+    SharedString, Window, canvas, div, fill, img, point, prelude::*, px, rgb, size, uniform_list,
 };
 use gpui_component::{
     ActiveTheme, Disableable, InteractiveElementExt, Selectable, StyledExt,
     button::{Button, ButtonVariants},
-    h_flex, v_flex,
+    h_flex,
+    tooltip::Tooltip,
+    v_flex,
 };
 
-use crate::shell::{Shell, agent_label, session_title};
+use crate::shell::{Shell, agent_label, project_name, session_title};
 
 /// 侧栏宽度，与 Codex Desktop 的全高侧栏一致。
 const WIDTH: f32 = 248.;
@@ -412,11 +414,13 @@ fn session_row(
 ) -> impl IntoElement + use<> {
     let id: SharedString = item.thread_id.0.clone().into();
     let payload = item.clone();
-    let title = session_title(item);
+    let title: SharedString = session_title(item).into();
+    let folder: SharedString = project_name(item).into();
+    let path: SharedString = item.cwd.display().to_string().into();
     // Button 的内部 label 容器不会收缩，扣除 padding、边框、图标与 gap_2。
     let title_width = px(WIDTH - 3. - AGENT_ICON_SIZE) - window.rem_size() * 4.;
 
-    Button::new(id)
+    let mut button = Button::new(id)
         .ghost()
         .selected(selected)
         .tab_stop(false)
@@ -425,7 +429,6 @@ fn session_row(
         })
         .w_full()
         .justify_start()
-        .tooltip(format!("{title}\n{}", item.cwd.display()))
         .child(agent_icon(item.agent_kind))
         .child(
             div()
@@ -434,10 +437,73 @@ fn session_row(
                 .whitespace_normal()
                 .line_clamp(1)
                 .text_ellipsis()
-                .child(title),
+                .child(title.clone()),
         )
         .on_click(cx.listener(move |shell, _, window, cx| {
             shell.sidebar_focus.focus(window);
             shell.open_session(payload.clone(), cx);
-        }))
+        }));
+
+    button.interactivity().tooltip(move |window, cx| {
+        let (title, folder, path) = (title.clone(), folder.clone(), path.clone());
+        Tooltip::element(move |window, cx| {
+            let width = px(320.);
+            v_flex()
+                .w(width)
+                .gap_3()
+                .whitespace_normal()
+                .child(tooltip_title(title.clone(), width, window, cx))
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(div().line_clamp(1).text_ellipsis().child(folder.clone()))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(path.clone()),
+                        ),
+                )
+        })
+        .p_3()
+        .rounded(px(12.))
+        .build(window, cx)
+    });
+    button
+}
+
+fn tooltip_title(title: SharedString, width: Pixels, window: &Window, cx: &App) -> gpui::Div {
+    let mut style = window.text_style();
+    style.font_family = cx.theme().font_family.clone();
+    style.font_weight = FontWeight::SEMIBOLD;
+    let third_line_start = window
+        .text_system()
+        .shape_text(
+            title.clone(),
+            window.rem_size() * 0.875,
+            &[style.to_run(title.len())],
+            Some(width),
+            None,
+        )
+        .ok()
+        .and_then(|lines| {
+            let line = lines.first()?;
+            (line.wrap_boundaries().len() > 2).then(|| {
+                let boundary = line.wrap_boundaries()[1];
+                line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index
+            })
+        });
+    v_flex().w(width).font_semibold().map(|this| {
+        if let Some(start) = third_line_start {
+            // GPUI 多行省略可能把后缀裁掉；按实际换行点保留前两行，最后一行单独省略。
+            this.child(title[..start].trim_end().to_owned()).child(
+                div()
+                    .line_clamp(1)
+                    .text_ellipsis()
+                    .child(title[start..].to_owned()),
+            )
+        } else {
+            this.child(title)
+        }
+    })
 }

@@ -37,7 +37,8 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
   `uniform_list`）都只渲染可见区域附近的条目，长会话滚动不再逐帧排版全部内容。
   侧栏每条会话带 16px 来源像素图标：Codex 为蓝色宠物
   [Codey](https://learn.chatgpt.com/docs/pets) 的简化版，Claude Code 为暖橙色小螃蟹；
-  悬停显示完整会话标题与项目路径。长标题以省略号显示；Tab 聚焦会话列表后，用上下键移动并自动滚动到目标条目，
+  悬停显示信息卡：标题最多三行，底部显示文件夹名和弱化的完整路径。
+  列表中的长标题以省略号显示；Tab 聚焦会话列表后，用上下键移动并自动滚动到目标条目，
   Return 打开会话，Tab / Shift-Tab 离开列表。
 - composer 显示当前会话的项目与 agent，两种形态共用草稿；发送和搜索仍禁用，
   模型、审批和沙箱显示暂不可用。
