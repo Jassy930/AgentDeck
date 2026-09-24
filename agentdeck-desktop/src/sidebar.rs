@@ -5,10 +5,10 @@
 use std::ops::Range;
 use std::sync::{Arc, LazyLock};
 
-use agentdeck_protocol::HistoryListItem;
+use agentdeck_protocol::{AgentKind, HistoryListItem};
 use gpui::{
-    Context, Image, ImageFormat, IntoElement, ParentElement, SharedString, Window, div, img,
-    prelude::*, px, uniform_list,
+    Bounds, Context, Image, ImageFormat, IntoElement, ParentElement, SharedString, Window, canvas,
+    div, fill, img, point, prelude::*, px, rgb, size, uniform_list,
 };
 use gpui_component::{
     ActiveTheme, Disableable, InteractiveElementExt, Selectable, StyledExt,
@@ -20,6 +20,77 @@ use crate::shell::{Shell, agent_label, session_title};
 
 /// 侧栏宽度，与 Codex Desktop 的全高侧栏一致。
 const WIDTH: f32 = 248.;
+const AGENT_ICON_SIZE: f32 = 16.;
+
+const CODEX_PIXELS: [&[u8; 16]; 16] = [
+    b".....bbb........",
+    b"...bbbbbbbb.....",
+    b"..bbbbbbbbbbb...",
+    b".bbbbbbbbbbbbb..",
+    b".bbbddddddddbb..",
+    b".bbbdfddddddbb..",
+    b".bbbddfdddddbb..",
+    b".bbbdfddfffdbb..",
+    b"..bbddddddddbb..",
+    b"...bbbbbbbbbb...",
+    b"....bbbbbbb.....",
+    b"...bbbbbbbbb....",
+    b"..bbbfbbffbbb...",
+    b"..bb.bbbbbb.bb..",
+    b".....bb.bb......",
+    b".....bb.bb......",
+];
+
+const CLAUDE_PIXELS: [&[u8; 16]; 16] = [
+    b"................",
+    b"................",
+    b"................",
+    b"...cccccccccc...",
+    b"...cccccccccc...",
+    b"...cccccccccc...",
+    b".cccc.cccc.cccc.",
+    b".cccc.cccc.cccc.",
+    b".cccccccccccccc.",
+    b"...cccccccccc...",
+    b"...cccccccccc...",
+    b"...cc.c..c.cc...",
+    b"...cc.c..c.cc...",
+    b"...cc.c..c.cc...",
+    b"................",
+    b"................",
+];
+
+fn agent_icon(kind: AgentKind) -> impl IntoElement {
+    let pixels = match kind {
+        AgentKind::Codex => &CODEX_PIXELS,
+        AgentKind::ClaudeCode => &CLAUDE_PIXELS,
+    };
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            for (y, row) in pixels.iter().enumerate() {
+                for (x, pixel) in row.iter().enumerate() {
+                    let color = match pixel {
+                        b'b' => rgb(0x7495ff),
+                        b'd' => rgb(0x25386f),
+                        b'f' => rgb(0xa7f3f0),
+                        b'c' => rgb(0xc87555),
+                        _ => continue,
+                    };
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            bounds.origin + point(px(x as f32), px(y as f32)),
+                            size(px(1.), px(1.)),
+                        ),
+                        color,
+                    ));
+                }
+            }
+        },
+    )
+    .size(px(AGENT_ICON_SIZE))
+    .flex_shrink_0()
+}
 
 static BRAND_ICON: LazyLock<Arc<Image>> = LazyLock::new(|| {
     Arc::new(Image::from_bytes(
@@ -341,8 +412,8 @@ fn session_row(
 ) -> impl IntoElement + use<> {
     let id: SharedString = item.thread_id.0.clone().into();
     let payload = item.clone();
-    // Button 的内部 label 容器不会收缩，正文需先扣除侧栏/按钮 padding 与三条边框。
-    let title_width = px(WIDTH - 3.) - window.rem_size() * 3.5;
+    // Button 的内部 label 容器不会收缩，扣除 padding、边框、图标与 gap_2。
+    let title_width = px(WIDTH - 3. - AGENT_ICON_SIZE) - window.rem_size() * 4.;
 
     Button::new(id)
         .ghost()
@@ -353,6 +424,8 @@ fn session_row(
         })
         .w_full()
         .justify_start()
+        .tooltip(agent_label(item.agent_kind))
+        .child(agent_icon(item.agent_kind))
         .child(
             div()
                 .w(title_width)

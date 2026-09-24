@@ -44,7 +44,7 @@ poison 并退出 daemon。protocol v4 增加累计消息的 item identity/state/
 
 ## 分层边界
 
-- `agentdeck-desktop/`：macOS GPUI executable。负责窗口、组件根节点、外壳布局（侧栏 / 空态 / 会话态 / composer）和桌面 selfcheck。`daemon.rs` 是唯一的数据入口：只发 `AgentList` 和 `History` 命令，只消费中立类型；侧栏与空态卡片都按 daemon 返回的 `AgentKind` 迭代生成，不硬编码 vendor 分支，也不解析 vendor JSON。阻塞 IPC 一律走 GPUI background executor，UI 线程不等 daemon。
+- `agentdeck-desktop/`：macOS GPUI executable。负责窗口、组件根节点、外壳布局（侧栏 / 空态 / 会话态 / composer）和桌面 selfcheck。`daemon.rs` 是唯一的数据入口：只发 `AgentList` 和 `History` 命令，只消费中立类型；侧栏与空态卡片都按 daemon 返回的 `AgentKind` 迭代生成，不按 vendor 分支查询或路由，也不解析 vendor JSON。侧栏按 `AgentKind` 选择来源像素图标，仅用于标识。阻塞 IPC 一律走 GPUI background executor，UI 线程不等 daemon。
 - `Sources/AgentDeckMobileCore/`：iOS 使用的平台无关 Swift 模型，禁止 import AppKit/UIKit。
 - `agentdeck-protocol/`：本地 IPC 协议事实源 crate。分 trunk / capabilities / vendor 三个模块，`PROTOCOL_VERSION` = 5，`protocol_schema()` 聚合本地 v5 类型。
 - `agentdeckd/src/ipc.rs`：re-export `agentdeck-protocol::*` 壳，保持 daemon 内 `crate::ipc::X` 引用不变。
