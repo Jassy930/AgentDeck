@@ -12,9 +12,16 @@
 重生成快照；仅清除不属于本地 IPC 的聚合根不改变版本。`cargo test` 的 drift 测试
 会在类型与快照脱节时失败。
 
+当前为 v5。历史成功 admin 回复保留 `response`，新增可选 `warnings` 数组；每项包含
+`agentKind`、`code`、`message`。空 warnings 省略；`requestId` 仍原样回显，失败仍使用
+`error`。`HistoryReply` / `HistoryWarning` 均纳入生成快照。
+`HistoryReply` 是成功回复的内容类型，允许完整 admin 回复中的 `reply` / `requestId`
+等额外字段；客户端先校验关联并识别错误，再解码成功内容。Swift mirror 使用相同的
+字段与 warnings 缺省/省略规则。
+
 ## actionDecision wire 形态
 
-`ActionDecision` 是 protocol v4 `ClientCommand` 的 typed variant，并包含在 schema：
+`ActionDecision` 是 `ClientCommand` 的 typed variant，并包含在 schema：
 
 ```json
 {

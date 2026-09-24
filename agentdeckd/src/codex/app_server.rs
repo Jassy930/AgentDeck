@@ -8,7 +8,7 @@
 use crate::codex::capabilities::{
     VERSION_PROBE_TIMEOUT, check_probe_deadline, probe_codex_version_at, supported_codex_version,
 };
-use agentdeck_protocol::ProtocolError;
+use agentdeck_protocol::{AgentKind, HistoryWarning, ProtocolError};
 use serde_json::{Value, json};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -38,7 +38,7 @@ fn unsupported_version_error(message: impl Into<String>) -> ProtocolError {
     }
 }
 
-/// One canonical Codex executable together with its validated pinned version.
+/// One canonical Codex executable together with its probed version.
 ///
 /// Session owners resolve this once, then pass the same value to capability
 /// emission and app-server spawn. This prevents GUI PATH differences from
@@ -51,10 +51,26 @@ pub(crate) struct CodexBinary {
 
 impl CodexBinary {
     pub(crate) async fn resolve(cancel: &mut watch::Receiver<bool>) -> Result<Self, ProtocolError> {
+        Self::resolve_with_policy(cancel, true).await
+    }
+
+    pub(super) async fn resolve_for_history(
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<Self, ProtocolError> {
+        // 桌面端可能已写入新版历史，回退旧 CLI 会让这些记录无法解析；
+        // 只读历史保留优先运行时，live session 仍独立通过精确版本门禁。
+        Self::resolve_with_policy(cancel, false).await
+    }
+
+    async fn resolve_with_policy(
+        cancel: &mut watch::Receiver<bool>,
+        require_verified: bool,
+    ) -> Result<Self, ProtocolError> {
         Self::resolve_candidates(
             codex_candidates(std::env::var_os("AGENTDECK_CODEX_BIN").map(PathBuf::from))?,
             Instant::now() + VERSION_PROBE_TIMEOUT,
             cancel,
+            require_verified,
         )
         .await
     }
@@ -63,6 +79,7 @@ impl CodexBinary {
         candidates: impl IntoIterator<Item = PathBuf>,
         deadline: Instant,
         cancel: &mut watch::Receiver<bool>,
+        require_verified: bool,
     ) -> Result<Self, ProtocolError> {
         let mut checked = Vec::new();
         let mut mismatches = Vec::new();
@@ -75,7 +92,7 @@ impl CodexBinary {
                 continue;
             }
             checked.push(path.clone());
-            match probe_codex_version_at(&path, deadline, cancel).await {
+            match probe_codex_version_at(&path, deadline, cancel, require_verified).await {
                 Ok(version) => {
                     check_probe_deadline(deadline, cancel)?;
                     return Ok(Self { path, version });
@@ -107,7 +124,10 @@ impl CodexBinary {
     /// callers use [`Self::resolve`]; deterministic tests use this entrypoint
     /// so they never inspect or execute the user's PATH vendor.
     #[cfg(test)]
-    pub(crate) async fn resolve_at(path: &Path) -> Result<Self, ProtocolError> {
+    pub(crate) async fn resolve_at(
+        path: &Path,
+        require_verified: bool,
+    ) -> Result<Self, ProtocolError> {
         let path = path.canonicalize().map_err(|_| {
             unsupported_version_error("supported Codex CLI executable could not be resolved")
         })?;
@@ -117,9 +137,13 @@ impl CodexBinary {
             ));
         }
         let (_cancel_tx, mut cancel) = watch::channel(false);
-        let version =
-            probe_codex_version_at(&path, Instant::now() + VERSION_PROBE_TIMEOUT, &mut cancel)
-                .await?;
+        let version = probe_codex_version_at(
+            &path,
+            Instant::now() + VERSION_PROBE_TIMEOUT,
+            &mut cancel,
+            require_verified,
+        )
+        .await?;
         Ok(Self { path, version })
     }
 
@@ -129,6 +153,17 @@ impl CodexBinary {
 
     pub(crate) fn version(&self) -> &str {
         &self.version
+    }
+
+    fn enrich_error(&self, mut error: ProtocolError) -> ProtocolError {
+        error.message = format!(
+            "{}\nCodex：{}\n已验证：{}\n路径：{}",
+            error.message,
+            self.version(),
+            supported_codex_version(),
+            self.path().display()
+        );
+        error
     }
 }
 
@@ -544,10 +579,10 @@ pub(super) struct ShortLivedAppServer {
 }
 
 impl ShortLivedAppServer {
-    pub(super) async fn spawn(cwd: &Path) -> Result<Self, ProtocolError> {
+    pub(super) async fn spawn_for_history(cwd: &Path) -> Result<Self, ProtocolError> {
         let (_cancel_tx, mut cancel) = watch::channel(false);
-        let binary = CodexBinary::resolve(&mut cancel).await?;
-        Self::spawn_with_binary(cwd, &binary)
+        let binary = CodexBinary::resolve_for_history(&mut cancel).await?;
+        Self::spawn_with_binary(cwd, &binary).map_err(|error| binary.enrich_error(error))
     }
 
     pub(crate) fn spawn_with_binary(
@@ -621,14 +656,22 @@ impl ShortLivedAppServer {
         .map_err(map_short_lived_error)
     }
 
-    pub(super) fn enrich_error(&self, mut error: ProtocolError) -> ProtocolError {
-        error.message = format!(
-            "{}\nCodex：{}\n路径：{}",
-            error.message,
-            self.binary.version(),
-            self.binary.path().display()
-        );
-        self.stderr_tail.enrich_error(error)
+    pub(super) fn enrich_error(&self, error: ProtocolError) -> ProtocolError {
+        self.stderr_tail
+            .enrich_error(self.binary.enrich_error(error))
+    }
+
+    pub(super) fn version_warning(&self) -> Option<HistoryWarning> {
+        (self.binary.version() != supported_codex_version()).then(|| HistoryWarning {
+            agent_kind: AgentKind::Codex,
+            code: "codex-version-unverified".into(),
+            message: format!(
+                "当前 Codex 版本尚未验证，已继续读取历史。实际：{}；已验证：{}；路径：{}。读取成功不代表完整兼容；如读取失败，请检查 AgentDeck 更新或选择已验证版本。",
+                self.binary.version(),
+                supported_codex_version(),
+                self.binary.path().display()
+            ),
+        })
     }
 
     pub(super) async fn shutdown(&mut self) {
@@ -844,7 +887,9 @@ done
     #[tokio::test]
     async fn fake_binary_is_probed_and_spawned_by_the_same_canonical_path() {
         let fake = FakeCodex::new(supported_codex_version());
-        let binary = CodexBinary::resolve_at(&fake.executable).await.unwrap();
+        let binary = CodexBinary::resolve_at(&fake.executable, true)
+            .await
+            .unwrap();
         let canonical = fake.executable.canonicalize().unwrap();
 
         assert!(binary.path().is_absolute());
@@ -852,6 +897,7 @@ done
         assert_eq!(binary.version(), supported_codex_version());
 
         let mut client = ShortLivedAppServer::spawn_with_binary(&fake.root, &binary).unwrap();
+        assert!(client.version_warning().is_none());
         assert_eq!(client.initialize().await.unwrap(), json!({ "fake": true }));
         assert_eq!(
             client.request("fake/ping", json!({})).await.unwrap(),
@@ -904,6 +950,7 @@ done
             [desktop.executable.clone(), cli.executable.clone()],
             Instant::now() + VERSION_PROBE_TIMEOUT,
             &mut cancel,
+            true,
         )
         .await
         .unwrap();
@@ -934,6 +981,68 @@ done
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn history_keeps_unverified_desktop_instead_of_switching_to_matching_cli() {
+        let desktop = FakeCodex::new("codex-cli 99.0.0");
+        let cli = FakeCodex::new(supported_codex_version());
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let binary = CodexBinary::resolve_candidates(
+            [
+                desktop.root.join("missing"),
+                desktop.executable.clone(),
+                cli.executable.clone(),
+            ],
+            Instant::now() + VERSION_PROBE_TIMEOUT,
+            &mut cancel,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(binary.path(), desktop.executable.canonicalize().unwrap());
+        assert_eq!(binary.version(), "codex-cli 99.0.0");
+        assert!(
+            !cli.log.exists(),
+            "history must not switch runtime on mismatch"
+        );
+
+        let mut client = ShortLivedAppServer::spawn_with_binary(&desktop.root, &binary).unwrap();
+        assert_eq!(client.initialize().await.unwrap(), json!({ "fake": true }));
+        let warning = client
+            .version_warning()
+            .expect("unverified runtime warning");
+        assert_eq!(warning.code, "codex-version-unverified");
+        assert!(warning.message.contains(binary.version()));
+        assert!(warning.message.contains(supported_codex_version()));
+        assert!(warning.message.contains(binary.path().to_str().unwrap()));
+        client.shutdown().await;
+        let spawn_error =
+            ShortLivedAppServer::spawn_with_binary(&desktop.root.join("missing-cwd"), &binary)
+                .err()
+                .expect("missing cwd must fail to spawn");
+        let spawn_error = binary.enrich_error(spawn_error);
+        assert_eq!(spawn_error.code, "codex-spawn-failed");
+        for detail in [
+            binary.version(),
+            supported_codex_version(),
+            binary.path().to_str().unwrap(),
+        ] {
+            assert!(
+                spawn_error.message.contains(detail),
+                "{}",
+                spawn_error.message
+            );
+        }
+        assert_eq!(
+            desktop
+                .calls()
+                .iter()
+                .filter(|call| call.starts_with("probe|"))
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn resolution_skips_duplicate_and_unsupported_candidates() {
         let old = FakeCodex::new("codex-cli 0.145.0");
         let supported = FakeCodex::new(supported_codex_version());
@@ -947,6 +1056,7 @@ done
             ],
             Instant::now() + VERSION_PROBE_TIMEOUT,
             &mut cancel,
+            true,
         )
         .await
         .unwrap();
@@ -958,6 +1068,7 @@ done
             [old.executable.clone(), old.executable.clone()],
             Instant::now() + VERSION_PROBE_TIMEOUT,
             &mut cancel,
+            true,
         )
         .await
         .unwrap_err();
@@ -979,6 +1090,7 @@ done
             [old.executable.clone(), newer.executable.clone()],
             Instant::now() + VERSION_PROBE_TIMEOUT,
             &mut cancel,
+            true,
         )
         .await
         .unwrap_err();
@@ -990,6 +1102,7 @@ done
             [old.root.join("missing")],
             Instant::now() + VERSION_PROBE_TIMEOUT,
             &mut cancel,
+            true,
         )
         .await
         .unwrap_err();
@@ -1013,6 +1126,7 @@ done
                 [failed.executable.clone(), supported.executable.clone()],
                 Instant::now() + VERSION_PROBE_TIMEOUT,
                 &mut cancel,
+                false,
             )
             .await
             .unwrap_err();
@@ -1060,6 +1174,7 @@ done
                     ],
                     started + Duration::from_millis(400),
                     &mut cancel,
+                    true,
                 )
                 .await
                 .unwrap_err();
@@ -1089,13 +1204,15 @@ done
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
-        let missing = CodexBinary::resolve_at(&root.join("codex"))
+        let missing = CodexBinary::resolve_at(&root.join("codex"), true)
             .await
             .unwrap_err();
         assert_eq!(missing.code, "codex-version-unsupported");
 
         let fake = FakeCodex::new("codex-cli 0.146.0");
-        let mismatch = CodexBinary::resolve_at(&fake.executable).await.unwrap_err();
+        let mismatch = CodexBinary::resolve_at(&fake.executable, true)
+            .await
+            .unwrap_err();
         assert_eq!(mismatch.code, "codex-version-unsupported");
         assert_eq!(fake.calls().len(), 1, "mismatch must not spawn app-server");
         assert!(fake.calls()[0].ends_with("|--version"));

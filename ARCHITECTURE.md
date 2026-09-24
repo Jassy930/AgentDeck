@@ -46,7 +46,7 @@ poison 并退出 daemon。protocol v4 增加累计消息的 item identity/state/
 
 - `agentdeck-desktop/`：macOS GPUI executable。负责窗口、组件根节点、外壳布局（侧栏 / 空态 / 会话态 / composer）和桌面 selfcheck。`daemon.rs` 是唯一的数据入口：只发 `AgentList` 和 `History` 命令，只消费中立类型；侧栏与空态卡片都按 daemon 返回的 `AgentKind` 迭代生成，不硬编码 vendor 分支，也不解析 vendor JSON。阻塞 IPC 一律走 GPUI background executor，UI 线程不等 daemon。
 - `Sources/AgentDeckMobileCore/`：iOS 使用的平台无关 Swift 模型，禁止 import AppKit/UIKit。
-- `agentdeck-protocol/`：本地 IPC 协议事实源 crate。分 trunk / capabilities / vendor 三个模块，`PROTOCOL_VERSION` = 4，`protocol_schema()` 聚合本地 v4 类型。
+- `agentdeck-protocol/`：本地 IPC 协议事实源 crate。分 trunk / capabilities / vendor 三个模块，`PROTOCOL_VERSION` = 5，`protocol_schema()` 聚合本地 v5 类型。
 - `agentdeckd/src/ipc.rs`：re-export `agentdeck-protocol::*` 壳，保持 daemon 内 `crate::ipc::X` 引用不变。
 - `agentdeckd/src/agent.rs`：`Agent` trait + `AgentKind` 枚举。两个 adapter 共享的逻辑在此，不得让 adapter 相互引用。
 - `agentdeckd/src/runtime/`：`RuntimeHub`（stdin loop + stdout writer）+ `AgentRouter`（sessionId → agentKind → adapter）。
@@ -124,11 +124,14 @@ agentdeck-cli（参考客户端 / E2E 驱动，与 GUI 互相独立）
 
 `agentdeck-protocol` crate 是 IPC 协议的唯一事实源：
 
-- `PROTOCOL_VERSION`：当前为 4。v4 的 `AgentItem` 必须携带 `turnId`、`itemId` 与
+- `PROTOCOL_VERSION`：当前为 5。v5 增加 `HistoryReply` / `HistoryWarning`，历史成功回复
+  保留顶层 `response` 并可携带同层 `warnings`；`HistoryReply` 只表示成功内容，忽略
+  `reply` / `requestId` 等 envelope 字段，关联校验和错误识别仍由 client 负责。
+  Swift Core 同步对应 Codable 类型。失败仍走 `error`。v4 的 `AgentItem` 必须携带 `turnId`、`itemId` 与
   `state`（streaming/completed），同 item 的文本是累计快照。v3 引入 caller-owned `sessionId` / `turnId`、显式
   `TurnStart` / `TurnCancel` / `SessionClose` 和两级 terminal；`TurnComplete` 暂只保留给
   尚未迁移的 Claude Code 路径。
-- `protocol_schema()`：schemars 从 Rust 类型派生的 JSON Schema，聚合所有 v4 公共类型。
+- `protocol_schema()`：schemars 从 Rust 类型派生的 JSON Schema，聚合所有 v5 公共类型。
 - 快照：`protocol/agentdeck/agentdeck-protocol.schema.json`（`UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot` 重生成）。
 - 漂移测试随 `cargo test` 运行。
 - 中立性测试（`neutrality_tests.rs`）守护 N1/N4。

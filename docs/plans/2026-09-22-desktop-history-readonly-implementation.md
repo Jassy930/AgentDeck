@@ -335,3 +335,43 @@ macOS 进程组存在性查询在组仅剩僵尸进程时可能返回 `EPERM`；
   展示用户、助手与工具正文。
   本轮不发送模型 prompt，alpha.16 完整 lifecycle E2E 仍未验收；也不承诺识别所有
   不触发 RPC/解码错误的语义漂移。
+
+## 2026-09-24：历史版本不匹配仅警告
+
+- 历史 list/read 保持桌面端优先、系统 CLI 兜底，选择首个版本探测成功的运行时；
+  版本不同返回 `codex-version-unverified` warning 并继续读取。显式路径不回退，
+  探测、启动、RPC、解码和分页失败仍报错；任意一页失败不返回残缺正文。
+- live session 保留精确版本门禁，Codex archive/unarchive/rename 仍不支持。
+  vendor schema 基线仍为 alpha.16；AgentDeck IPC 升至 v5，成功历史回复以
+  `HistoryReply` 携带中立 warnings，包括跨来源成功空列表。CLI 将 warning 写到
+  stderr，成功 stdout 与退出码不变；桌面在来源和正文区域显示可滚动警告，成功
+  新结果覆盖旧 warning，不重复累积，旧请求不能覆盖新正文。
+- 91 项 Codex focused、30 项 desktop、protocol/router focused 与完整离线门禁通过；
+  绑定当前 checkout daemon 的 CLI selfcheck、diagnostics report、desktop selfcheck、
+  真实 bundle verify、格式与文档检查通过。
+- 显式 `AGENTDECK_E2E=1` 的真实 CLI 使用桌面端 `0.155.0-alpha.16.3`，成功读取
+  101 条列表，以及此前失败会话的 23 轮 / 1,576 个条目；两者均输出版本 warning。
+  重建后的真实桌面显示 Codex / Claude Code 各 50 条，点击该 Codex 会话可见用户、
+  助手和工具正文，顶部同时显示版本与完整路径。加载更多扩展到 Codex 100 条，
+  正文保持显示，来源警告可滚动读全且未累积重复卡片。
+- 本轮只验证真实历史读取，未发送模型 prompt；不承诺未知未来格式的完整语义保真。
+
+## 2026-09-24：历史兼容警告审查修复
+
+- `HistoryReply` 接受完整成功回复中的 transport metadata，desktop 不再手动删除
+  `reply` / `requestId`；内部 response 与 warning 仍严格解码，IPC 保持 v5。
+  Swift mirror 补齐 `HistoryReply` / `HistoryWarning`，缺失 warnings 默认为空，
+  编码空 warnings 时省略该字段。
+- 来源列表请求失败后清除旧 warning，保留已加载列表和重试位置；正文警告默认
+  单行折叠，展开查看详情，切换会话或重新读取后恢复折叠。历史启动及读取失败
+  统一附带实际版本、已验证基线与路径，仍隐藏 vendor 原始错误正文。
+- 完整离线门禁、91 项 Codex focused、30 项 desktop 测试、Swift 105 项测试、
+  iPhone 17 模拟器 21 项测试通过；绑定当前 checkout daemon 的 CLI selfcheck、
+  diagnostics report、desktop selfcheck、真实 bundle verify、格式与文档检查通过。
+- 真实 bundle 连接本机后端，Codex `0.155.0-alpha.16.3` 的历史正文可读；正文
+  warning 默认折叠，展开后显示实际版本、已验证版本与完整路径。
+  同一 bundle 连接临时 fake daemon，确认切换会话后默认折叠；加载更多失败后
+  来源旧 warning 消失，50 条列表与当前正文保留；点击重试后恢复到 75 条且无
+  来源 warning。Tab / Shift-Tab 可聚焦正文警告按钮，Enter / Space 可展开或收起。
+  fake 回复附带额外 `durationMs`，客户端仍可读取。
+- 真实验收仅覆盖只读历史，未发送模型 prompt。

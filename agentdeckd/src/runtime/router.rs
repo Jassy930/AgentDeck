@@ -6,8 +6,9 @@ use crate::agent::{AgentEventSender, AgentSessionHandle, DynAgent};
 use crate::diag::{self, DiagnosticEvent};
 use crate::record::RunRecord;
 use agentdeck_protocol::{
-    ActionDecision, AgentKind, HistoryRequest, HistoryResponse, ProtocolError, SessionCapabilities,
-    SessionId, SessionStart, ThreadId, TurnId, VendorControlPayload, effective_history_list_limit,
+    ActionDecision, AgentKind, HistoryReply, HistoryRequest, HistoryResponse, ProtocolError,
+    SessionCapabilities, SessionId, SessionStart, ThreadId, TurnId, VendorControlPayload,
+    effective_history_list_limit,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -227,7 +228,7 @@ impl AgentRouter {
     pub async fn handle_history(
         &self,
         request: HistoryRequest,
-    ) -> Result<HistoryResponse, ProtocolError> {
+    ) -> Result<HistoryReply, ProtocolError> {
         let agent_kind = match &request {
             HistoryRequest::List {
                 agent_kind: Some(k),
@@ -260,7 +261,7 @@ impl AgentRouter {
     async fn handle_history_cross_agent(
         &self,
         request: HistoryRequest,
-    ) -> Result<HistoryResponse, ProtocolError> {
+    ) -> Result<HistoryReply, ProtocolError> {
         self.handle_history_cross_agent_with_timeout(request, HISTORY_SOURCE_TIMEOUT)
             .await
     }
@@ -269,7 +270,7 @@ impl AgentRouter {
         &self,
         request: HistoryRequest,
         source_timeout: Duration,
-    ) -> Result<HistoryResponse, ProtocolError> {
+    ) -> Result<HistoryReply, ProtocolError> {
         let (cwd_filter, limit) = match &request {
             HistoryRequest::List {
                 cwd_filter, limit, ..
@@ -315,6 +316,7 @@ impl AgentRouter {
         }
 
         let mut all = Vec::new();
+        let mut warnings = Vec::new();
         let mut successful_sources = Vec::new();
         let mut failed_sources = Vec::new();
         let mut task_failures = Vec::new();
@@ -327,11 +329,15 @@ impl AgentRouter {
                 }
             };
             match result {
-                Ok(HistoryResponse::List(items)) => {
+                Ok(HistoryReply {
+                    response: HistoryResponse::List(items),
+                    warnings: source_warnings,
+                }) => {
                     successful_sources.push(kind);
                     all.extend(items);
+                    warnings.extend(source_warnings);
                 }
-                Ok(response) => {
+                Ok(HistoryReply { response, .. }) => {
                     let response_kind = match response {
                         HistoryResponse::Read(_) => "read",
                         HistoryResponse::Ack => "ack",
@@ -370,7 +376,11 @@ impl AgentRouter {
 
         all.sort_by_key(|item| std::cmp::Reverse(item.last_active_ms));
         all.truncate(effective_history_list_limit(limit));
-        Ok(HistoryResponse::List(all))
+        warnings.sort_by_key(|warning| warning.agent_kind);
+        Ok(HistoryReply {
+            response: HistoryResponse::List(all),
+            warnings,
+        })
     }
 
     async fn lookup_session(&self, sid: &SessionId) -> Result<AgentKind, ProtocolError> {
@@ -545,12 +555,11 @@ mod tests {
             Ok(())
         }
 
-        async fn handle_history(
-            &self,
-            _: HistoryRequest,
-        ) -> Result<HistoryResponse, ProtocolError> {
+        async fn handle_history(&self, _: HistoryRequest) -> Result<HistoryReply, ProtocolError> {
             match &self.behavior {
-                HistoryBehavior::Immediate(items) => Ok(HistoryResponse::List(items.clone())),
+                HistoryBehavior::Immediate(items) => {
+                    Ok(HistoryResponse::List(items.clone()).into())
+                }
                 HistoryBehavior::Pending => std::future::pending().await,
             }
         }
@@ -602,7 +611,7 @@ mod tests {
         .expect("router must not wait for the hub deadline")
         .expect("one successful source must preserve its result");
 
-        let HistoryResponse::List(items) = response else {
+        let HistoryResponse::List(items) = response.response else {
             panic!("expected list response");
         };
         assert_eq!(items.len(), 1);

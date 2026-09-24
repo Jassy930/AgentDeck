@@ -10,6 +10,7 @@ struct StubAgent {
 
 enum StubHistory {
     List(Vec<HistoryListItem>),
+    Reply(HistoryReply),
     Error(&'static str),
 }
 
@@ -72,9 +73,10 @@ impl Agent for StubAgent {
         Ok(())
     }
 
-    async fn handle_history(&self, _: HistoryRequest) -> Result<HistoryResponse, ProtocolError> {
+    async fn handle_history(&self, _: HistoryRequest) -> Result<HistoryReply, ProtocolError> {
         match &self.history {
-            StubHistory::List(items) => Ok(HistoryResponse::List(items.clone())),
+            StubHistory::List(items) => Ok(HistoryResponse::List(items.clone()).into()),
+            StubHistory::Reply(reply) => Ok(reply.clone()),
             StubHistory::Error(code) => Err(ProtocolError {
                 code: (*code).into(),
                 message: format!("{} history failed", self.kind.as_str()),
@@ -178,11 +180,61 @@ async fn cross_agent_history_keeps_best_effort_result_when_one_source_succeeds()
         .handle_history(cross_agent_list_request())
         .await
         .expect("one successful source must keep the merged list usable");
-    let HistoryResponse::List(items) = response else {
+    let HistoryResponse::List(items) = response.response else {
         panic!("expected list response");
     };
 
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].thread_id, ThreadId("cc-thread".into()));
     assert_eq!(items[0].agent_kind, AgentKind::ClaudeCode);
+}
+
+#[tokio::test]
+async fn history_preserves_warning_from_successful_empty_source() {
+    let warning = HistoryWarning {
+        agent_kind: AgentKind::Codex,
+        code: "codex-version-unverified".into(),
+        message: "runtime version is not verified".into(),
+    };
+    let mut router = AgentRouter::new();
+    router.register(Arc::new(StubAgent::with_history(
+        AgentKind::Codex,
+        StubHistory::Reply(HistoryReply {
+            response: HistoryResponse::List(Vec::new()),
+            warnings: vec![warning.clone()],
+        }),
+    )));
+    router.register(Arc::new(StubAgent::with_history(
+        AgentKind::ClaudeCode,
+        StubHistory::List(vec![HistoryListItem {
+            thread_id: ThreadId("cc-thread".into()),
+            agent_kind: AgentKind::ClaudeCode,
+            title: None,
+            cwd: "/tmp/cc".into(),
+            last_active_ms: 42,
+            archived: false,
+        }]),
+    )));
+
+    let single = router
+        .handle_history(HistoryRequest::List {
+            request_id: None,
+            agent_kind: Some(AgentKind::Codex),
+            cwd_filter: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(single.warnings, vec![warning.clone()]);
+    assert!(matches!(single.response, HistoryResponse::List(items) if items.is_empty()));
+
+    let merged = router
+        .handle_history(cross_agent_list_request())
+        .await
+        .unwrap();
+    assert_eq!(merged.warnings, vec![warning]);
+    assert!(matches!(
+        merged.response,
+        HistoryResponse::List(items) if items.len() == 1 && items[0].thread_id.0 == "cc-thread"
+    ));
 }

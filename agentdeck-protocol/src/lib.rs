@@ -1,4 +1,4 @@
-//! The agent-neutral IPC protocol — v4.
+//! The agent-neutral IPC protocol — v5.
 //!
 //! All v1 types (IpcMessage, SessionState, Lifecycle, LegacyAgentItem,
 //! LegacyActionRequest, LegacyActionDecision, HistoryThreadSummary,
@@ -24,7 +24,8 @@ pub use trunk::{
 };
 pub use trunk::{DEFAULT_HISTORY_LIST_LIMIT, MAX_HISTORY_LIST_LIMIT, effective_history_list_limit};
 pub use trunk::{
-    HistoryListItem, HistoryReadResponse, HistoryRequest, HistoryResponse, HistoryTurn,
+    HistoryListItem, HistoryReadResponse, HistoryReply, HistoryRequest, HistoryResponse,
+    HistoryTurn, HistoryWarning,
 };
 pub use trunk::{InitialTurn, RuntimeOptions, SessionStart, VendorSessionOptions};
 pub use vendor::claude_code::{ClaudeCodeCapabilities, ClaudeCodePermissionMode};
@@ -37,9 +38,9 @@ pub use vendor::codex::{CodexSessionOptions, McpOverride};
 pub use vendor::codex::{CodexVendorControl, CodexVendorPanelEvent};
 
 /// 契约产物版本。改动协议形态时手动 +1，并重生成快照。
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
-/// Aggregate JSON Schema for all v4 wire types. Snapshot-tested against
+/// Aggregate JSON Schema for all v5 wire types. Snapshot-tested against
 /// `protocol/agentdeck/agentdeck-protocol.schema.json`.
 pub fn protocol_schema() -> serde_json::Value {
     use schemars::schema_for;
@@ -59,6 +60,8 @@ pub fn protocol_schema() -> serde_json::Value {
             "HistoryListItem": serde_json::to_value(schema_for!(trunk::HistoryListItem)).unwrap(),
             "HistoryReadResponse": serde_json::to_value(schema_for!(trunk::HistoryReadResponse)).unwrap(),
             "HistoryResponse": serde_json::to_value(schema_for!(trunk::HistoryResponse)).unwrap(),
+            "HistoryWarning": serde_json::to_value(schema_for!(trunk::HistoryWarning)).unwrap(),
+            "HistoryReply": serde_json::to_value(schema_for!(trunk::HistoryReply)).unwrap(),
         }
     }))
 }

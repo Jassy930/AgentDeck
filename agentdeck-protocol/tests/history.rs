@@ -135,3 +135,33 @@ fn history_request_id_round_trips_for_every_operation() {
         assert_eq!(decoded.request_id(), Some("history-request-42"));
     }
 }
+
+#[test]
+fn history_reply_omits_empty_warnings_and_defaults_missing_warnings() {
+    let reply = HistoryReply::from(HistoryResponse::List(Vec::new()));
+    let json = serde_json::to_value(reply).unwrap();
+    assert!(json.get("warnings").is_none());
+
+    let decoded: HistoryReply = serde_json::from_value(json).unwrap();
+    assert!(decoded.warnings.is_empty());
+    assert!(matches!(decoded.response, HistoryResponse::List(items) if items.is_empty()));
+}
+
+#[test]
+fn history_reply_round_trips_success_with_warning() {
+    let warning = HistoryWarning {
+        agent_kind: AgentKind::Codex,
+        code: "codex-version-unverified".into(),
+        message: "runtime version is not verified".into(),
+    };
+    let reply = HistoryReply {
+        response: HistoryResponse::List(Vec::new()),
+        warnings: vec![warning.clone()],
+    };
+    let json = serde_json::to_value(reply).unwrap();
+    assert_eq!(json["warnings"][0]["agentKind"], "codex");
+
+    let decoded: HistoryReply = serde_json::from_value(json).unwrap();
+    assert_eq!(decoded.warnings, vec![warning]);
+    assert!(matches!(decoded.response, HistoryResponse::List(items) if items.is_empty()));
+}

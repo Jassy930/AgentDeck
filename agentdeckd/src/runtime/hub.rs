@@ -27,11 +27,11 @@
 use crate::agent::{AgentEventSender, AgentSessionHandle};
 use crate::diag::{self, DiagnosticEvent};
 use crate::runtime::router::AgentRouter;
-#[cfg(test)]
-use agentdeck_protocol::HistoryRequest;
 use agentdeck_protocol::{
-    ClientCommand, HistoryResponse, PROTOCOL_VERSION, ProtocolError, ServerEvent, SessionId,
+    ClientCommand, HistoryReply, PROTOCOL_VERSION, ProtocolError, ServerEvent, SessionId,
 };
+#[cfg(test)]
+use agentdeck_protocol::{HistoryRequest, HistoryResponse};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io;
@@ -63,9 +63,9 @@ const HISTORY_REQUEST_TIMEOUT: Duration = Duration::from_secs(32);
 async fn handle_history_with_timeout<F>(
     request: F,
     timeout: Duration,
-) -> Result<HistoryResponse, ProtocolError>
+) -> Result<HistoryReply, ProtocolError>
 where
-    F: Future<Output = Result<HistoryResponse, ProtocolError>>,
+    F: Future<Output = Result<HistoryReply, ProtocolError>>,
 {
     tokio::time::timeout(timeout, request)
         .await
@@ -78,14 +78,19 @@ where
 
 fn history_admin_reply(
     request_id: Option<String>,
-    result: Result<HistoryResponse, ProtocolError>,
+    result: Result<HistoryReply, ProtocolError>,
 ) -> String {
     let mut reply = serde_json::json!({ "reply": "history" });
     if let Some(request_id) = request_id {
         reply["requestId"] = serde_json::Value::String(request_id);
     }
     match result {
-        Ok(response) => reply["response"] = serde_json::json!(response),
+        Ok(result) => {
+            reply["response"] = serde_json::json!(result.response);
+            if !result.warnings.is_empty() {
+                reply["warnings"] = serde_json::json!(result.warnings);
+            }
+        }
         Err(error) => reply["error"] = serde_json::json!(error),
     }
     reply.to_string()
@@ -408,7 +413,7 @@ impl RuntimeHub {
                 // Task 4C — Phase 4 finalization: route through the
                 // router's `handle_history`, which routes by agent kind
                 // (or fans out for cross-agent List). The response is
-                // a typed `HistoryResponse` envelope; we side-channel
+                // a typed `HistoryReply` envelope; we side-channel
                 // the JSON onto the admin reply stream (same posture
                 // as Ping / Selfcheck — request/response, not streaming
                 // events) so it doesn't try to fit through the
@@ -2148,19 +2153,51 @@ mod tests {
     fn history_success_admin_reply_echoes_request_id() {
         let line = history_admin_reply(
             Some("history-success-1".into()),
-            Ok(HistoryResponse::List(Vec::new())),
+            Ok(HistoryResponse::List(Vec::new()).into()),
         );
         let reply: serde_json::Value = serde_json::from_str(&line).expect("history reply JSON");
 
         assert_eq!(reply["reply"], "history");
         assert_eq!(reply["requestId"], "history-success-1");
         assert_eq!(reply["response"]["kind"], "list");
+        assert!(reply.get("warnings").is_none());
         assert!(reply.get("error").is_none());
+
+        let decoded: HistoryReply = serde_json::from_str(&line).unwrap();
+        assert!(decoded.warnings.is_empty());
+        assert!(matches!(decoded.response, HistoryResponse::List(items) if items.is_empty()));
+    }
+
+    #[test]
+    fn history_warning_keeps_success_response_and_request_id() {
+        let warning = agentdeck_protocol::HistoryWarning {
+            agent_kind: agentdeck_protocol::AgentKind::Codex,
+            code: "codex-version-unverified".into(),
+            message: "runtime version is not verified".into(),
+        };
+        let line = history_admin_reply(
+            Some("history-warning-1".into()),
+            Ok(HistoryReply {
+                response: HistoryResponse::List(Vec::new()),
+                warnings: vec![warning.clone()],
+            }),
+        );
+        let reply: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(reply["reply"], "history");
+        assert_eq!(reply["requestId"], "history-warning-1");
+        assert_eq!(reply["response"]["kind"], "list");
+        assert_eq!(reply["warnings"], serde_json::json!([warning.clone()]));
+        assert!(reply.get("error").is_none());
+
+        let decoded: HistoryReply = serde_json::from_str(&line).unwrap();
+        assert_eq!(decoded.warnings, vec![warning]);
+        assert!(matches!(decoded.response, HistoryResponse::List(items) if items.is_empty()));
     }
 
     #[tokio::test]
     async fn history_timeout_helper_bounds_pending_future() {
-        let pending = std::future::pending::<Result<HistoryResponse, ProtocolError>>();
+        let pending = std::future::pending::<Result<HistoryReply, ProtocolError>>();
         let error = handle_history_with_timeout(pending, Duration::from_millis(5))
             .await
             .expect_err("pending history future must time out");

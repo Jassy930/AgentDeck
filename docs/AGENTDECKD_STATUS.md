@@ -10,12 +10,13 @@
   iOS iPhone 17 Simulator 已执行 21 项测试且全部通过。详见 [M0 CLI 实施记录](plans/2026-09-21-backend-m0-cli-implementation.md)。
 - 当前桌面边界：GPUI 桌面已连接 daemon，但只用 `AgentList` 与 `History` 三个只读入口；
   本页其余 backend 能力仍不能视为桌面端可用能力。
-- 运行时策略：复用本机 Codex，macOS 桌面端优先、CLI 兜底，保留精确版本门禁。
-  版本不匹配会显示各候选实际版本、路径和升级责任；历史 RPC/解码失败保留实际运行时
+- 运行时策略：复用本机 Codex，macOS 桌面端优先、CLI 兜底。历史 list/read 接受首个
+  版本探测成功的运行时，版本不同仅 warning；live session 仍保留精确版本门禁。
+  warning 显示实际版本、路径和已验证基线；历史 RPC/解码失败保留实际运行时
   信息与方法名，只在方法明确不支持时给出确定提示，其他失败不武断归因为协议。
   桌面未知历史条目显示不支持提示；自带 Codex 与自动下载暂不实施。
-- 2026-09-23 当前基线：Codex 固定为 `codex-cli 0.155.0-alpha.16`，官方稳定 schema
-  同步刷新；AgentDeck IPC 仍为 v4。列表包含全部 provider，正文经稳定的
+- 2026-09-24 当前基线：Codex 官方稳定 schema 仍为已验证的 `codex-cli 0.155.0-alpha.16`；
+  AgentDeck IPC 为 v5，历史成功回复可携带 warnings。列表包含全部 provider，正文经稳定的
   `thread/turns/list` 按页读取完整条目，不启用 `experimentalApi`。本版本真实 CLI
   list/read、桌面正文与 50 → 100 条加载更多已验收，证据见只读历史实施记录；
   lifecycle E2E 尚未重跑。
@@ -65,7 +66,7 @@ README、架构、诊断和计划文档用于解释目标与不变量；当文�
 | daemon runtime | turn cancel / session close | 部分 | Codex TurnCancel 使用官方 interrupt，健康会话回 Ready；SessionClose 才回收 child。session live 暴露完整控制命令，run/continue 保留自动 close/wait；真实四轮已证明第三轮取消后第四轮成功，最终 child/进程组消失。证据限定于下述覆盖环境，Claude Code 尚未迁移。 | `agentdeckd/src/codex/session.rs`、`agentdeck-cli/src/commands.rs` |
 | admin | ping、协议版本/schema、agent list/capabilities | 较完整 | 已有 typed command 和 CLI 入口，回复由单 writer 输出。 | `agentdeckd/src/runtime/hub.rs`、`agentdeck-cli/src/` |
 | admin | selfcheck | 部分 | `agentdeckd --selfcheck` 验证数据目录、诊断和 record 写入；CLI selfcheck 验证 daemon IPC 与静态 adapter 注册。两者都不证明 vendor CLI 登录、握手、真实 turn 或历史来源健康。 | `agentdeckd/src/main.rs`、`agentdeckd/src/runtime/hub.rs` |
-| Codex | app-server 进程与 JSON-RPC | 部分 | locator 在共享 5 秒预算内先探测 macOS ChatGPT.app 自带 executable，再探测 PATH 与常见 CLI 位置；跳过不存在或版本不匹配的候选，其他探测失败立即返回。`AGENTDECK_CODEX_BIN` 显式绝对路径覆盖自动查找且不回退。首个精确匹配 `protocol/CODEX_VERSION.txt` 的规范化绝对路径同时用于 probe 与 spawn。live 与 short-lived 路径均在 initialize response 后发送 `initialized`；live close 确认 direct child、进程组与 stderr pump 清理。0.145.0 的真实四轮证据保留，升级后的 lifecycle E2E 尚未重跑。 | `agentdeckd/src/codex/app_server.rs`、`agentdeckd/src/codex/session.rs`、`protocol/ClientNotification.json` |
+| Codex | app-server 进程与 JSON-RPC | 部分 | locator 在共享 5 秒预算内先探测 macOS ChatGPT.app 自带 executable，再探测 PATH 与常见 CLI 位置。历史使用首个版本探测成功的候选，不匹配只 warning；live session 跳过不匹配候选，要求精确匹配。缺失候选跳过，其他探测失败立即返回。`AGENTDECK_CODEX_BIN` 显式绝对路径覆盖自动查找且不回退；probe 与 spawn 使用同一规范化路径。live 与 short-lived 路径均在 initialize response 后发送 `initialized`；live close 确认 direct child、进程组与 stderr pump 清理。0.145.0 的真实四轮证据保留，升级后的 lifecycle E2E 尚未重跑。 | `agentdeckd/src/codex/app_server.rs`、`agentdeckd/src/codex/session.rs`、`protocol/ClientNotification.json` |
 | Codex | 新 session | 部分 | `SessionStart` 先完成 initialize → initialized → thread/start|resume，再发 `SessionStarted`、`SessionCapabilities`；可携 initial turn，且启动前校验 caller ID、cwd 和固定 M0 options。0.145.0 曾在临时配置覆盖环境验证新 thread、握手和 prompt，并确认默认配置启动失败时的 cleanup；升级后尚未重新验收。 | `agentdeckd/src/codex/adapter.rs`、`agentdeckd/src/codex/session.rs` |
 | Codex | resume 与 live 后续 turn | 部分 | resume 验证 threadId 和固定选项，并以 `excludeTurns=true` 省去未使用的历史轮次；session live 可在同一 daemon/owner/thread 上启动后续 turn。限定环境的真实四轮及 one-shot run/continue 均通过；run/continue 仍各自新建 daemon，该结果不证明原 session 全部启动配置恢复。 | `agentdeckd/src/codex/session.rs`、`agentdeck-cli/tests/e2e_codex.rs` |
 | Codex | 固定 M0 options / capabilities | 部分 | 仅接受 never/read-only/medium、persistApproval=false、无 MCP；只声明 StreamingMessages。审批、工具展示和正式 coding session 默认配置不在 M0 范围。 | `agentdeckd/src/codex/adapter.rs`、`agentdeckd/src/codex/capabilities.rs` |

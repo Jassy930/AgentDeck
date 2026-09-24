@@ -294,7 +294,10 @@ fn protocol_error_or_default(error: Option<&ProtocolError>, default_code: &str) 
 
 pub fn handle_history(c: &mut Client, req: HistoryRequest, pretty: bool) -> Result<(), CliError> {
     let resp = c.history(req)?;
-    let v = serde_json::to_value(&resp)?;
+    for warning in resp.warnings {
+        eprintln!("warning [{}]: {}", warning.code, warning.message);
+    }
+    let v = serde_json::to_value(&resp.response)?;
     println!("{}", render(&v, pretty));
     Ok(())
 }

@@ -7,13 +7,18 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use agentdeck_protocol::{AgentKind, HistoryListItem, MAX_HISTORY_LIST_LIMIT, ThreadId};
+use agentdeck_protocol::{
+    AgentKind, HistoryListItem, HistoryWarning, MAX_HISTORY_LIST_LIMIT, ThreadId,
+};
 use gpui::{
     App, Context, Entity, FocusHandle, IntoElement, ListAlignment, ListState, ParentElement,
     ScrollStrategy, SharedString, UniformListScrollHandle, Window, div, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme, InteractiveElementExt, StyledExt, button::Button, h_flex, input::InputState,
+    ActiveTheme, InteractiveElementExt, Sizable, StyledExt,
+    button::{Button, ButtonVariants},
+    h_flex,
+    input::InputState,
     v_flex,
 };
 
@@ -49,7 +54,10 @@ fn transcript_list() -> ListState {
 /// 选中会话的记录加载状态。
 pub enum Transcript {
     Loading,
-    Ready(Rc<[transcript::Block]>),
+    Ready {
+        blocks: Rc<[transcript::Block]>,
+        warnings: Vec<HistoryWarning>,
+    },
     Failed(String),
 }
 
@@ -57,7 +65,7 @@ impl Stage {
     fn finish_read(
         &mut self,
         completed_id: u64,
-        read: Result<Vec<transcript::Block>, String>,
+        read: Result<(Vec<transcript::Block>, Vec<HistoryWarning>), String>,
     ) -> bool {
         if let Stage::Session {
             transcript,
@@ -68,9 +76,12 @@ impl Stage {
             && *read_id == completed_id
         {
             *transcript = match read {
-                Ok(turns) => {
+                Ok((turns, warnings)) => {
                     list.reset(turns.len());
-                    Transcript::Ready(turns.into())
+                    Transcript::Ready {
+                        blocks: turns.into(),
+                        warnings,
+                    }
                 }
                 Err(message) => Transcript::Failed(message),
             };
@@ -170,6 +181,7 @@ pub(crate) struct AgentHistory {
     loaded: usize,
     limit: usize,
     has_more: bool,
+    pub warnings: Vec<HistoryWarning>,
 }
 
 impl AgentHistory {
@@ -180,6 +192,7 @@ impl AgentHistory {
             loaded: 0,
             limit: SIDEBAR_LIMIT,
             has_more: false,
+            warnings: Vec::new(),
         }
     }
 
@@ -187,11 +200,17 @@ impl AgentHistory {
         (self.limit + 1).min(MAX_HISTORY_LIST_LIMIT)
     }
 
-    fn complete(&mut self, listed: &mut Result<Vec<HistoryListItem>, String>) {
-        if let Ok(items) = listed {
+    fn complete(
+        &mut self,
+        listed: &mut Result<(Vec<HistoryListItem>, Vec<HistoryWarning>), String>,
+    ) {
+        if let Ok((items, warnings)) = listed {
             self.has_more = items.len() > self.limit || items.len() == MAX_HISTORY_LIST_LIMIT;
             items.truncate(self.limit);
             self.loaded = items.len();
+            self.warnings = std::mem::take(warnings);
+        } else {
+            self.warnings.clear();
         }
         self.result = Some(listed.as_ref().map(|_| ()).map_err(Clone::clone));
     }
@@ -425,7 +444,7 @@ impl Shell {
                 if let Some(agent) = shell.agents.iter_mut().find(|agent| agent.kind == kind) {
                     agent.complete(&mut listed);
                 }
-                if let Ok(mut items) = listed {
+                if let Ok((mut items, _)) = listed {
                     shell.sessions.retain(|item| item.agent_kind != kind);
                     shell.sessions.append(&mut items);
                     shell
@@ -531,7 +550,8 @@ impl Shell {
             let read = cx
                 .background_executor()
                 .spawn(async move {
-                    daemon::history_read(request.kind, request.thread_id).map(transcript::prepare)
+                    daemon::history_read(request.kind, request.thread_id)
+                        .map(|(turns, warnings)| (transcript::prepare(turns), warnings))
                 })
                 .await;
             this.update(cx, |shell, cx| {
@@ -629,10 +649,10 @@ impl Shell {
                         .on_click(cx.listener(|shell, _, _, cx| shell.retry_transcript(cx))),
                 )
                 .into_any_element(),
-            Transcript::Ready(blocks) if blocks.is_empty() => {
+            Transcript::Ready { blocks, .. } if blocks.is_empty() => {
                 placeholder("这个会话没有可显示的记录", cx).into_any_element()
             }
-            Transcript::Ready(blocks) => {
+            Transcript::Ready { blocks, .. } => {
                 transcript::render(blocks.clone(), list.clone(), read_id, window, cx)
                     .into_any_element()
             }
@@ -679,6 +699,62 @@ impl Shell {
                                 project_name(item)
                             )),
                     ),
+            )
+            .when_some(
+                match transcript {
+                    Transcript::Ready { warnings, .. } if !warnings.is_empty() => Some(warnings),
+                    _ => None,
+                },
+                |section, warnings| {
+                    let expanded = window.use_keyed_state(
+                        SharedString::from(format!("transcript-warning-expanded-{read_id}")),
+                        cx,
+                        |_, _| false,
+                    );
+                    let open = *expanded.read(cx);
+                    section.child(
+                        v_flex()
+                            .w_full()
+                            .flex_shrink_0()
+                            .px_5()
+                            .py_1()
+                            .bg(cx.theme().warning.opacity(0.1))
+                            .child(
+                                Button::new(("transcript-warning-toggle", read_id))
+                                    .ghost()
+                                    .xsmall()
+                                    .w_full()
+                                    .justify_start()
+                                    .label(if open {
+                                        "▾ 兼容性警告 · 收起详情"
+                                    } else {
+                                        "▸ 兼容性警告 · 展开详情"
+                                    })
+                                    .on_click(move |_, _, cx| {
+                                        expanded.update(cx, |expanded, cx| {
+                                            *expanded = !*expanded;
+                                            cx.notify();
+                                        });
+                                    }),
+                            )
+                            .when(open, |section| {
+                                section.child(
+                                    div()
+                                        .id(("transcript-warnings", read_id))
+                                        .w_full()
+                                        .max_h(px(112.))
+                                        .overflow_y_scroll()
+                                        .px_2()
+                                        .pb_2()
+                                        .child(v_flex().gap_1().children(warnings.iter().map(
+                                            |warning| {
+                                                div().text_xs().child(warning.message.clone())
+                                            },
+                                        ))),
+                                )
+                            }),
+                    )
+                },
             )
             .child(body)
             .child(
@@ -778,7 +854,15 @@ mod tests {
         AgentHistory, FrameStats, ReadQueue, ReadRequest, Stage, Transcript, agent_label,
         empty_hint, project_name, session_title, transcript_list,
     };
-    use agentdeck_protocol::{AgentKind, HistoryListItem, ThreadId};
+    use agentdeck_protocol::{AgentKind, HistoryListItem, HistoryWarning, ThreadId};
+
+    fn warning() -> HistoryWarning {
+        HistoryWarning {
+            agent_kind: AgentKind::Codex,
+            code: "codex-version-unverified".into(),
+            message: "当前 Codex 版本未经验证，仍继续读取历史".into(),
+        }
+    }
 
     fn item(title: Option<&str>) -> HistoryListItem {
         HistoryListItem {
@@ -849,7 +933,7 @@ mod tests {
             list: transcript_list(),
             read_id: 2,
         };
-        assert!(!stage.finish_read(1, Ok(vec![])));
+        assert!(!stage.finish_read(1, Ok((vec![], vec![warning()]))));
 
         stage = Stage::Session {
             item: first,
@@ -861,17 +945,34 @@ mod tests {
             text: "新的 A 记录".into(),
             meta: Default::default(),
         });
-        assert!(stage.finish_read(3, Ok(vec![block])));
+        assert!(stage.finish_read(3, Ok((vec![block], vec![warning()]))));
         assert!(!stage.finish_read(1, Err("旧读取超时".into())));
-        assert!(!stage.finish_read(1, Ok(vec![])));
+        assert!(!stage.finish_read(1, Ok((vec![], vec![]))));
         assert!(matches!(
             &stage,
-            Stage::Session { transcript: Transcript::Ready(turns), list, .. }
-                if turns.len() == 1 && list.item_count() == 1
+            Stage::Session { transcript: Transcript::Ready { blocks, warnings }, list, .. }
+                if blocks.len() == 1 && list.item_count() == 1 && warnings == &[warning()]
+        ));
+
+        if let Stage::Session {
+            read_id,
+            transcript,
+            ..
+        } = &mut stage
+        {
+            *read_id = 4;
+            *transcript = Transcript::Loading;
+        }
+        assert!(stage.finish_read(4, Ok((vec![], vec![]))));
+        assert!(!stage.finish_read(3, Ok((vec![], vec![warning()]))));
+        assert!(matches!(
+            &stage,
+            Stage::Session { transcript: Transcript::Ready { warnings, .. }, .. }
+                if warnings.is_empty()
         ));
 
         stage = Stage::Empty;
-        assert!(!stage.finish_read(3, Ok(vec![])));
+        assert!(!stage.finish_read(3, Ok((vec![], vec![]))));
     }
 
     fn read_request(id: u64, thread: &str) -> ReadRequest {
@@ -893,7 +994,7 @@ mod tests {
         assert!(!source.retry());
         source.complete(&mut Err("still unavailable".into()));
         assert!(source.retry());
-        source.complete(&mut Ok(vec![item(None)]));
+        source.complete(&mut Ok((vec![item(None)], vec![])));
         assert_eq!(source.status(), "已加载 1 个会话");
         assert!(!source.retry());
     }
@@ -906,9 +1007,9 @@ mod tests {
             loop {
                 assert_eq!(source.limit, expected);
                 assert!(!source.load_more());
-                let mut listed = Ok(vec![item(None); total.min(source.request_limit())]);
+                let mut listed = Ok((vec![item(None); total.min(source.request_limit())], vec![]));
                 source.complete(&mut listed);
-                assert_eq!(listed.unwrap().len(), total.min(expected));
+                assert_eq!(listed.unwrap().0.len(), total.min(expected));
                 assert_eq!(source.loaded, total.min(expected));
                 if !source.can_load_more() {
                     assert_eq!(source.loaded, total.min(2_000));
@@ -933,7 +1034,8 @@ mod tests {
     #[test]
     fn failed_load_more_keeps_count_and_retries_the_same_limit() {
         let mut source = AgentHistory::new(AgentKind::Codex);
-        source.complete(&mut Ok(vec![item(None); 51]));
+        source.complete(&mut Ok((vec![item(None); 51], vec![warning()])));
+        assert_eq!(source.warnings, vec![warning()]);
         assert!(source.load_more());
         assert_eq!(source.status(), "已加载 50 · 加载中…");
         assert_eq!(source.request_limit(), 101);
@@ -941,11 +1043,13 @@ mod tests {
         source.complete(&mut Err("timeout".into()));
         assert_eq!(source.status(), "已加载 50 · 加载失败");
         assert_eq!(source.error(), Some("timeout"));
+        assert!(source.warnings.is_empty());
+        assert_eq!(source.loaded, 50);
         assert!(!source.load_more());
         assert!(source.retry());
         assert_eq!(source.request_limit(), 101);
         assert!(!source.retry());
-        source.complete(&mut Ok(vec![item(None); 100]));
+        source.complete(&mut Ok((vec![item(None); 100], vec![])));
         assert_eq!(source.status(), "已加载 100 个会话");
         assert_eq!(source.list_hint(), Some("已全部加载"));
     }
@@ -978,10 +1082,24 @@ mod tests {
     }
 
     #[test]
+    fn list_warnings_are_replaced_after_each_successful_read() {
+        let mut source = AgentHistory::new(AgentKind::Codex);
+        for _ in 0..2 {
+            source.complete(&mut Ok((vec![item(None)], vec![warning()])));
+            assert_eq!(source.status(), "已加载 1 个会话");
+            assert_eq!(source.warnings, vec![warning()]);
+            assert!(source.error().is_none());
+        }
+        source.complete(&mut Ok((vec![item(None)], vec![])));
+        assert!(source.warnings.is_empty());
+        assert_eq!(source.loaded, 1);
+    }
+
+    #[test]
     fn each_agent_keeps_its_loading_failure_and_empty_result_distinct() {
         let mut fast = AgentHistory::new(AgentKind::ClaudeCode);
         let mut slow = AgentHistory::new(AgentKind::Codex);
-        fast.complete(&mut Ok(vec![item(None)]));
+        fast.complete(&mut Ok((vec![item(None)], vec![])));
         assert_eq!(fast.status(), "已加载 1 个会话");
         assert_eq!(slow.status(), "读取中…");
 
@@ -991,7 +1109,7 @@ mod tests {
         assert_eq!(fast.status(), "已加载 1 个会话");
         assert_eq!(fast.error(), None);
 
-        fast.complete(&mut Ok(vec![]));
+        fast.complete(&mut Ok((vec![], vec![])));
         assert_eq!(fast.status(), "已加载 0 个会话");
         assert_eq!(slow.error(), Some("历史读取超时"));
     }
@@ -1005,10 +1123,10 @@ mod tests {
         agents[0].complete(&mut Err("历史读取超时".into()));
         assert_eq!(empty_hint(&agents, 1, None), "正在读取会话…");
 
-        agents[1].complete(&mut Ok(vec![]));
+        agents[1].complete(&mut Ok((vec![], vec![])));
         assert_eq!(empty_hint(&agents, 0, None), "没有可显示的会话");
 
-        agents[1].complete(&mut Ok(vec![item(None)]));
+        agents[1].complete(&mut Ok((vec![item(None)], vec![])));
         assert_eq!(
             empty_hint(&agents, 0, None),
             "选择左侧会话查看记录，或试着输入任务"

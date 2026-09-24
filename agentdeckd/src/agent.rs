@@ -5,7 +5,7 @@
 //! 方法，或 daemon 层。
 
 use agentdeck_protocol::{
-    ActionDecision, AgentKind, HistoryRequest, HistoryResponse, ProtocolError, ServerEvent,
+    ActionDecision, AgentKind, HistoryReply, HistoryRequest, ProtocolError, ServerEvent,
     SessionCapabilities, SessionId, SessionOutcome, SessionStart, ThreadId, TurnId,
     VendorControlPayload,
 };
@@ -165,7 +165,7 @@ pub trait Agent: Send + Sync + 'static {
     async fn handle_history(
         &self,
         _request: HistoryRequest,
-    ) -> Result<HistoryResponse, ProtocolError> {
+    ) -> Result<HistoryReply, ProtocolError> {
         Err(ProtocolError {
             code: "history-not-supported".into(),
             message: format!("agent {:?} does not implement history", self.kind()),

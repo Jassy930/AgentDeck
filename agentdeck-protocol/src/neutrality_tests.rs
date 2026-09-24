@@ -84,18 +84,21 @@ fn protocol_neutrality_main_trunk() {
         }
     }
 
-    // 检查 ProtocolError 属性名
-    let schema_val = serde_json::to_value(schema_for!(ProtocolError)).expect("serializable");
-    if let Some(props) = schema_val["properties"].as_object() {
-        for key in props.keys() {
-            let key_lower = key.to_lowercase();
-            for prefix in FORBIDDEN_PREFIXES {
-                assert!(
-                    !key_lower.starts_with(prefix),
-                    "ProtocolError property name `{}` starts with vendor prefix `{}`",
-                    key,
-                    prefix
-                );
+    for (name, schema) in [
+        ("ProtocolError", schema_for!(ProtocolError)),
+        ("HistoryWarning", schema_for!(HistoryWarning)),
+        ("HistoryReply", schema_for!(HistoryReply)),
+    ] {
+        let schema_val = serde_json::to_value(schema).expect("serializable");
+        if let Some(props) = schema_val["properties"].as_object() {
+            for key in props.keys() {
+                let key_lower = key.to_lowercase();
+                for prefix in FORBIDDEN_PREFIXES {
+                    assert!(
+                        !key_lower.starts_with(prefix),
+                        "{name} property name `{key}` starts with vendor prefix `{prefix}`",
+                    );
+                }
             }
         }
     }
