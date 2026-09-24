@@ -4,8 +4,9 @@
 //! 助手、思考与过程块正文按 Markdown 渲染（代码走围栏高亮）；用户消息仍是纯文本。
 
 use std::collections::HashSet;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
+
+mod markdown_fallback;
 
 use agentdeck_protocol::{AgentItem, HistoryTurn, PlanStepStatus, ShellStatus};
 use gpui::{
@@ -21,7 +22,7 @@ use gpui_component::{
 const BODY_LIMIT: usize = 2_000;
 /// 折叠摘要的字符上限。
 const SUMMARY_LIMIT: usize = 120;
-/// 至少这么长、且几乎全是 base64 字符的串视为二进制内容。
+/// 只折叠明确带 base64 标记的 data URI，普通文本不能靠字符集判断。
 const BINARY_MIN_LEN: usize = 256;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -29,6 +30,7 @@ pub struct Block {
     pub label: &'static str,
     /// `Some` 表示过程块：折叠时只显示这一行；`None` 表示对话消息，正文总是显示。
     pub summary: Option<SharedString>,
+    pub status: Option<SharedString>,
     /// 过程块展开后的正文；为空表示没有可展开的内容。
     pub body: SharedString,
     /// 正文按 Markdown 渲染；用户消息里常夹带 `<in-app-browser-context>` 这类注入标签，
@@ -40,10 +42,17 @@ pub struct Block {
 
 impl Block {
     fn message(label: &'static str, body: &str, markdown: bool) -> Self {
+        let body = truncate(body.trim());
+        let body = if markdown {
+            markdown_fallback::images_as_links(&body)
+        } else {
+            body
+        };
         Self {
             label,
             summary: None,
-            body: truncate(body.trim()).into(),
+            status: None,
+            body: body.into(),
             markdown,
             failed: false,
         }
@@ -53,7 +62,8 @@ impl Block {
         Self {
             label,
             summary: Some(one_line(&summary).into()),
-            body: body.trim().to_string().into(),
+            status: None,
+            body: markdown_fallback::images_as_links(body.trim()).into(),
             markdown: true,
             failed: false,
         }
@@ -82,13 +92,7 @@ pub fn describe(item: &AgentItem) -> Block {
             let summary = first
                 .trim()
                 .trim_matches(|c| c == '*' || c == '#' || c == ' ');
-            // 只有一行的思考，摘要就是全部内容，不必再展开。
-            let body = if text.lines().filter(|l| !l.trim().is_empty()).count() > 1 {
-                truncate(text)
-            } else {
-                String::new()
-            };
-            Block::detail("思考", summary.to_string(), body)
+            Block::detail("思考", summary.to_string(), truncate(text))
         }
         AgentItem::Shell {
             command,
@@ -97,7 +101,7 @@ pub fn describe(item: &AgentItem) -> Block {
             duration_ms,
             ..
         } => {
-            let mut summary = format!("$ {}", command.trim());
+            let summary = format!("$ {}", command.trim());
             let state = match status {
                 ShellStatus::Running => Some("运行中".to_string()),
                 ShellStatus::Completed => None,
@@ -111,17 +115,9 @@ pub fn describe(item: &AgentItem) -> Block {
                 .into_iter()
                 .chain(duration_ms.map(|ms| format!("{:.1}s", ms as f64 / 1000.)))
                 .collect();
-            let multiline = command.trim().contains('\n');
-            summary = one_line(&summary);
-            if !tail.is_empty() {
-                summary = format!("{summary}  ·  {}", tail.join(" · "));
-            }
-            let body = if multiline {
-                fence("sh", &truncate(command.trim()))
-            } else {
-                String::new()
-            };
+            let body = fence("sh", &truncate(command.trim()));
             Block {
+                status: (!tail.is_empty()).then(|| tail.join(" · ").into()),
                 failed: matches!(status, ShellStatus::Failed),
                 ..Block::detail("命令", summary, body)
             }
@@ -205,7 +201,12 @@ pub fn describe(item: &AgentItem) -> Block {
                 .or(original_path.as_ref())
                 .map(|path| path.display().to_string())
                 .unwrap_or_default();
-            Block::detail("图片", path, String::new())
+            let body = if path.is_empty() {
+                String::new()
+            } else {
+                fence("", &truncate(&path))
+            };
+            Block::detail("图片", path, body)
         }
     }
 }
@@ -229,7 +230,7 @@ fn arg_hint(args: &serde_json::Value) -> Option<String> {
         .map(one_line)
 }
 
-/// 把 JSON 里的 base64 大串替换成占位说明，其余原样保留。
+/// 把 JSON 里明确标记的 base64 data URI 替换成占位说明，其余原样保留。
 fn scrub(value: &serde_json::Value) -> serde_json::Value {
     use serde_json::Value;
     match value {
@@ -247,12 +248,14 @@ fn scrub(value: &serde_json::Value) -> serde_json::Value {
 }
 
 fn is_binary(text: &str) -> bool {
-    let text = text
+    let Some((_, data)) = text
         .strip_prefix("data:")
         .and_then(|rest| rest.split_once(";base64,"))
-        .map_or(text, |(_, data)| data);
-    text.len() >= BINARY_MIN_LEN
-        && text
+    else {
+        return false;
+    };
+    data.len() >= BINARY_MIN_LEN
+        && data
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"+/=_-\n\r".contains(&b))
 }
@@ -308,11 +311,9 @@ fn markdown(
     TextView::markdown(id, body.clone(), window, cx)
         .selectable(true)
         .code_block_actions(|code, _, _| {
-            // 按钮 id 用内容哈希区分同一条消息里的多个代码块。
+            // TextView 缓存各代码块的 SharedString；同内容的不同块也要有独立按钮状态。
             let code = code.code();
-            let mut hasher = DefaultHasher::new();
-            code.hash(&mut hasher);
-            Button::new(ElementId::Integer(hasher.finish()))
+            Button::new(ElementId::Integer(code.as_ptr() as u64))
                 .ghost()
                 .xsmall()
                 .label("复制")
@@ -390,11 +391,20 @@ pub fn render(
                             .child(div().flex_shrink_0().font_semibold().child(block.label))
                             .child(
                                 div()
+                                    .flex_1()
                                     .min_w(px(0.))
                                     .truncate()
                                     .when(block.failed, |text| text.text_color(danger))
                                     .child(summary.clone()),
                             )
+                            .when_some(block.status.clone(), |header, status| {
+                                header.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .when(block.failed, |text| text.text_color(danger))
+                                        .child(status),
+                                )
+                            })
                             .when(expandable, |header| {
                                 let expanded = expanded.clone();
                                 header.cursor_pointer().on_click(move |_, _, cx| {
@@ -506,15 +516,31 @@ mod tests {
         });
         assert_eq!(
             shell.summary.as_ref().map(|s| s.as_str()),
-            Some("$ cargo test  ·  失败 · 退出码 101 · 1.5s")
+            Some("$ cargo test")
+        );
+        assert_eq!(
+            shell.status.as_ref().map(|s| s.as_str()),
+            Some("失败 · 退出码 101 · 1.5s")
         );
         assert!(shell.failed);
-        assert!(shell.body.is_empty(), "单行命令没有可展开的内容");
+        assert!(shell.body.contains("cargo test"));
+
+        let command = format!("cargo test -- {}", "long_test_name_".repeat(15));
+        let long = describe(&AgentItem::Shell {
+            command: command.clone(),
+            status: ShellStatus::Failed,
+            exit_code: Some(101),
+            duration_ms: Some(1500),
+            meta: meta(),
+        });
+        assert!(long.summary.as_ref().unwrap().ends_with('…'));
+        assert!(long.body.contains(&command));
+        assert_eq!(long.status, shell.status);
     }
 
     #[test]
     fn tool_summarizes_args_and_hides_binary_results() {
-        let base64 = "iVBORw0KGgo".repeat(40);
+        let base64 = format!("data:image/png;base64,{}", "iVBORw0KGgo".repeat(40));
         let tool = describe(&AgentItem::ToolCall {
             name: "Read".into(),
             args: serde_json::json!({"file_path": "/tmp/a.png"}),
@@ -525,12 +551,16 @@ mod tests {
             tool.summary.as_ref().map(|s| s.as_str()),
             Some("Read  /tmp/a.png")
         );
-        assert!(tool.body.contains("[二进制内容 0.4 KB]"));
+        assert!(tool.body.contains("[二进制内容 0.5 KB]"));
         assert!(!tool.body.contains("iVBORw0KGgo"));
+
+        let plain = (1..=100).map(|n| format!("{n}\n")).collect::<String>();
+        let value = serde_json::json!({"output": plain, "data": "abc123\n".repeat(50)});
+        assert_eq!(super::scrub(&value), value);
     }
 
     #[test]
-    fn reasoning_summary_strips_markdown_and_single_line_is_not_expandable() {
+    fn single_line_details_keep_expandable_bodies() {
         let one = describe(&AgentItem::Reasoning {
             text: "**我检查试玩页的桌面布局。**".into(),
             meta: meta(),
@@ -539,7 +569,24 @@ mod tests {
             one.summary.as_ref().map(|s| s.as_str()),
             Some("我检查试玩页的桌面布局。")
         );
-        assert!(one.body.is_empty());
+        assert_eq!(one.body, "**我检查试玩页的桌面布局。**");
+
+        let text = "需要检查调用点并验证错误路径。".repeat(15);
+        let long = describe(&AgentItem::Reasoning {
+            text: text.clone(),
+            meta: meta(),
+        });
+        assert!(long.summary.unwrap().ends_with('…'));
+        assert_eq!(long.body, text);
+
+        let path = format!("/tmp/{}/image.png", "directory/".repeat(20));
+        let image = describe(&AgentItem::ImageReference {
+            saved_path: None,
+            original_path: Some(path.clone().into()),
+            meta: meta(),
+        });
+        assert!(image.summary.unwrap().ends_with('…'));
+        assert!(image.body.contains(&path));
 
         let many: Block = describe(&AgentItem::Reasoning {
             text: "**标题**\n\n细节".into(),
@@ -551,7 +598,7 @@ mod tests {
 
     #[test]
     fn binary_detection_and_fences() {
-        assert!(is_binary(&"A".repeat(300)));
+        assert!(!is_binary(&"A".repeat(300)));
         assert!(is_binary(&format!(
             "data:image/png;base64,{}",
             "A".repeat(300)

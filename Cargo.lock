@@ -39,6 +39,7 @@ dependencies = [
  "gpui",
  "gpui-component",
  "libc",
+ "markdown",
  "serde_json",
 ]
 

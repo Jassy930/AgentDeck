@@ -41,8 +41,12 @@
   执行的读取仍由 daemon 按自身时限完成并清理。
   侧栏虚拟列表作为一个 Tab 停靠点，上下键移动键盘游标并滚入视野，Return 读取
   目标会话；游标按来源与 threadId 定位，列表扩展或重新排序不会改变目标身份。
-- `agentdeck-desktop/src/transcript.rs`：把中立 `AgentItem` 映射成「标签 + 正文」
-  文本块，单条正文上限 2000 字符；后台读取完成时转换一次，渲染复用最终文本。
+- `agentdeck-desktop/src/transcript.rs`：把中立 `AgentItem` 映射成消息或可展开过程块，
+  单段原文上限 2000 字符；后台读取完成时转换一次，渲染复用最终文本。助手和过程块
+  正文使用 Markdown，代码块提供高亮与复制；用户消息保持纯文本。命令状态独立于
+  摘要显示，单行命令、思考和图片路径保留展开正文。图片节点按 Markdown 源码位置
+  改为可见说明与目标链接／路径，代码示例不改写。普通字符串不猜测是否为二进制，
+  仅明确的 base64 data URI 显示占位说明。
 - `script/build_and_run.sh`：bundle 内同时装配 `agentdeckd`，`--verify` 额外断言它存在。
 
 ## 关键决策与坑点
@@ -127,6 +131,18 @@ PR 评论修复后的验证：
   时，侧栏和主区均显示“没有可显示的会话”，来源错误仍可见。
 - 未运行真实 vendor E2E；900px 实窗缩放和窗口拖动仍未取得验收证据。
 
+2026-09-24 PR #26 富文本与过程块修复验收：
+
+- 31 项 desktop 单测、desktop selfcheck、31 项 Swift 测试、格式与文档检查通过。
+- fake daemon 实窗确认长单行命令、思考和图片路径可展开至末尾；长命令保留失败、
+  退出码与耗时。Markdown 图片显示说明与目标，两个相同代码块均能独立复制。
+  普通数字列表保持文本，明确的 base64 data URI 显示二进制占位。
+- bundle 的五项 `--verify` 通过。macOS 27 本机链接器生成的宿主宏出现
+  `mis-aligned LINKEDIT string pool`，验证时用临时 rustc wrapper 将宿主 proc-macro
+  的部署版本设为 11.0；最终应用与 Info.plist 仍为 15.0，仓库构建脚本未改。
+- 未运行真实 vendor E2E，也未取得最小窗口宽度的实窗证据；图片加载和单段原文
+  2000 字符上限仍是本切片边界。
+
 ## 已知缺口与后续
 
 - Claude Code 会话标题常常是 `<local-command-caveat>Caveat: …`。这是
@@ -138,7 +154,7 @@ PR 评论修复后的验证：
 - transcript 打开后停在顶部，没有自动滚到最新；同一 `toolUseId` 的 inProgress /
   completed 两条都会渲染。
 - 没有客户端侧超时，依赖 daemon 自己的历史硬超时（见 `daemon.rs` 的 `ponytail:` 注释）。
-- 仍属后续独立切片：启动/继续会话、turn 与 streaming、审批、Markdown 与 diff 渲染、
+- 仍属后续独立切片：启动/继续会话、turn 与 streaming、审批、图片加载、
   会话搜索、按项目分组（CC 的 `cwd` 是从目录名还原的，带 `-` 的路径会还原错，不能
   直接拿来分组）。
 
