@@ -1,4 +1,3 @@
-mod composer;
 mod daemon;
 mod shell;
 mod sidebar;
