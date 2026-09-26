@@ -224,7 +224,7 @@ pub fn render(
                         .child(
                             div()
                                 .text_sm()
-                                .text_color(cx.theme().sidebar_foreground.opacity(0.72))
+                                .text_color(cx.theme().muted_foreground)
                                 .child("本机"),
                         ),
                 )
@@ -259,7 +259,7 @@ pub fn render(
                             div()
                                 .px_2()
                                 .text_sm()
-                                .text_color(cx.theme().sidebar_foreground.opacity(0.72))
+                                .text_color(cx.theme().muted_foreground)
                                 .child(text)
                         }))
                         .when(shell.error.is_some(), |section| {
@@ -294,9 +294,7 @@ pub fn render(
                             .gap_1()
                             .child(
                                 v_flex().gap_1().child(name).child(
-                                    div()
-                                        .text_color(cx.theme().sidebar_foreground.opacity(0.72))
-                                        .child(status),
+                                    div().text_color(cx.theme().muted_foreground).child(status),
                                 ),
                             )
                             .when(can_load_more, |section| {
@@ -314,7 +312,7 @@ pub fn render(
                             .children(list_hint.map(|hint| {
                                 div()
                                     .text_xs()
-                                    .text_color(cx.theme().sidebar_foreground.opacity(0.72))
+                                    .text_color(cx.theme().muted_foreground)
                                     .child(hint)
                             }))
                             .when(!warnings.is_empty(), |section| {
@@ -330,7 +328,7 @@ pub fn render(
                                         .overflow_y_scroll()
                                         .p_2()
                                         .rounded_md()
-                                        .bg(cx.theme().warning.opacity(0.1))
+                                        .bg(crate::theme_tokens::WARN_WEAK)
                                         .child(
                                             v_flex()
                                                 .gap_1()
@@ -360,7 +358,7 @@ pub fn render(
                                             .max_h(px(96.))
                                             .overflow_y_scroll()
                                             .text_xs()
-                                            .text_color(cx.theme().sidebar_foreground.opacity(0.72))
+                                            .text_color(cx.theme().muted_foreground)
                                             .child(message),
                                     )
                                     .child(
@@ -401,7 +399,7 @@ fn section_label(text: &str, cx: &Context<Shell>) -> impl IntoElement {
         .px_2()
         .text_sm()
         .font_semibold()
-        .text_color(cx.theme().sidebar_foreground.opacity(0.72))
+        .text_color(cx.theme().muted_foreground)
         .child(text.to_string())
 }
 

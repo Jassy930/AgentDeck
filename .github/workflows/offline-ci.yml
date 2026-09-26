@@ -30,6 +30,9 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
+      - name: Check desktop theme tokens
+        run: node designs/agentdeck-design-system/tools/build.mjs --check-desktop
+
       - name: Run offline Cargo tests
         run: env -u AGENTDECK_E2E scripts/verify-offline-tests.sh
 

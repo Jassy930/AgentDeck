@@ -48,15 +48,17 @@ vendor。标准 Cargo 测试因此可作为默认离线门禁，但其中提前�
 check 名称是 `Offline CI / offline`，使用 `macos-15`，按顺序执行：
 
 1. `cargo fmt --all -- --check`。
-2. `scripts/verify-offline-tests.sh`，且入口显式 unset `AGENTDECK_E2E`。
-3. 构建当前 checkout 的 `agentdeckd` 与 `agentdeck`。
-4. 显式 unset `AGENTDECK_E2E`，以
+2. `node designs/agentdeck-design-system/tools/build.mjs --check-desktop`，只读比对
+   SSOT 应生成的 Rust 颜色与 `agentdeck-desktop/src/theme_tokens.rs`，漂移时失败。
+3. `scripts/verify-offline-tests.sh`，且入口显式 unset `AGENTDECK_E2E`。
+4. 构建当前 checkout 的 `agentdeckd` 与 `agentdeck`。
+5. 显式 unset `AGENTDECK_E2E`，以
    `AGENTDECK_DAEMON_BIN=$GITHUB_WORKSPACE/target/debug/agentdeckd` 和临时 data dir 运行
    CLI selfcheck，禁止命中旧 sibling 或系统安装；显式路径无效时必须 fail fast，不得
    fallback。
-5. 再次显式 unset gate，通过同一对当前 checkout 二进制输出 AgentDeck protocol schema
+6. 再次显式 unset gate，通过同一对当前 checkout 二进制输出 AgentDeck protocol schema
    并与快照比较。
-6. `swift test` 和 `scripts/verify-agent-docs.sh`。
+7. `swift test` 和 `scripts/verify-agent-docs.sh`。
 
 该 workflow 不设置 `AGENTDECK_E2E=1`，不运行真实 Codex / Claude Code，也不运行 iOS
 Simulator。`swift test` 只覆盖平台无关的 `AgentDeckMobileCore`；UIKit Simulator 仍按
@@ -73,6 +75,11 @@ cargo run -p agentdeck-desktop -- --selfcheck
 bash -n script/build_and_run.sh
 ./script/build_and_run.sh --verify
 ```
+
+颜色来自 `designs/agentdeck-design-system/tokens/tokens.json`。修改源 token 或生成器后，
+在设计系统目录运行 `bun run check` 生成并验证 Web / iOS / GPUI 产物；Rust 漂移检查
+使用上面的只读命令。配色实窗验收覆盖正文、行内与 fenced code、警告展开、侧栏选中
+和输入选区；共享 token 改动涉及 iOS 生成物时，同时执行 Swift 与 iOS Simulator 测试。
 
 selfcheck 的成功输出必须是单行 JSON，并明确包含：
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /* ============================================================
    AgentDeck 设计系统 · Token 生成器
-   单一数据源 tokens/tokens.json → generated/{tokens.css, DesignTokens.ts}
-   用法：node tools/build.mjs
+   单一数据源 tokens/tokens.json → Web / iOS / GPUI token
+   用法：node tools/build.mjs [--check-desktop]
    生成物禁止手改；改 tokens.json 后重跑本脚本。
    ============================================================ */
 import fs from "node:fs";
@@ -12,7 +12,6 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const src = JSON.parse(fs.readFileSync(path.join(root, "tokens/tokens.json"), "utf8"));
 const outDir = path.join(root, "generated");
-fs.mkdirSync(outDir, { recursive: true });
 
 /* ---------- 工具 ---------- */
 const kebab = (s) =>
@@ -134,8 +133,50 @@ function genMobileSwift() {
   return "ios/AgentDeckMobile/DesignTokens.swift";
 }
 
-genCss();
-genTs();
-const mobileOut = genMobileSwift();
-console.log("✓ 生成完成 → generated/tokens.css, generated/DesignTokens.ts");
-if (mobileOut) console.log("✓ Mobile 契约 → " + mobileOut);
+function desktopRust() {
+  const colors = src.themes.codex.color;
+  const keys = [
+    "bg", "text", "text2", "surface", "surface2", "border", "sidebarBg",
+    "accent", "accentWeak", "textOnAccent", "warn", "warnWeak", "danger", "success", "info",
+  ];
+  const float = (n) => Number.isInteger(n) ? `${n}.0` : String(n);
+  const L = [
+    "// 生成物 · 由 designs/agentdeck-design-system/tools/build.mjs 从 codex 主题生成，禁止手改。",
+    "use gpui::Rgba;",
+    "",
+  ];
+  for (const key of keys) {
+    const color = parseColor(colors[key]);
+    if (!color) throw new Error(`GPUI 颜色 token 无效: ${key}`);
+    const name = key.replace(/([a-z])([A-Z])/g, "$1_$2").toUpperCase();
+    L.push(`pub const ${name}: Rgba = Rgba {`);
+    for (const channel of ["r", "g", "b"]) {
+      const value = Number.isInteger(color[channel])
+        ? float(color[channel]) : `${float(f4(color[channel] * 255))} / 255.0`;
+      L.push(`    ${channel}: ${value},`);
+    }
+    L.push(`    a: ${float(color.a)},`);
+    L.push("};", "");
+  }
+  return L.join("\n");
+}
+
+const desktopPath = path.join(root, "../../agentdeck-desktop/src/theme_tokens.rs");
+const desktopSource = desktopRust();
+if (process.argv.includes("--check-desktop")) {
+  if (fs.readFileSync(desktopPath, "utf8") !== desktopSource) {
+    console.error("GPUI token 与 SSOT 不一致，请运行 bun run build");
+    process.exitCode = 1;
+  } else {
+    console.log("✓ GPUI token 与 SSOT 一致");
+  }
+} else {
+  fs.mkdirSync(outDir, { recursive: true });
+  genCss();
+  genTs();
+  const mobileOut = genMobileSwift();
+  fs.writeFileSync(desktopPath, desktopSource);
+  console.log("✓ 生成完成 → generated/tokens.css, generated/DesignTokens.ts");
+  if (mobileOut) console.log("✓ Mobile 契约 → " + mobileOut);
+  console.log("✓ GPUI 契约 → agentdeck-desktop/src/theme_tokens.rs");
+}

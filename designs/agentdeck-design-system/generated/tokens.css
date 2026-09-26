@@ -35,8 +35,8 @@
   --text-on-accent: #1c0f04;
   --accent: #ff7d2e;
   --accent-weak: rgba(255,125,46,0.14);
-  --warn: #ff7d2e;
-  --warn-weak: rgba(255,125,46,0.14);
+  --warn: #f5b544;
+  --warn-weak: rgba(245,181,68,0.14);
   --danger: #ff5c5c;
   --danger-weak: rgba(255,92,92,0.13);
   --success: #57cf7c;
