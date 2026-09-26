@@ -7,7 +7,7 @@ use std::sync::{Arc, LazyLock};
 
 use agentdeck_protocol::{AgentKind, HistoryListItem};
 use gpui::{
-    App, Bounds, Context, FontWeight, Image, ImageFormat, IntoElement, ParentElement, Pixels,
+    App, Bounds, Context, FontWeight, Hsla, Image, ImageFormat, IntoElement, ParentElement, Pixels,
     SharedString, Window, canvas, div, fill, img, point, prelude::*, px, rgb, size, uniform_list,
 };
 use gpui_component::{
@@ -62,7 +62,7 @@ const CLAUDE_PIXELS: [&[u8; 16]; 16] = [
     b"................",
 ];
 
-fn agent_icon(kind: AgentKind) -> impl IntoElement {
+fn agent_icon(kind: AgentKind, grayscale: bool) -> impl IntoElement {
     let pixels = match kind {
         AgentKind::Codex => &CODEX_PIXELS,
         AgentKind::ClaudeCode => &CLAUDE_PIXELS,
@@ -79,12 +79,13 @@ fn agent_icon(kind: AgentKind) -> impl IntoElement {
                         b'c' => rgb(0xc87555),
                         _ => continue,
                     };
+                    let color = Hsla::from(color);
                     window.paint_quad(fill(
                         Bounds::new(
                             bounds.origin + point(px(x as f32), px(y as f32)),
                             size(px(1.), px(1.)),
                         ),
-                        color,
+                        if grayscale { color.grayscale() } else { color },
                     ));
                 }
             }
@@ -421,6 +422,7 @@ fn session_row(
     let title_width = px(WIDTH - 3. - AGENT_ICON_SIZE) - window.rem_size() * 4.;
 
     let mut button = Button::new(id)
+        .group("session-row")
         .ghost()
         .selected(selected)
         .tab_stop(false)
@@ -429,7 +431,21 @@ fn session_row(
         })
         .w_full()
         .justify_start()
-        .child(agent_icon(item.agent_kind))
+        .child(
+            div()
+                .relative()
+                .size(px(AGENT_ICON_SIZE))
+                .flex_shrink_0()
+                .child(agent_icon(item.agent_kind, true))
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .opacity(0.)
+                        .group_hover("session-row", |style| style.opacity(1.))
+                        .child(agent_icon(item.agent_kind, false)),
+                ),
+        )
         .child(
             div()
                 .w(title_width)
