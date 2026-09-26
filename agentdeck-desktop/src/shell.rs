@@ -77,7 +77,7 @@ impl Stage {
         {
             *transcript = match read {
                 Ok((turns, warnings)) => {
-                    list.reset(turns.len());
+                    list.reset(transcript::collapsed_indices(&turns).count());
                     Transcript::Ready {
                         blocks: turns.into(),
                         warnings,

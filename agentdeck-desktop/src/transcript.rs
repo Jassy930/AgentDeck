@@ -1,6 +1,7 @@
 //! 会话记录渲染：把中立 `AgentItem` 转成只读块。
 //!
 //! 对话消息直接展开；命令、思考、工具、变更等过程块默认折叠成一行摘要，点击展开。
+//! 连续两个以上的过程块再合成一组，默认只显示一行组摘要。
 //! 助手、思考与过程块正文按 Markdown 渲染（代码走围栏高亮）；用户消息仍是纯文本。
 
 use std::collections::HashSet;
@@ -14,8 +15,13 @@ use gpui::{
     list, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme, Sizable, StyledExt, button::Button, button::ButtonVariants, h_flex,
-    text::TextView, v_flex,
+    ActiveTheme, Sizable, StyledExt,
+    button::Button,
+    button::ButtonVariants,
+    h_flex,
+    scroll::{Scrollbar, ScrollbarShow},
+    text::TextView,
+    v_flex,
 };
 
 /// 单条内容的展示上限；历史里的工具结果可能是几十 KB 的整页文本。
@@ -38,6 +44,10 @@ pub struct Block {
     pub markdown: bool,
     /// 命令失败等需要醒目提示的状态。
     pub failed: bool,
+    /// 所在连续过程块组的 `(起始下标, 块数)`；连续两个以上过程块才成组。
+    pub group: Option<(usize, usize)>,
+    /// 只存于组首块，避免滚动时重新统计整个组。
+    group_summary: Option<(SharedString, usize)>,
 }
 
 impl Block {
@@ -55,6 +65,8 @@ impl Block {
             body: body.into(),
             markdown,
             failed: false,
+            group: None,
+            group_summary: None,
         }
     }
 
@@ -66,6 +78,8 @@ impl Block {
             body: markdown_fallback::images_as_links(body.trim()).into(),
             markdown: true,
             failed: false,
+            group: None,
+            group_summary: None,
         }
     }
 
@@ -294,12 +308,120 @@ fn truncate(body: &str) -> String {
 }
 
 pub fn prepare(turns: Vec<HistoryTurn>) -> Vec<Block> {
-    turns
+    let mut blocks: Vec<Block> = turns
         .into_iter()
         .flat_map(|turn| turn.items)
         .map(|item| describe(&item))
         .filter(|block| !block.is_empty())
-        .collect()
+        .collect();
+    let mut start = 0;
+    while start < blocks.len() {
+        let len = blocks[start..]
+            .iter()
+            .take_while(|block| block.summary.is_some())
+            .count();
+        if len >= 2 {
+            let (summary, failed) = group_summary(&blocks[start..start + len]);
+            blocks[start].group_summary = Some((summary.into(), failed));
+            for block in &mut blocks[start..start + len] {
+                block.group = Some((start, len));
+            }
+        }
+        start += len.max(1);
+    }
+    blocks
+}
+
+pub fn collapsed_indices(blocks: &[Block]) -> impl Iterator<Item = usize> + '_ {
+    blocks.iter().enumerate().filter_map(|(ix, block)| {
+        block
+            .group
+            .is_none_or(|(start, _)| start == ix)
+            .then_some(ix)
+    })
+}
+
+struct VisibleRows {
+    /// 列表位置会随折叠变化，内容和展开状态始终使用原始块下标。
+    indices: Vec<usize>,
+    expanded_groups: HashSet<usize>,
+}
+
+impl VisibleRows {
+    fn new(blocks: &[Block]) -> Self {
+        Self {
+            indices: collapsed_indices(blocks).collect(),
+            expanded_groups: HashSet::new(),
+        }
+    }
+
+    fn toggle_group(&mut self, row: usize, start: usize, len: usize, list: &ListState) {
+        let (removed, inserted) = if self.expanded_groups.remove(&start) {
+            (len, 1)
+        } else {
+            self.expanded_groups.insert(start);
+            (1, len)
+        };
+        self.indices
+            .splice(row..row + removed, start..start + inserted);
+        // 首行也会改变高度；splice 同时保留替换区之后的滚动锚点。
+        list.splice(row..row + removed, inserted);
+    }
+}
+
+/// 组摘要：步数加按首次出现顺序的各类计数，如“5 步 · 命令 3 · 思考 2”；另返回失败数。
+fn group_summary(blocks: &[Block]) -> (String, usize) {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for block in blocks {
+        match counts.iter_mut().find(|(label, _)| *label == block.label) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((block.label, 1)),
+        }
+    }
+    let parts: Vec<String> = std::iter::once(format!("{} 步", blocks.len()))
+        .chain(counts.iter().map(|(label, n)| format!("{label} {n}")))
+        .collect();
+    let failed = blocks.iter().filter(|block| block.failed).count();
+    (parts.join(" · "), failed)
+}
+
+/// 折叠行：箭头、标签、截断摘要和可选状态；`failed` 标红状态，`failed_summary` 同时标红摘要。
+#[allow(clippy::too_many_arguments)]
+fn summary_row(
+    id: ElementId,
+    arrow: &'static str,
+    label: &'static str,
+    summary: SharedString,
+    status: Option<SharedString>,
+    failed: bool,
+    failed_summary: bool,
+    cx: &gpui::App,
+) -> gpui::Stateful<gpui::Div> {
+    let (muted, danger) = (cx.theme().muted_foreground, cx.theme().danger);
+    h_flex()
+        .id(id)
+        .gap_2()
+        .min_w(px(0.))
+        .text_sm()
+        .text_color(muted)
+        .child(div().w(px(10.)).flex_shrink_0().child(arrow))
+        .child(div().flex_shrink_0().font_semibold().child(label))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .truncate()
+                .when(failed_summary, |text| text.text_color(danger))
+                .child(summary),
+        )
+        .when_some(status, |header, status| {
+            header.child(
+                div()
+                    .flex_shrink_0()
+                    .when(failed, |text| text.text_color(danger))
+                    .child(status),
+            )
+        })
 }
 
 fn markdown(
@@ -341,99 +463,129 @@ pub fn render(
         cx,
         |_, _| HashSet::<usize>::new(),
     );
-    // min_h(0)：flex item 默认按内容撑高，不加这行长记录会顶穿底部 composer。
-    list(state, move |ix, window, cx| {
+    let visible = window.use_keyed_state(
+        SharedString::from(format!("transcript-groups-{read_id}")),
+        cx,
+        |_, _| VisibleRows::new(&blocks),
+    );
+    let list_state = state.clone();
+    // 常驻显示：长会话需要随时看到当前位置，不跟随系统的自动隐藏。
+    let scrollbar = Scrollbar::vertical(&state).scrollbar_show(ScrollbarShow::Always);
+    let rows = list(state, move |row, window, cx| {
+        let ix = visible.read(cx).indices[row];
         let block = &blocks[ix];
+        let group_open = block
+            .group
+            .map(|(start, _)| visible.read(cx).expanded_groups.contains(&start));
         let md_id = ElementId::NamedInteger(format!("transcript-{read_id}").into(), ix as u64);
         let theme = cx.theme();
-        let (muted, danger, border) = (theme.muted_foreground, theme.danger, theme.border);
+        let (muted, border) = (theme.muted_foreground, theme.border);
 
-        let content =
-            match &block.summary {
-                None => {
-                    let body = if block.markdown {
-                        markdown(md_id, &block.body, window, cx).into_any_element()
-                    } else {
-                        block.body.clone().into_any_element()
-                    };
-                    v_flex()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_semibold()
-                                .text_color(muted)
-                                .child(block.label),
-                        )
-                        .child(div().text_sm().child(body))
-                        .into_any_element()
-                }
-                Some(summary) => {
-                    let expandable = !block.body.is_empty();
-                    let open = expandable && expanded.read(cx).contains(&ix);
-                    let header =
-                        h_flex()
-                            .id(ElementId::NamedInteger(
-                                "transcript-toggle".into(),
-                                ix as u64,
-                            ))
-                            .gap_2()
-                            .min_w(px(0.))
+        let content = match &block.summary {
+            None => {
+                let body = if block.markdown {
+                    markdown(md_id, &block.body, window, cx).into_any_element()
+                } else {
+                    block.body.clone().into_any_element()
+                };
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
                             .text_sm()
+                            .font_semibold()
                             .text_color(muted)
-                            .child(div().w(px(10.)).flex_shrink_0().child(
-                                match (expandable, open) {
-                                    (false, _) => "",
-                                    (true, false) => "▸",
-                                    (true, true) => "▾",
-                                },
-                            ))
-                            .child(div().flex_shrink_0().font_semibold().child(block.label))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .truncate()
-                                    .when(block.failed, |text| text.text_color(danger))
-                                    .child(summary.clone()),
-                            )
-                            .when_some(block.status.clone(), |header, status| {
-                                header.child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .when(block.failed, |text| text.text_color(danger))
-                                        .child(status),
-                                )
-                            })
-                            .when(expandable, |header| {
-                                let expanded = expanded.clone();
-                                header.cursor_pointer().on_click(move |_, _, cx| {
-                                    expanded.update(cx, |set, cx| {
-                                        if !set.remove(&ix) {
-                                            set.insert(ix);
-                                        }
-                                        cx.notify();
-                                    });
-                                })
-                            });
+                            .child(block.label),
+                    )
+                    .child(div().text_sm().child(body))
+                    .into_any_element()
+            }
+            Some(summary) => {
+                let expandable = !block.body.is_empty();
+                let open = expandable && expanded.read(cx).contains(&ix);
+                let header = summary_row(
+                    ElementId::NamedInteger("transcript-toggle".into(), ix as u64),
+                    match (expandable, open) {
+                        (false, _) => "",
+                        (true, false) => "▸",
+                        (true, true) => "▾",
+                    },
+                    block.label,
+                    summary.clone(),
+                    block.status.clone(),
+                    block.failed,
+                    block.failed,
+                    cx,
+                )
+                .when(expandable, |header| {
+                    let expanded = expanded.clone();
+                    header.cursor_pointer().on_click(move |_, _, cx| {
+                        expanded.update(cx, |set, cx| {
+                            if !set.remove(&ix) {
+                                set.insert(ix);
+                            }
+                            cx.notify();
+                        });
+                    })
+                });
+                v_flex()
+                    .gap_2()
+                    .child(header)
+                    .when(open, |this| {
+                        this.child(
+                            div()
+                                .ml(px(4.))
+                                .pl_4()
+                                .border_l_1()
+                                .border_color(border)
+                                .text_sm()
+                                .when(block.label == "思考", |text| text.text_color(muted))
+                                .child(markdown(md_id, &block.body, window, cx)),
+                        )
+                    })
+                    .into_any_element()
+            }
+        };
+        let content = match (block.group, group_open) {
+            (Some((start, len)), Some(open)) => {
+                let indented = div()
+                    .ml(px(4.))
+                    .pl_4()
+                    .border_l_1()
+                    .border_color(border)
+                    .child(content);
+                if start != ix {
+                    indented.into_any_element()
+                } else {
+                    let (summary, failed) = block.group_summary.as_ref().expect("group summary");
+                    let visible = visible.clone();
+                    let list_state = list_state.clone();
+                    let header = summary_row(
+                        ElementId::NamedInteger("transcript-group".into(), start as u64),
+                        if open { "▾" } else { "▸" },
+                        "过程",
+                        summary.clone(),
+                        (*failed > 0).then(|| format!("{failed} 个失败").into()),
+                        *failed > 0,
+                        false,
+                        cx,
+                    )
+                    .cursor_pointer()
+                    .on_click(move |_, _, cx| {
+                        visible.update(cx, |rows, cx| {
+                            rows.toggle_group(row, start, len, &list_state);
+                            cx.notify();
+                        });
+                    });
                     v_flex()
                         .gap_2()
                         .child(header)
-                        .when(open, |this| {
-                            this.child(
-                                div()
-                                    .ml(px(4.))
-                                    .pl_4()
-                                    .border_l_1()
-                                    .border_color(border)
-                                    .text_sm()
-                                    .when(block.label == "思考", |text| text.text_color(muted))
-                                    .child(markdown(md_id, &block.body, window, cx)),
-                            )
-                        })
+                        .when(open, |this| this.child(indented))
                         .into_any_element()
                 }
-            };
+            }
+            _ => content,
+        };
 
         // 相邻的过程块挤在一起更易扫读；对话消息之间留大间距。
         let gap = if block.summary.is_some() {
@@ -455,15 +607,26 @@ pub fn render(
             )
             .into_any_element()
     })
-    .flex_1()
-    .min_h(px(0.))
-    .w_full()
+    .size_full();
+    // min_h(0)：flex item 默认按内容撑高，不加这行长记录会顶穿底部 composer。
+    div()
+        .relative()
+        .flex_1()
+        .min_h(px(0.))
+        .w_full()
+        .child(rows)
+        // Scrollbar 自身是绝对定位但不带 inset，直接放在列表后面会落到列表下方。
+        .child(div().absolute().inset_0().child(scrollbar))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BODY_LIMIT, Block, describe, fence, is_binary, prepare, truncate};
+    use super::{
+        BODY_LIMIT, Block, VisibleRows, collapsed_indices, describe, fence, is_binary, prepare,
+        truncate,
+    };
     use agentdeck_protocol::{AgentItem, AgentItemMeta, HistoryTurn, ShellStatus};
+    use gpui::{ListAlignment, ListOffset, ListState, px};
 
     fn meta() -> AgentItemMeta {
         AgentItemMeta::default()
@@ -615,5 +778,103 @@ mod tests {
         assert_eq!(truncate("短文本"), "短文本");
         let truncated = truncate(&"字".repeat(BODY_LIMIT + 1));
         assert!(truncated.ends_with("…（已截断）"));
+    }
+
+    #[test]
+    fn consecutive_process_blocks_form_groups() {
+        let user = |text: &str| AgentItem::UserMessage {
+            text: text.into(),
+            meta: meta(),
+        };
+        let think = |text: &str| AgentItem::Reasoning {
+            text: text.into(),
+            meta: meta(),
+        };
+        let shell = |status| AgentItem::Shell {
+            command: "ls".into(),
+            status,
+            exit_code: None,
+            duration_ms: None,
+            meta: meta(),
+        };
+        let blocks = prepare(vec![HistoryTurn {
+            items: vec![
+                user("问"),
+                think("想"),
+                shell(ShellStatus::Completed),
+                shell(ShellStatus::Failed),
+                user("再问"),
+                think("单独一个"),
+                user("结束"),
+            ],
+        }]);
+        let groups: Vec<_> = blocks.iter().map(|b| b.group).collect();
+        assert_eq!(
+            groups,
+            vec![
+                None,
+                Some((1, 3)),
+                Some((1, 3)),
+                Some((1, 3)),
+                None,
+                None,
+                None
+            ]
+        );
+        assert_eq!(
+            blocks[1].group_summary,
+            Some(("3 步 · 思考 1 · 命令 2".into(), 1))
+        );
+    }
+
+    #[test]
+    fn collapsed_groups_remove_hidden_rows_and_preserve_following_scroll_anchor() {
+        let message = || AgentItem::UserMessage {
+            text: "消息".into(),
+            meta: meta(),
+        };
+        let process = || AgentItem::Reasoning {
+            text: "步骤".into(),
+            meta: meta(),
+        };
+        let items = std::iter::once(message())
+            .chain((0..1000).map(|_| process()))
+            .chain(std::iter::once(message()))
+            .chain((0..3).map(|_| process()))
+            .chain(std::iter::once(message()))
+            .collect();
+        let blocks = prepare(vec![HistoryTurn { items }]);
+        let mut rows = VisibleRows::new(&blocks);
+        let list = ListState::new(
+            collapsed_indices(&blocks).count(),
+            ListAlignment::Top,
+            px(1000.),
+        );
+        assert_eq!(rows.indices, [0, 1, 1001, 1002, 1005]);
+        assert_eq!(list.item_count(), 5);
+        list.scroll_to(ListOffset {
+            item_ix: 4,
+            offset_in_item: px(7.),
+        });
+
+        // 先展开后面的组，再改变前面的组；原块身份和后方滚动锚点不能串位。
+        rows.toggle_group(3, 1002, 3, &list);
+        assert_eq!(rows.indices, [0, 1, 1001, 1002, 1003, 1004, 1005]);
+        assert_eq!(list.item_count(), 7);
+        rows.toggle_group(1, 1, 1000, &list);
+        assert_eq!(rows.indices, (0..blocks.len()).collect::<Vec<_>>());
+        assert_eq!(list.item_count(), blocks.len());
+        assert_eq!(list.logical_scroll_top().item_ix, 1005);
+
+        rows.toggle_group(1, 1, 1000, &list);
+        assert_eq!(rows.indices, [0, 1, 1001, 1002, 1003, 1004, 1005]);
+        assert_eq!(list.item_count(), 7);
+        assert!(rows.expanded_groups.contains(&1002));
+        rows.toggle_group(3, 1002, 3, &list);
+        assert_eq!(rows.indices, [0, 1, 1001, 1002, 1005]);
+        assert_eq!(list.item_count(), 5);
+        assert_eq!(list.logical_scroll_top().item_ix, 4);
+        assert_eq!(list.logical_scroll_top().offset_in_item, px(7.));
+        assert!(rows.expanded_groups.is_empty());
     }
 }
