@@ -18,11 +18,10 @@ use gpui_component::{
     ActiveTheme, InteractiveElementExt, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
-    input::InputState,
+    input::{InputEvent, InputState},
     v_flex,
 };
 
-use crate::composer;
 use crate::daemon;
 use crate::sidebar;
 use crate::transcript;
@@ -32,9 +31,9 @@ const SIDEBAR_LIMIT: usize = 50;
 
 /// 主区当前展示的形态。
 pub enum Stage {
-    /// 空态：居中大标题、composer 和本机 agent 卡片。
+    /// 空态：居中大标题、只读提示和本机 agent 过滤卡片。
     Empty,
-    /// 会话态：thread header、会话记录和底部悬浮 composer。
+    /// 会话态：thread header、会话记录和底部只读提示。
     Session {
         item: HistoryListItem,
         transcript: Transcript,
@@ -88,14 +87,6 @@ impl Stage {
             return true;
         }
         false
-    }
-
-    /// 会话态的项目名；空态没有会话上下文。
-    pub fn project_name(&self) -> Option<String> {
-        match self {
-            Stage::Empty => None,
-            Stage::Session { item, .. } => Some(project_name(item)),
-        }
     }
 
     pub fn thread_id(&self) -> Option<&ThreadId> {
@@ -262,6 +253,16 @@ impl AgentHistory {
     pub fn error(&self) -> Option<&str> {
         self.result.as_ref()?.as_ref().err().map(String::as_str)
     }
+
+    /// 侧栏 agent 行的简短计数；完整状态放在悬停详情里。
+    pub fn count_label(&self) -> String {
+        match &self.result {
+            Some(Ok(())) => self.loaded.to_string(),
+            Some(Err(_)) => "失败".to_string(),
+            None if self.loaded > 0 => format!("{}…", self.loaded),
+            None => "…".to_string(),
+        }
+    }
 }
 
 fn empty_hint(agents: &[AgentHistory], pending: usize, error: Option<&str>) -> String {
@@ -277,7 +278,7 @@ fn empty_hint(agents: &[AgentHistory], pending: usize, error: Option<&str>) -> S
         .to_string();
     }
     if agents.iter().any(|agent| agent.loaded > 0) {
-        "选择左侧会话查看记录，或试着输入任务"
+        "选择左侧会话查看记录"
     } else if pending > 0 {
         "正在读取会话…"
     } else {
@@ -309,8 +310,74 @@ impl FrameStats {
     }
 }
 
+/// 侧栏列表的一行：日期分组标题，或指向 `Shell::sessions` 的会话。
+pub(crate) enum SidebarRow {
+    Header(&'static str),
+    Session { index: usize, time: SharedString },
+}
+
+/// 毫秒时间戳的本地日序号、月、日、时、分。偏移取该时刻自己的，夏令时切换当天不会错位。
+#[cfg(unix)]
+fn local_time(ms: u64) -> (i64, i32, i32, i32, i32) {
+    let secs = (ms / 1000) as libc::time_t;
+    // SAFETY: localtime_r 只写入传入的 tm。
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&secs, &mut tm) };
+    (
+        (secs as i64 + tm.tm_gmtoff as i64).div_euclid(86_400),
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+    )
+}
+
+/// 相对今天的分组；未来时间（时钟偏差）归入今天。
+fn day_group(day: i64, today: i64) -> &'static str {
+    match today - day {
+        ..=0 => "今天",
+        1 => "昨天",
+        2..=6 => "近 7 天",
+        _ => "更早",
+    }
+}
+
+/// 按标题或项目名（不区分大小写）和 agent 过滤。
+fn session_matches(item: &HistoryListItem, query: &str, agent: Option<AgentKind>) -> bool {
+    agent.is_none_or(|kind| item.agent_kind == kind)
+        && (query.is_empty()
+            || session_title(item).to_lowercase().contains(query)
+            || project_name(item).to_lowercase().contains(query))
+}
+
+/// 已过滤的会话（按最近活动倒序，带本地时间）插入分组标题。
+fn sidebar_rows(
+    visible: impl IntoIterator<Item = (usize, (i64, i32, i32, i32, i32))>,
+    today: i64,
+) -> Vec<SidebarRow> {
+    let mut rows = Vec::new();
+    let mut current = None;
+    for (index, (day, month, mday, hour, minute)) in visible {
+        let group = day_group(day, today);
+        if current != Some(group) {
+            current = Some(group);
+            rows.push(SidebarRow::Header(group));
+        }
+        let time = if today - day <= 1 {
+            format!("{hour:02}:{minute:02}")
+        } else {
+            format!("{month}/{mday}")
+        };
+        rows.push(SidebarRow::Session {
+            index,
+            time: time.into(),
+        });
+    }
+    rows
+}
+
 fn sidebar_target(
-    sessions: &[HistoryListItem],
+    sessions: &[&HistoryListItem],
     cursor: Option<&(AgentKind, ThreadId)>,
     step: isize,
 ) -> Option<usize> {
@@ -336,11 +403,16 @@ pub struct Shell {
     frame_stats: Option<FrameStats>,
     next_read_id: u64,
     reads: ReadQueue,
-    composer: Entity<InputState>,
+    /// 侧栏搜索框：按标题或项目名过滤会话。
+    pub(crate) search: Entity<InputState>,
+    /// 只看某个 agent 的会话；主页卡片和侧栏 agent 行切换。
+    pub(crate) agent_filter: Option<AgentKind>,
     /// daemon 已注册的 agent，决定侧栏按哪些来源拉历史。
     pub(crate) agents: Vec<AgentHistory>,
     /// 所有来源合并后的会话，按最近活动倒序。
     pub(crate) sessions: Vec<HistoryListItem>,
+    /// 过滤并分组后的侧栏行；只在会话、搜索词或过滤变化时重建。
+    pub(crate) rows: Vec<SidebarRow>,
     pub(crate) sidebar_focus: FocusHandle,
     pub(crate) sidebar_scroll: UniformListScrollHandle,
     sidebar_cursor: Option<(AgentKind, ThreadId)>,
@@ -359,24 +431,27 @@ impl Shell {
         dev_mode: bool,
         cx: &mut Context<Self>,
     ) -> Self {
-        let composer = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("描述任务，预览输入效果…")
-                .multi_line(true)
-                .auto_grow(1, 8)
-        });
-
-        // 打开窗口即可直接输入。切换形态时的聚焦留到接入真实会话时一并处理。
-        composer.update(cx, |input, cx| input.focus(window, cx));
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索会话"));
+        cx.subscribe(&search, |shell, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                shell.rebuild_rows(cx);
+                cx.notify();
+            }
+        })
+        .detach();
+        // 打开窗口即可直接搜索。
+        search.update(cx, |input, cx| input.focus(window, cx));
 
         let mut shell = Self {
             stage: Stage::Empty,
             frame_stats: dev_mode.then(FrameStats::default),
             next_read_id: 0,
             reads: ReadQueue::default(),
-            composer,
+            search,
+            agent_filter: None,
             agents: Vec::new(),
             sessions: Vec::new(),
+            rows: Vec::new(),
             sidebar_focus: cx.focus_handle(),
             sidebar_scroll: UniformListScrollHandle::new(),
             sidebar_cursor: None,
@@ -450,6 +525,7 @@ impl Shell {
                     shell
                         .sessions
                         .sort_by(|a, b| b.last_active_ms.cmp(&a.last_active_ms));
+                    shell.rebuild_rows(cx);
                 }
                 cx.notify();
             })
@@ -477,16 +553,60 @@ impl Shell {
         }
     }
 
-    pub fn load_more_agent(&mut self, kind: AgentKind, cx: &mut Context<Self>) {
-        if self
-            .agents
-            .iter_mut()
-            .find(|agent| agent.kind == kind)
-            .is_some_and(AgentHistory::load_more)
-        {
-            self.load_agent_sessions(kind, cx);
-            cx.notify();
+    /// 列表末尾还能加载更多的来源；有 agent 过滤时只算该来源。
+    pub fn load_more_kinds(&self) -> Vec<AgentKind> {
+        self.agents
+            .iter()
+            .filter(|agent| {
+                agent.can_load_more() && self.agent_filter.is_none_or(|kind| kind == agent.kind)
+            })
+            .map(|agent| agent.kind)
+            .collect()
+    }
+
+    pub fn load_more(&mut self, cx: &mut Context<Self>) {
+        for kind in self.load_more_kinds() {
+            if let Some(agent) = self.agents.iter_mut().find(|agent| agent.kind == kind)
+                && agent.load_more()
+            {
+                self.load_agent_sessions(kind, cx);
+            }
         }
+        cx.notify();
+    }
+
+    pub fn toggle_agent_filter(&mut self, kind: AgentKind, cx: &mut Context<Self>) {
+        self.agent_filter = (self.agent_filter != Some(kind)).then_some(kind);
+        self.rebuild_rows(cx);
+        cx.notify();
+    }
+
+    // ponytail: 分组相对重建时刻的“今天”，窗口跨午夜不动时不刷新；需要时加定时重建。
+    fn rebuild_rows(&mut self, cx: &App) {
+        let query = self.search.read(cx).value().trim().to_lowercase();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as u64);
+        self.rows = sidebar_rows(
+            self.sessions
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| session_matches(item, &query, self.agent_filter))
+                .map(|(index, item)| (index, local_time(item.last_active_ms))),
+            local_time(now).0,
+        );
+    }
+
+    /// 可见会话的行号与条目，键盘导航只在这些行之间移动。
+    fn visible_rows(&self) -> (Vec<usize>, Vec<&HistoryListItem>) {
+        self.rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row, entry)| match entry {
+                SidebarRow::Session { index, .. } => Some((row, &self.sessions[*index])),
+                SidebarRow::Header(_) => None,
+            })
+            .unzip()
     }
 
     fn retry_transcript(&mut self, cx: &mut Context<Self>) {
@@ -500,24 +620,34 @@ impl Shell {
         }
     }
 
-    pub fn sidebar_cursor_index(&self) -> Option<usize> {
-        sidebar_target(&self.sessions, self.sidebar_cursor.as_ref(), 0)
+    /// 键盘光标所在的侧栏行号。
+    pub fn sidebar_cursor_row(&self) -> Option<usize> {
+        let (rows, items) = self.visible_rows();
+        sidebar_target(&items, self.sidebar_cursor.as_ref(), 0).map(|index| rows[index])
     }
 
     pub fn navigate_sidebar(&mut self, step: isize, cx: &mut Context<Self>) {
-        if let Some(index) = sidebar_target(&self.sessions, self.sidebar_cursor.as_ref(), step) {
-            let item = &self.sessions[index];
-            self.sidebar_cursor = Some((item.agent_kind, item.thread_id.clone()));
-            self.sidebar_scroll
-                .scroll_to_item(index, ScrollStrategy::Top);
+        let (rows, items) = self.visible_rows();
+        let target = sidebar_target(&items, self.sidebar_cursor.as_ref(), step).map(|index| {
+            (
+                rows[index],
+                items[index].agent_kind,
+                items[index].thread_id.clone(),
+            )
+        });
+        if let Some((row, kind, thread_id)) = target {
+            self.sidebar_cursor = Some((kind, thread_id));
+            self.sidebar_scroll.scroll_to_item(row, ScrollStrategy::Top);
             cx.notify();
         }
     }
 
     pub fn open_sidebar_cursor(&mut self, cx: &mut Context<Self>) {
-        if let Some(index) = self.sidebar_cursor_index() {
-            self.sidebar_scroll
-                .scroll_to_item(index, ScrollStrategy::Top);
+        let Some(row) = self.sidebar_cursor_row() else {
+            return;
+        };
+        if let SidebarRow::Session { index, .. } = self.rows[row] {
+            self.sidebar_scroll.scroll_to_item(row, ScrollStrategy::Top);
             self.open_session(self.sessions[index].clone(), cx);
         }
     }
@@ -574,11 +704,18 @@ impl Shell {
         cx.notify();
     }
 
-    fn render_empty(&self, cx: &App) -> impl IntoElement + use<> {
+    fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let cards: Vec<_> = self
             .agents
             .iter()
-            .map(|agent| connector_card(&agent_label(agent.kind), &agent.status(), cx))
+            .map(|agent| {
+                connector_card(
+                    agent.kind,
+                    &agent.status(),
+                    self.agent_filter == Some(agent.kind),
+                    cx,
+                )
+            })
             .collect();
 
         let hint = empty_hint(&self.agents, self.pending, self.error.as_deref());
@@ -607,8 +744,8 @@ impl Shell {
                                     .child(hint),
                             ),
                     )
-                    .child(composer::render(&self.composer, None, None, cx))
-                    .child(h_flex().gap_3().children(cards)),
+                    .child(h_flex().gap_3().children(cards))
+                    .child(read_only_notice(cx)),
             )
     }
 
@@ -758,19 +895,15 @@ impl Shell {
             )
             .child(body)
             .child(
-                // 底部悬浮 composer：固定高度，不被上方记录挤压或盖住。
+                // 发送接入前只留一行只读提示；固定高度，不被上方记录挤压。
                 h_flex()
                     .w_full()
                     .flex_shrink_0()
                     .justify_center()
-                    .px_6()
-                    .pb_6()
-                    .child(composer::render(
-                        &self.composer,
-                        self.stage.project_name().as_deref(),
-                        Some(&agent_label(item.agent_kind)),
-                        cx,
-                    )),
+                    .py_3()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .child(read_only_notice(cx)),
             )
     }
 }
@@ -784,21 +917,52 @@ fn placeholder(text: &str, cx: &App) -> impl IntoElement + use<> {
     )
 }
 
-fn connector_card(name: &str, status: &str, cx: &App) -> impl IntoElement + use<> {
+fn read_only_notice(cx: &App) -> impl IntoElement + use<> {
+    div()
+        .text_sm()
+        .text_color(cx.theme().muted_foreground)
+        .child("只读历史预览，暂不能发送任务")
+}
+
+/// 主页 agent 卡片：点击只看该 agent 的会话，再点取消。
+fn connector_card(
+    kind: AgentKind,
+    status: &str,
+    selected: bool,
+    cx: &mut Context<Shell>,
+) -> impl IntoElement + use<> {
     v_flex()
+        .id(SharedString::from(format!("agent-card-{}", kind.as_str())))
         .w(px(220.))
         .gap_1()
         .p_4()
         .rounded_lg()
         .bg(cx.theme().muted)
         .border_1()
-        .border_color(cx.theme().border)
-        .child(div().text_sm().font_semibold().child(name.to_string()))
+        .border_color(if selected {
+            cx.theme().ring
+        } else {
+            cx.theme().border
+        })
+        .cursor_pointer()
+        .hover(|style| style.bg(cx.theme().secondary_hover))
+        .on_click(cx.listener(move |shell, _, _, cx| shell.toggle_agent_filter(kind, cx)))
+        .child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(sidebar::agent_icon(kind))
+                .child(div().text_sm().font_semibold().child(agent_label(kind))),
+        )
         .child(
             div()
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
-                .child(status.to_string()),
+                .child(if selected {
+                    format!("{status} · 已筛选")
+                } else {
+                    status.to_string()
+                }),
         )
 }
 
@@ -851,8 +1015,9 @@ impl Render for Shell {
 mod tests {
     use super::sidebar_target;
     use super::{
-        AgentHistory, FrameStats, ReadQueue, ReadRequest, Stage, Transcript, agent_label,
-        empty_hint, project_name, session_title, transcript_list,
+        AgentHistory, FrameStats, ReadQueue, ReadRequest, SidebarRow, Stage, Transcript,
+        agent_label, day_group, empty_hint, project_name, session_matches, session_title,
+        sidebar_rows, transcript_list,
     };
     use agentdeck_protocol::{AgentKind, HistoryListItem, HistoryWarning, ThreadId};
 
@@ -876,9 +1041,9 @@ mod tests {
     }
 
     #[test]
-    fn navigation_keeps_the_selected_thread_and_project_together() {
+    fn navigation_keeps_the_selected_thread() {
         let mut stage = Stage::Empty;
-        assert_eq!((stage.thread_id(), stage.project_name()), (None, None));
+        assert_eq!(stage.thread_id(), None);
 
         stage = Stage::Session {
             item: item(Some("修复记录收尾")),
@@ -887,10 +1052,9 @@ mod tests {
             read_id: 1,
         };
         assert_eq!(stage.thread_id().map(|id| id.0.as_str()), Some("7330efa6"));
-        assert_eq!(stage.project_name(), Some("AgentDeck".to_string()));
 
         stage = Stage::Empty;
-        assert_eq!((stage.thread_id(), stage.project_name()), (None, None));
+        assert_eq!(stage.thread_id(), None);
     }
 
     #[test]
@@ -901,7 +1065,7 @@ mod tests {
         let mut other_agent = second.clone();
         other_agent.agent_kind = AgentKind::Codex;
         let cursor = (second.agent_kind, second.thread_id.clone());
-        let mut sessions = vec![first, second, other_agent];
+        let mut sessions = vec![&first, &second, &other_agent];
 
         assert_eq!(sidebar_target(&[], None, 1), None);
         assert_eq!(sidebar_target(&sessions, None, 0), Some(0));
@@ -920,6 +1084,71 @@ mod tests {
         assert_eq!(sidebar_target(&sessions, Some(&cursor), 0), None);
         assert_eq!(sidebar_target(&sessions, Some(&cursor), 1), Some(0));
         assert_eq!(sidebar_target(&sessions, Some(&cursor), -1), Some(1));
+    }
+
+    #[test]
+    fn sidebar_rows_group_by_local_day_and_keep_session_indices() {
+        let today = 20_000;
+        let rows = sidebar_rows(
+            [
+                (0, (today, 9, 26, 14, 5)),
+                (2, (today - 1, 9, 25, 9, 0)),
+                (3, (today - 3, 9, 23, 8, 0)),
+                (5, (today - 4, 9, 22, 8, 0)),
+                (7, (today - 30, 8, 27, 8, 0)),
+            ],
+            today,
+        );
+        let flat: Vec<_> = rows
+            .iter()
+            .map(|row| match row {
+                SidebarRow::Header(label) => label.to_string(),
+                SidebarRow::Session { index, time } => format!("{index}@{time}"),
+            })
+            .collect();
+        assert_eq!(
+            flat,
+            [
+                "今天",
+                "0@14:05",
+                "昨天",
+                "2@09:00",
+                "近 7 天",
+                "3@9/23",
+                "5@9/22",
+                "更早",
+                "7@8/27"
+            ]
+        );
+        assert_eq!(day_group(today + 1, today), "今天");
+        assert_eq!(day_group(today - 6, today), "近 7 天");
+        assert_eq!(day_group(today - 7, today), "更早");
+    }
+
+    #[test]
+    fn session_filter_matches_title_or_project_and_agent() {
+        let claude = item(Some("Review AgentDeck PR"));
+        assert!(session_matches(&claude, "", None));
+        assert!(session_matches(&claude, "review", None));
+        assert!(session_matches(
+            &claude,
+            "agentdeck",
+            Some(AgentKind::ClaudeCode)
+        ));
+        assert!(!session_matches(&claude, "review", Some(AgentKind::Codex)));
+        assert!(!session_matches(&claude, "robodojo", None));
+    }
+
+    #[test]
+    fn agent_count_label_distinguishes_loading_failure_and_count() {
+        let mut source = AgentHistory::new(AgentKind::Codex);
+        assert_eq!(source.count_label(), "…");
+        source.complete(&mut Ok((vec![item(None); 51], vec![])));
+        assert_eq!(source.count_label(), "50");
+        assert!(source.load_more());
+        assert_eq!(source.count_label(), "50…");
+        source.complete(&mut Err("timeout".into()));
+        assert_eq!(source.count_label(), "失败");
     }
 
     #[test]
@@ -1127,10 +1356,7 @@ mod tests {
         assert_eq!(empty_hint(&agents, 0, None), "没有可显示的会话");
 
         agents[1].complete(&mut Ok((vec![item(None)], vec![])));
-        assert_eq!(
-            empty_hint(&agents, 0, None),
-            "选择左侧会话查看记录，或试着输入任务"
-        );
+        assert_eq!(empty_hint(&agents, 0, None), "选择左侧会话查看记录");
     }
 
     #[test]
