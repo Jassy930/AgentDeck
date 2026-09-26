@@ -718,7 +718,7 @@ impl Shell {
                             .flex_shrink_0()
                             .px_5()
                             .py_1()
-                            .bg(cx.theme().warning.opacity(0.1))
+                            .bg(crate::theme_tokens::WARN_WEAK)
                             .child(
                                 Button::new(("transcript-warning-toggle", read_id))
                                     .ghost()

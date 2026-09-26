@@ -3,6 +3,7 @@ mod daemon;
 mod shell;
 mod sidebar;
 mod theme;
+mod theme_tokens;
 mod transcript;
 
 use std::env;

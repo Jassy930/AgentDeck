@@ -293,9 +293,7 @@ pub fn render(
                             .gap_1()
                             .child(
                                 v_flex().gap_1().child(name).child(
-                                    div()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(status),
+                                    div().text_color(cx.theme().muted_foreground).child(status),
                                 ),
                             )
                             .when(can_load_more, |section| {
@@ -329,7 +327,7 @@ pub fn render(
                                         .overflow_y_scroll()
                                         .p_2()
                                         .rounded_md()
-                                        .bg(cx.theme().warning.opacity(0.1))
+                                        .bg(crate::theme_tokens::WARN_WEAK)
                                         .child(
                                             v_flex()
                                                 .gap_1()

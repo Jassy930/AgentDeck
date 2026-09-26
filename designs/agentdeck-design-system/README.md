@@ -1,9 +1,8 @@
 # AgentDeck 设计系统
 
-> 2026-08-17：macOS AppKit 客户端及其 Swift 生成链已经删除。GPUI P0 只使用
-> gpui-component；token、Web 预览和 iOS 生成物继续保留。
-> 2026-09-26：GPUI 桌面端在 `agentdeck-desktop/src/theme.rs` 手写映射 codex 主题
-> （锁定深色，warning 改用琥珀 `#f5b544` 以区分品牌橙），改 token 时需同步该文件。
+> Web / RN、iOS 与 GPUI 桌面端共用 `tokens/tokens.json`。
+> GPUI 当前消费 codex 主题的生成颜色，`agentdeck-desktop/src/theme.rs` 将其映射到
+> gpui-component 并固定为深色；codex 的 warning 在各端统一使用琥珀 `#f5b544`。
 
 面向 Coding Agent 工作台的**跨桌面/手机端**可视化设计系统展示页。以 Codex Desktop 视觉范式为主基调，并额外提供三种可一键切换的设计语言。
 
@@ -51,14 +50,16 @@ python3 -m http.server 4311 --directory designs
 设计系统不止"看"，还能被工程直接吃、被 CI 拦。
 
 ```bash
-bun run build   # SSOT → generated/tokens.css · DesignTokens.ts + iOS DesignTokens.swift
+bun run build   # SSOT → Web / RN、iOS 与 GPUI 颜色生成物
 bun run lint    # 门禁：SSOT 一致 · 组件禁硬编码色 · 开关默认值齐全
 bun run a11y    # 六套主题关键对比度 ≥ AA
 bun run check   # 以上一步到位（可接 CI）
+node tools/build.mjs --check-desktop  # 只读检查已提交的 Rust 颜色生成物是否与 SSOT 一致
 ```
 
 - **[`tokens/tokens.json`](tokens/tokens.json)** — **单一数据源（SSOT）**：6 套主题的色板/圆角/字体/阴影/结构枚举，以及全局字号、行高与平台开关。改这里，其余生成。
-- **`generated/`** — Web / RN 生成物（**禁手改**）：`tokens.css`、`DesignTokens.ts`。同一生成器还更新 iOS 的 `ios/AgentDeckMobile/DesignTokens.swift`；不会写入任何 macOS 源码目录。
+- **`generated/`** — Web / RN 生成物（**禁手改**）：`tokens.css`、`DesignTokens.ts`。同一生成器还更新 iOS 的 `ios/AgentDeckMobile/DesignTokens.swift` 和 GPUI 的 `agentdeck-desktop/src/theme_tokens.rs`；后者只包含桌面当前使用的 codex `Rgba` 颜色常量。
+- **`agentdeck-desktop/src/theme.rs`** — GPUI 字段映射与交互状态派生；选区使用 `accentWeak`（透明度 `0.14`）。codex 的 `warn` / `warnWeak` 在各端统一为琥珀 / 透明度 `0.14`，详细边界见 `ENGINEERING.md`。
 - **`tools/`** — `build.mjs`（生成器）· `lint.mjs`（约束门禁）· `a11y.mjs`（对比度核验）。
 - **[`ENGINEERING.md`](ENGINEERING.md)** — **工程约束**（MUST/MUST NOT、分层、工作流、GPUI/iOS 边界、扩展手册）。
 - **[`COMPONENTS.md`](COMPONENTS.md)** — 组件契约（变体/状态/token/无障碍/状态矩阵）。

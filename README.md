@@ -15,6 +15,7 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
 
 - 创建真实 GPUI macOS 窗口，使用透明标题栏。
 - 初始化 `gpui-component` 并挂载 `Root`。
+- 界面固定使用深色，配色来自设计系统 SSOT 生成的 codex 颜色；警告使用与品牌橙区分的琥珀色。
 - 渲染外壳布局：全高左侧栏（品牌行 / 快捷入口 / 最近会话 / 本机 Agent 状态）、
   空态（居中标题、圆角 composer、按已注册 agent 生成的接入卡片），以及会话态
   （thread header、会话记录、底部悬浮 composer）。
