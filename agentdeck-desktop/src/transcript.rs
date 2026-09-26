@@ -46,6 +46,8 @@ pub struct Block {
     pub failed: bool,
     /// 所在连续过程块组的 `(起始下标, 块数)`；连续两个以上过程块才成组。
     pub group: Option<(usize, usize)>,
+    /// 只存于组首块，避免滚动时重新统计整个组。
+    group_summary: Option<(SharedString, usize)>,
 }
 
 impl Block {
@@ -64,6 +66,7 @@ impl Block {
             markdown,
             failed: false,
             group: None,
+            group_summary: None,
         }
     }
 
@@ -76,6 +79,7 @@ impl Block {
             markdown: true,
             failed: false,
             group: None,
+            group_summary: None,
         }
     }
 
@@ -317,6 +321,8 @@ pub fn prepare(turns: Vec<HistoryTurn>) -> Vec<Block> {
             .take_while(|block| block.summary.is_some())
             .count();
         if len >= 2 {
+            let (summary, failed) = group_summary(&blocks[start..start + len]);
+            blocks[start].group_summary = Some((summary.into(), failed));
             for block in &mut blocks[start..start + len] {
                 block.group = Some((start, len));
             }
@@ -324,6 +330,43 @@ pub fn prepare(turns: Vec<HistoryTurn>) -> Vec<Block> {
         start += len.max(1);
     }
     blocks
+}
+
+pub fn collapsed_indices(blocks: &[Block]) -> impl Iterator<Item = usize> + '_ {
+    blocks.iter().enumerate().filter_map(|(ix, block)| {
+        block
+            .group
+            .is_none_or(|(start, _)| start == ix)
+            .then_some(ix)
+    })
+}
+
+struct VisibleRows {
+    /// 列表位置会随折叠变化，内容和展开状态始终使用原始块下标。
+    indices: Vec<usize>,
+    expanded_groups: HashSet<usize>,
+}
+
+impl VisibleRows {
+    fn new(blocks: &[Block]) -> Self {
+        Self {
+            indices: collapsed_indices(blocks).collect(),
+            expanded_groups: HashSet::new(),
+        }
+    }
+
+    fn toggle_group(&mut self, row: usize, start: usize, len: usize, list: &ListState) {
+        let (removed, inserted) = if self.expanded_groups.remove(&start) {
+            (len, 1)
+        } else {
+            self.expanded_groups.insert(start);
+            (1, len)
+        };
+        self.indices
+            .splice(row..row + removed, start..start + inserted);
+        // 首行也会改变高度；splice 同时保留替换区之后的滚动锚点。
+        list.splice(row..row + removed, inserted);
+    }
 }
 
 /// 组摘要：步数加按首次出现顺序的各类计数，如“5 步 · 命令 3 · 思考 2”；另返回失败数。
@@ -420,24 +463,20 @@ pub fn render(
         cx,
         |_, _| HashSet::<usize>::new(),
     );
-    // 展开的组按起始下标记录；组默认折叠。
-    let groups = window.use_keyed_state(
+    let visible = window.use_keyed_state(
         SharedString::from(format!("transcript-groups-{read_id}")),
         cx,
-        |_, _| HashSet::<usize>::new(),
+        |_, _| VisibleRows::new(&blocks),
     );
     let list_state = state.clone();
     // 常驻显示：长会话需要随时看到当前位置，不跟随系统的自动隐藏。
     let scrollbar = Scrollbar::vertical(&state).scrollbar_show(ScrollbarShow::Always);
-    let rows = list(state, move |ix, window, cx| {
+    let rows = list(state, move |row, window, cx| {
+        let ix = visible.read(cx).indices[row];
         let block = &blocks[ix];
         let group_open = block
             .group
-            .map(|(start, _)| groups.read(cx).contains(&start));
-        // 折叠组里除首块外都渲染成零高度，首块位置改画组摘要。
-        if group_open == Some(false) && block.group.is_some_and(|(start, _)| start != ix) {
-            return div().into_any_element();
-        }
+            .map(|(start, _)| visible.read(cx).expanded_groups.contains(&start));
         let md_id = ElementId::NamedInteger(format!("transcript-{read_id}").into(), ix as u64);
         let theme = cx.theme();
         let (muted, border) = (theme.muted_foreground, theme.border);
@@ -518,29 +557,25 @@ pub fn render(
                 if start != ix {
                     indented.into_any_element()
                 } else {
-                    let (summary, failed) = group_summary(&blocks[start..start + len]);
-                    let groups = groups.clone();
+                    let (summary, failed) = block.group_summary.as_ref().expect("group summary");
+                    let visible = visible.clone();
                     let list_state = list_state.clone();
                     let header = summary_row(
                         ElementId::NamedInteger("transcript-group".into(), start as u64),
                         if open { "▾" } else { "▸" },
                         "过程",
-                        summary.into(),
-                        (failed > 0).then(|| format!("{failed} 个失败").into()),
-                        failed > 0,
+                        summary.clone(),
+                        (*failed > 0).then(|| format!("{failed} 个失败").into()),
+                        *failed > 0,
                         false,
                         cx,
                     )
                     .cursor_pointer()
                     .on_click(move |_, _, cx| {
-                        groups.update(cx, |set, cx| {
-                            if !set.remove(&start) {
-                                set.insert(start);
-                            }
+                        visible.update(cx, |rows, cx| {
+                            rows.toggle_group(row, start, len, &list_state);
                             cx.notify();
                         });
-                        // 组内其余块高度在 0 与实际之间切换，屏幕外的缓存高度需要作废。
-                        list_state.splice(start + 1..start + len, len - 1);
                     });
                     v_flex()
                         .gap_2()
@@ -586,8 +621,12 @@ pub fn render(
 
 #[cfg(test)]
 mod tests {
-    use super::{BODY_LIMIT, Block, describe, fence, group_summary, is_binary, prepare, truncate};
+    use super::{
+        BODY_LIMIT, Block, VisibleRows, collapsed_indices, describe, fence, is_binary, prepare,
+        truncate,
+    };
     use agentdeck_protocol::{AgentItem, AgentItemMeta, HistoryTurn, ShellStatus};
+    use gpui::{ListAlignment, ListOffset, ListState, px};
 
     fn meta() -> AgentItemMeta {
         AgentItemMeta::default()
@@ -783,8 +822,59 @@ mod tests {
             ]
         );
         assert_eq!(
-            group_summary(&blocks[1..4]),
-            ("3 步 · 思考 1 · 命令 2".to_string(), 1)
+            blocks[1].group_summary,
+            Some(("3 步 · 思考 1 · 命令 2".into(), 1))
         );
+    }
+
+    #[test]
+    fn collapsed_groups_remove_hidden_rows_and_preserve_following_scroll_anchor() {
+        let message = || AgentItem::UserMessage {
+            text: "消息".into(),
+            meta: meta(),
+        };
+        let process = || AgentItem::Reasoning {
+            text: "步骤".into(),
+            meta: meta(),
+        };
+        let items = std::iter::once(message())
+            .chain((0..1000).map(|_| process()))
+            .chain(std::iter::once(message()))
+            .chain((0..3).map(|_| process()))
+            .chain(std::iter::once(message()))
+            .collect();
+        let blocks = prepare(vec![HistoryTurn { items }]);
+        let mut rows = VisibleRows::new(&blocks);
+        let list = ListState::new(
+            collapsed_indices(&blocks).count(),
+            ListAlignment::Top,
+            px(1000.),
+        );
+        assert_eq!(rows.indices, [0, 1, 1001, 1002, 1005]);
+        assert_eq!(list.item_count(), 5);
+        list.scroll_to(ListOffset {
+            item_ix: 4,
+            offset_in_item: px(7.),
+        });
+
+        // 先展开后面的组，再改变前面的组；原块身份和后方滚动锚点不能串位。
+        rows.toggle_group(3, 1002, 3, &list);
+        assert_eq!(rows.indices, [0, 1, 1001, 1002, 1003, 1004, 1005]);
+        assert_eq!(list.item_count(), 7);
+        rows.toggle_group(1, 1, 1000, &list);
+        assert_eq!(rows.indices, (0..blocks.len()).collect::<Vec<_>>());
+        assert_eq!(list.item_count(), blocks.len());
+        assert_eq!(list.logical_scroll_top().item_ix, 1005);
+
+        rows.toggle_group(1, 1, 1000, &list);
+        assert_eq!(rows.indices, [0, 1, 1001, 1002, 1003, 1004, 1005]);
+        assert_eq!(list.item_count(), 7);
+        assert!(rows.expanded_groups.contains(&1002));
+        rows.toggle_group(3, 1002, 3, &list);
+        assert_eq!(rows.indices, [0, 1, 1001, 1002, 1005]);
+        assert_eq!(list.item_count(), 5);
+        assert_eq!(list.logical_scroll_top().item_ix, 4);
+        assert_eq!(list.logical_scroll_top().offset_in_item, px(7.));
+        assert!(rows.expanded_groups.is_empty());
     }
 }
