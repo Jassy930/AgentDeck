@@ -441,7 +441,7 @@ fn session_row(
                     div()
                         .absolute()
                         .inset_0()
-                        .opacity(0.)
+                        .opacity(if keyboard_cursor { 1. } else { 0. })
                         .group_hover("session-row", |style| style.opacity(1.))
                         .child(agent_icon(item.agent_kind, false)),
                 ),

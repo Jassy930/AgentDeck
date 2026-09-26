@@ -35,8 +35,9 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
   快速切换时最多执行一个历史读取，只保留最新待查会话；记录文本在后台读取完成时
   转换一次，滚动时复用。会话记录（变高 `list`）和侧栏会话列表（等高
   `uniform_list`）都只渲染可见区域附近的条目，长会话滚动不再逐帧排版全部内容。
-  侧栏每条会话带 16px 来源像素图标，默认灰色，悬停会话行时恢复彩色：Codex 为蓝色宠物
-  [Codey](https://learn.chatgpt.com/docs/pets) 的简化版，Claude Code 为暖橙色小螃蟹；移出后恢复灰色，选中态也遵循此规则。
+  侧栏每条会话带 16px 来源像素图标，默认灰色，鼠标悬停或键盘光标所在行显示彩色。
+  Codex 为蓝色宠物 [Codey](https://learn.chatgpt.com/docs/pets) 的简化版，
+  Claude Code 为暖橙色小螃蟹。
   悬停显示信息卡：标题最多三行，底部显示文件夹名和弱化的完整路径。
   列表中的长标题以省略号显示；Tab 聚焦会话列表后，用上下键移动并自动滚动到目标条目，
   Return 打开会话，Tab / Shift-Tab 离开列表。
