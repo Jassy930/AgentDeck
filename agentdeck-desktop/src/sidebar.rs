@@ -67,7 +67,7 @@ const CLAUDE_PIXELS: [&[u8; 16]; 16] = [
     b"................",
 ];
 
-pub fn agent_icon(kind: AgentKind) -> impl IntoElement + use<> {
+pub fn agent_icon(kind: AgentKind, grayscale: bool) -> impl IntoElement + use<> {
     let pixels = match kind {
         AgentKind::Codex => &CODEX_PIXELS,
         AgentKind::ClaudeCode => &CLAUDE_PIXELS,
@@ -84,12 +84,13 @@ pub fn agent_icon(kind: AgentKind) -> impl IntoElement + use<> {
                         b'c' => rgb(0xc87555),
                         _ => continue,
                     };
+                    let color = Hsla::from(color);
                     window.paint_quad(fill(
                         Bounds::new(
                             bounds.origin + point(px(x as f32), px(y as f32)),
                             size(px(1.), px(1.)),
                         ),
-                        Hsla::from(color),
+                        if grayscale { color.grayscale() } else { color },
                     ));
                 }
             }
@@ -328,7 +329,7 @@ fn agent_row(
         .cursor_pointer()
         .when(filtered, |row| row.bg(cx.theme().accent))
         .hover(|style| style.bg(cx.theme().accent))
-        .child(agent_icon(kind))
+        .child(agent_icon(kind, false))
         .child(div().flex_1().child(agent_label(kind)))
         .when(!agent.warnings.is_empty(), |row| {
             row.child(div().text_color(crate::theme_tokens::WARN).child("⚠"))
@@ -415,6 +416,7 @@ fn session_row(
     let title_width = px(WIDTH - 3. - AGENT_ICON_SIZE - TIME_WIDTH) - window.rem_size() * 4.5;
 
     let mut button = Button::new(id)
+        .group("session-row")
         .ghost()
         .selected(selected)
         .tab_stop(false)
@@ -423,7 +425,21 @@ fn session_row(
         })
         .w_full()
         .justify_start()
-        .child(agent_icon(item.agent_kind))
+        .child(
+            div()
+                .relative()
+                .size(px(AGENT_ICON_SIZE))
+                .flex_shrink_0()
+                .child(agent_icon(item.agent_kind, true))
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .opacity(if keyboard_cursor { 1. } else { 0. })
+                        .group_hover("session-row", |style| style.opacity(1.))
+                        .child(agent_icon(item.agent_kind, false)),
+                ),
+        )
         .child(
             div()
                 .w(title_width)

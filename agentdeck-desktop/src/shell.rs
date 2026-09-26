@@ -265,9 +265,17 @@ impl AgentHistory {
     }
 }
 
-fn empty_hint(agents: &[AgentHistory], pending: usize, error: Option<&str>) -> String {
+fn empty_hint(
+    agents: &[AgentHistory],
+    pending: usize,
+    error: Option<&str>,
+    filtered_empty: bool,
+) -> String {
     if let Some(error) = error {
         return error.to_string();
+    }
+    if filtered_empty {
+        return "没有匹配的会话".to_string();
     }
     if agents.is_empty() {
         return if pending > 0 {
@@ -316,20 +324,24 @@ pub(crate) enum SidebarRow {
     Session { index: usize, time: SharedString },
 }
 
-/// 毫秒时间戳的本地日序号、月、日、时、分。偏移取该时刻自己的，夏令时切换当天不会错位。
+/// 毫秒时间戳的本地日序号、月、日、时、分。零表示 adapter 没有可显示的时间。
+/// 偏移取该时刻自己的，夏令时切换当天不会错位。
 #[cfg(unix)]
-fn local_time(ms: u64) -> (i64, i32, i32, i32, i32) {
+fn local_time(ms: u64) -> Option<(i64, i32, i32, i32, i32)> {
+    if ms == 0 {
+        return None;
+    }
     let secs = (ms / 1000) as libc::time_t;
     // SAFETY: localtime_r 只写入传入的 tm。
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     unsafe { libc::localtime_r(&secs, &mut tm) };
-    (
+    Some((
         (secs as i64 + tm.tm_gmtoff as i64).div_euclid(86_400),
         tm.tm_mon + 1,
         tm.tm_mday,
         tm.tm_hour,
         tm.tm_min,
-    )
+    ))
 }
 
 /// 相对今天的分组；未来时间（时钟偏差）归入今天。
@@ -352,22 +364,28 @@ fn session_matches(item: &HistoryListItem, query: &str, agent: Option<AgentKind>
 
 /// 已过滤的会话（按最近活动倒序，带本地时间）插入分组标题。
 fn sidebar_rows(
-    visible: impl IntoIterator<Item = (usize, (i64, i32, i32, i32, i32))>,
+    visible: impl IntoIterator<Item = (usize, Option<(i64, i32, i32, i32, i32)>)>,
     today: i64,
 ) -> Vec<SidebarRow> {
     let mut rows = Vec::new();
     let mut current = None;
-    for (index, (day, month, mday, hour, minute)) in visible {
-        let group = day_group(day, today);
+    for (index, time) in visible {
+        let group = time
+            .map(|(day, ..)| day_group(day, today))
+            .unwrap_or("更早");
         if current != Some(group) {
             current = Some(group);
             rows.push(SidebarRow::Header(group));
         }
-        let time = if today - day <= 1 {
-            format!("{hour:02}:{minute:02}")
-        } else {
-            format!("{month}/{mday}")
-        };
+        let time = time
+            .map(|(day, month, mday, hour, minute)| {
+                if today - day <= 1 {
+                    format!("{hour:02}:{minute:02}")
+                } else {
+                    format!("{month}/{mday}")
+                }
+            })
+            .unwrap_or_default();
         rows.push(SidebarRow::Session {
             index,
             time: time.into(),
@@ -593,8 +611,20 @@ impl Shell {
                 .enumerate()
                 .filter(|(_, item)| session_matches(item, &query, self.agent_filter))
                 .map(|(index, item)| (index, local_time(item.last_active_ms))),
-            local_time(now).0,
+            local_time(now).map_or(0, |time| time.0),
         );
+        let cursor = self.sidebar_cursor.clone();
+        if cursor.is_some_and(|cursor| {
+            !self.rows.iter().any(|row| {
+                let SidebarRow::Session { index, .. } = row else {
+                    return false;
+                };
+                let item = &self.sessions[*index];
+                item.agent_kind == cursor.0 && item.thread_id == cursor.1
+            })
+        }) {
+            self.sidebar_cursor = None;
+        }
     }
 
     /// 可见会话的行号与条目，键盘导航只在这些行之间移动。
@@ -718,7 +748,12 @@ impl Shell {
             })
             .collect();
 
-        let hint = empty_hint(&self.agents, self.pending, self.error.as_deref());
+        let hint = empty_hint(
+            &self.agents,
+            self.pending,
+            self.error.as_deref(),
+            !self.sessions.is_empty() && self.rows.is_empty(),
+        );
 
         v_flex()
             .flex_1()
@@ -798,7 +833,7 @@ impl Shell {
         v_flex()
             .flex_1()
             .h_full()
-            // 裁剪在这一层：长会话记录不能顶穿底部 composer。
+            // 裁剪在这一层：长会话记录不能顶穿底部只读提示。
             .overflow_hidden()
             .child(
                 // thread header：左标题，右上环境信息。高度同时吃掉红绿灯占位。
@@ -951,7 +986,7 @@ fn connector_card(
             h_flex()
                 .gap_2()
                 .items_center()
-                .child(sidebar::agent_icon(kind))
+                .child(sidebar::agent_icon(kind, false))
                 .child(div().text_sm().font_semibold().child(agent_label(kind))),
         )
         .child(
@@ -1091,11 +1126,11 @@ mod tests {
         let today = 20_000;
         let rows = sidebar_rows(
             [
-                (0, (today, 9, 26, 14, 5)),
-                (2, (today - 1, 9, 25, 9, 0)),
-                (3, (today - 3, 9, 23, 8, 0)),
-                (5, (today - 4, 9, 22, 8, 0)),
-                (7, (today - 30, 8, 27, 8, 0)),
+                (0, Some((today, 9, 26, 14, 5))),
+                (2, Some((today - 1, 9, 25, 9, 0))),
+                (3, Some((today - 3, 9, 23, 8, 0))),
+                (5, Some((today - 4, 9, 22, 8, 0))),
+                (7, Some((today - 30, 8, 27, 8, 0))),
             ],
             today,
         );
@@ -1123,6 +1158,15 @@ mod tests {
         assert_eq!(day_group(today + 1, today), "今天");
         assert_eq!(day_group(today - 6, today), "近 7 天");
         assert_eq!(day_group(today - 7, today), "更早");
+    }
+
+    #[test]
+    fn sidebar_rows_do_not_render_epoch_for_unknown_time() {
+        let rows = sidebar_rows([(0, None)], 20_000);
+        assert!(matches!(
+            rows.as_slice(),
+            [SidebarRow::Header("更早"), SidebarRow::Session { time, .. }] if time.is_empty()
+        ));
     }
 
     #[test]
@@ -1350,13 +1394,14 @@ mod tests {
             AgentHistory::new(AgentKind::ClaudeCode),
         ];
         agents[0].complete(&mut Err("历史读取超时".into()));
-        assert_eq!(empty_hint(&agents, 1, None), "正在读取会话…");
+        assert_eq!(empty_hint(&agents, 1, None, false), "正在读取会话…");
 
         agents[1].complete(&mut Ok((vec![], vec![])));
-        assert_eq!(empty_hint(&agents, 0, None), "没有可显示的会话");
+        assert_eq!(empty_hint(&agents, 0, None, false), "没有可显示的会话");
 
         agents[1].complete(&mut Ok((vec![item(None)], vec![])));
-        assert_eq!(empty_hint(&agents, 0, None), "选择左侧会话查看记录");
+        assert_eq!(empty_hint(&agents, 0, None, false), "选择左侧会话查看记录");
+        assert_eq!(empty_hint(&agents, 0, None, true), "没有匹配的会话");
     }
 
     #[test]
