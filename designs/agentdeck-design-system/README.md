@@ -1,7 +1,9 @@
 # AgentDeck 设计系统
 
 > 2026-08-17：macOS AppKit 客户端及其 Swift 生成链已经删除。GPUI P0 只使用
-> gpui-component，尚未消费本设计系统；token、Web 预览和 iOS 生成物继续保留。
+> gpui-component；token、Web 预览和 iOS 生成物继续保留。
+> 2026-09-26：GPUI 桌面端在 `agentdeck-desktop/src/theme.rs` 手写映射 codex 主题
+> （锁定深色，warning 改用琥珀 `#f5b544` 以区分品牌橙），改 token 时需同步该文件。
 
 面向 Coding Agent 工作台的**跨桌面/手机端**可视化设计系统展示页。以 Codex Desktop 视觉范式为主基调，并额外提供三种可一键切换的设计语言。
 

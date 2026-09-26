@@ -2,6 +2,7 @@ mod composer;
 mod daemon;
 mod shell;
 mod sidebar;
+mod theme;
 mod transcript;
 
 use std::env;
@@ -48,6 +49,7 @@ fn main() {
 
     Application::new().run(move |cx| {
         gpui_component::init(cx);
+        theme::apply(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.set_menus(vec![Menu {

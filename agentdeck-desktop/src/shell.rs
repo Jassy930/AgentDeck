@@ -790,14 +790,14 @@ fn connector_card(name: &str, status: &str, cx: &App) -> impl IntoElement + use<
         .gap_1()
         .p_4()
         .rounded_lg()
-        .bg(cx.theme().secondary)
+        .bg(cx.theme().muted)
         .border_1()
         .border_color(cx.theme().border)
         .child(div().text_sm().font_semibold().child(name.to_string()))
         .child(
             div()
                 .text_sm()
-                .text_color(cx.theme().secondary_foreground)
+                .text_color(cx.theme().muted_foreground)
                 .child(status.to_string()),
         )
 }

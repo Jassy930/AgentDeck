@@ -21,7 +21,7 @@ pub fn render(
         .gap_2()
         .p_3()
         .rounded_xl()
-        .bg(cx.theme().background)
+        .bg(cx.theme().muted)
         .border_1()
         .border_color(cx.theme().border)
         .shadow_lg()
