@@ -391,3 +391,38 @@ macOS 进程组存在性查询在组仅剩僵尸进程时可能返回 `EPERM`；
 - 验证：desktop 36 项测试、selfcheck、真实 bundle verify 通过；窗口截图确认分组行高、
   行尾时间、底部 agent 行右对齐，以及临时把初始过滤设为 Codex 时的列表与卡片选中态
   （截图后已还原）。悬停详情与会话态底部提示未单独截图。
+
+## 2026-09-27：滚动时的来源图标绘制开销
+
+- Goal：消除会话滚动重绘侧栏时的逐像素绘制。`sidebar.rs` 使用 GPUI 现有 `Image` /
+  `img` 缓存，四张灰色和彩色 PNG 编译期嵌入 `assets/agents/`，不增加依赖。
+  32px 资源显示为 16px；静止、悬停和键盘光标的颜色规则保持不变。README 同步说明。
+- 原实现每个 Codex / Claude 图标分别提交 154 / 106 个 quad，灰色和彩色叠层均参与
+  绘制。滚动采样中，`draw_roots` 的 paint 分支 2,235 个样本有 2,088 个落在图标路径。
+  原始采样：`/tmp/agentdeck-scroll-active-42669.txt`。
+- A/B 环境：Apple M5 Pro、64 GB、macOS 27.0 (26A428)、Rust 1.96.0，基线
+  `a3ba185`；双方均为默认未优化 dev 构建、1536×864 pt Retina 窗口、真实
+  “Review MR156 模块精简”会话。预热上下各一页后，交替上下滚动 12 次。
+  临时 bundle 仅改名称和 identifier 以避免 GUI 工具混淆，同版本 daemon 随包运行。
+
+  | 构建 | 帧样本 | CPU 帧耗时中位数 | P95 |
+  | --- | ---: | ---: | ---: |
+  | 修复前，默认 dev | 43 | 80.91 ms | 84.61 ms |
+  | 修复后，默认 dev | 49 | 24.78 ms | 28.30 ms |
+  | 修复后，dev opt-level=3 | 44 | 4.73 ms | 6.90 ms |
+
+- 测量入口为 `open -n <bundle> --env ZED_MEASUREMENTS=1 --stderr <log>`。
+  仅截取滚动区间，原始日志在 `/tmp/agentdeck-{before,after,optimized}-scroll-frames.log`，统计在
+  `/tmp/agentdeck-scroll-ab.json`。GPUI 的 `frame duration` 包含 CPU 绘制、present 提交和
+  arena 清理，不是 GPU 完成耗时；低频自动滚轮不能证明持续 60 FPS。
+  右上角 FPS 统计的是 Shell render 调用频率，静止时的低数值也不代表渲染能力。
+- 最终启动的 bundle 使用 `CARGO_PROFILE_DEV_OPT_LEVEL=3 ./script/build_and_run.sh --verify`
+  构建，优化版 bundle selfcheck 与 verify 均通过。该环境变量保留 debug assertions，
+  仅用于此次本地构建；仓库的默认 dev profile 未改变，复现时需带同一变量。
+- 验证：`cargo fmt --check -p agentdeck-desktop`、
+  `env -u AGENTDECK_E2E cargo test --locked -p agentdeck-desktop`（39 项）、
+  `cargo run --locked -p agentdeck-desktop -- --selfcheck`、
+  `bash -n script/build_and_run.sh`、`./script/build_and_run.sh --verify`、
+  `swift test`、`scripts/verify-agent-docs.sh` 通过。四张 PNG 逐像素对照旧矩阵一致；
+  实窗确认正文实际滚动、静止图标灰色、悬停及键盘光标图标彩色。
+  本轮只验证历史 UI，未运行真实 vendor lifecycle E2E。

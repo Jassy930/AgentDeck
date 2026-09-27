@@ -7,8 +7,8 @@ use std::sync::{Arc, LazyLock};
 
 use agentdeck_protocol::{AgentKind, HistoryListItem};
 use gpui::{
-    App, Bounds, Context, FontWeight, Hsla, Image, ImageFormat, IntoElement, ParentElement, Pixels,
-    SharedString, Window, canvas, div, fill, img, point, prelude::*, px, rgb, size, uniform_list,
+    App, Context, FontWeight, Image, ImageFormat, IntoElement, ParentElement, Pixels, SharedString,
+    Window, div, img, prelude::*, px, uniform_list,
 };
 use gpui_component::{
     ActiveTheme, InteractiveElementExt, Selectable, Sizable, StyledExt,
@@ -29,75 +29,31 @@ const ROW_HEIGHT: f32 = 36.;
 /// 会话行尾时间列宽度，容纳 "12/31" 或 "23:59"。
 const TIME_WIDTH: f32 = 36.;
 
-const CODEX_PIXELS: [&[u8; 16]; 16] = [
-    b".....bbb........",
-    b"...bbbbbbbb.....",
-    b"..bbbbbbbbbbb...",
-    b".bbbbbbbbbbbbb..",
-    b".bbbddddddddbb..",
-    b".bbbdfddddddbb..",
-    b".bbbddfdddddbb..",
-    b".bbbdfddfffdbb..",
-    b"..bbddddddddbb..",
-    b"...bbbbbbbbbb...",
-    b"....bbbbbbb.....",
-    b"...bbbbbbbbb....",
-    b"..bbbfbbffbbb...",
-    b"..bb.bbbbbb.bb..",
-    b".....bb.bb......",
-    b".....bb.bb......",
-];
-
-const CLAUDE_PIXELS: [&[u8; 16]; 16] = [
-    b"................",
-    b"................",
-    b"................",
-    b"...cccccccccc...",
-    b"...cccccccccc...",
-    b"...cccccccccc...",
-    b".cccc.cccc.cccc.",
-    b".cccc.cccc.cccc.",
-    b".cccccccccccccc.",
-    b"...cccccccccc...",
-    b"...cccccccccc...",
-    b"...cc.c..c.cc...",
-    b"...cc.c..c.cc...",
-    b"...cc.c..c.cc...",
-    b"................",
-    b"................",
-];
+// 2x PNG 保留 Retina 下的像素边界；单独灰图保持 HSL 去饱和后的亮度。
+static AGENT_ICONS: LazyLock<[[Arc<Image>; 2]; 2]> = LazyLock::new(|| {
+    let sources: [[&[u8]; 2]; 2] = [
+        [
+            include_bytes!("../../assets/agents/codex.png"),
+            include_bytes!("../../assets/agents/codex-gray.png"),
+        ],
+        [
+            include_bytes!("../../assets/agents/claude.png"),
+            include_bytes!("../../assets/agents/claude-gray.png"),
+        ],
+    ];
+    sources.map(|variants| {
+        variants.map(|bytes| Arc::new(Image::from_bytes(ImageFormat::Png, bytes.to_vec())))
+    })
+});
 
 pub fn agent_icon(kind: AgentKind, grayscale: bool) -> impl IntoElement + use<> {
-    let pixels = match kind {
-        AgentKind::Codex => &CODEX_PIXELS,
-        AgentKind::ClaudeCode => &CLAUDE_PIXELS,
+    let index = match kind {
+        AgentKind::Codex => 0,
+        AgentKind::ClaudeCode => 1,
     };
-    canvas(
-        |_, _, _| (),
-        move |bounds, _, window, _| {
-            for (y, row) in pixels.iter().enumerate() {
-                for (x, pixel) in row.iter().enumerate() {
-                    let color = match pixel {
-                        b'b' => rgb(0x7495ff),
-                        b'd' => rgb(0x25386f),
-                        b'f' => rgb(0xa7f3f0),
-                        b'c' => rgb(0xc87555),
-                        _ => continue,
-                    };
-                    let color = Hsla::from(color);
-                    window.paint_quad(fill(
-                        Bounds::new(
-                            bounds.origin + point(px(x as f32), px(y as f32)),
-                            size(px(1.), px(1.)),
-                        ),
-                        if grayscale { color.grayscale() } else { color },
-                    ));
-                }
-            }
-        },
-    )
-    .size(px(AGENT_ICON_SIZE))
-    .flex_shrink_0()
+    img(AGENT_ICONS[index][usize::from(grayscale)].clone())
+        .size(px(AGENT_ICON_SIZE))
+        .flex_shrink_0()
 }
 
 static BRAND_ICON: LazyLock<Arc<Image>> = LazyLock::new(|| {
