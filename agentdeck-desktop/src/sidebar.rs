@@ -325,6 +325,12 @@ fn agent_row(
         .gap_2()
         .items_center()
         .rounded_md()
+        .border_1()
+        .border_color(if filtered {
+            cx.theme().ring
+        } else {
+            gpui::transparent_black()
+        })
         .text_sm()
         .cursor_pointer()
         .when(filtered, |row| row.bg(cx.theme().accent))
@@ -412,8 +418,9 @@ fn session_row(
     let title: SharedString = session_title(item).into();
     let folder: SharedString = project_name(item).into();
     let path: SharedString = item.cwd.display().to_string().into();
+    let time_width = if time.len() > 5 { 72. } else { TIME_WIDTH };
     // Button 的内部 label 容器不会收缩，扣除 padding、边框、图标、时间列与两个 gap_2。
-    let title_width = px(WIDTH - 3. - AGENT_ICON_SIZE - TIME_WIDTH) - window.rem_size() * 4.5;
+    let title_width = px(WIDTH - 3. - AGENT_ICON_SIZE - time_width) - window.rem_size() * 4.5;
 
     let mut button = Button::new(id)
         .group("session-row")
@@ -451,7 +458,7 @@ fn session_row(
         )
         .child(
             div()
-                .w(px(TIME_WIDTH))
+                .w(px(time_width))
                 .flex_shrink_0()
                 .text_right()
                 .text_xs()
