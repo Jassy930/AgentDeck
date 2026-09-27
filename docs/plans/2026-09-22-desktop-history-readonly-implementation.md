@@ -397,32 +397,24 @@ macOS 进程组存在性查询在组仅剩僵尸进程时可能返回 `EPERM`；
 - Goal：消除会话滚动重绘侧栏时的逐像素绘制。`sidebar.rs` 使用 GPUI 现有 `Image` /
   `img` 缓存，四张灰色和彩色 PNG 编译期嵌入 `assets/agents/`，不增加依赖。
   32px 资源显示为 16px；静止、悬停和键盘光标的颜色规则保持不变。README 同步说明。
-- 原实现每个 Codex / Claude 图标分别提交 154 / 106 个 quad，灰色和彩色叠层均参与
-  绘制。滚动采样中，`draw_roots` 的 paint 分支 2,235 个样本有 2,088 个落在图标路径。
-  原始采样：`/tmp/agentdeck-scroll-active-42669.txt`。
-- A/B 环境：Apple M5 Pro、64 GB、macOS 27.0 (26A428)、Rust 1.96.0，基线
-  `a3ba185`；双方均为默认未优化 dev 构建、1536×864 pt Retina 窗口、真实
-  “Review MR156 模块精简”会话。预热上下各一页后，交替上下滚动 12 次。
-  临时 bundle 仅改名称和 identifier 以避免 GUI 工具混淆，同版本 daemon 随包运行。
+- A/B 环境：Apple M5 Pro、macOS 27.0、Rust 1.96.0，基线 `a3ba185`；双方均为
+  默认未优化 dev 构建、1536×864 pt Retina 窗口、同一真实只读历史会话。
+  用 `open -n <bundle> --env ZED_MEASUREMENTS=1 --stderr <log>` 记录帧耗时；
+  预热上下各一页后，交替上下滚动 12 次，仅统计滚动区间。
 
   | 构建 | 帧样本 | CPU 帧耗时中位数 | P95 |
   | --- | ---: | ---: | ---: |
   | 修复前，默认 dev | 43 | 80.91 ms | 84.61 ms |
   | 修复后，默认 dev | 49 | 24.78 ms | 28.30 ms |
-  | 修复后，dev opt-level=3 | 44 | 4.73 ms | 6.90 ms |
 
-- 测量入口为 `open -n <bundle> --env ZED_MEASUREMENTS=1 --stderr <log>`。
-  仅截取滚动区间，原始日志在 `/tmp/agentdeck-{before,after,optimized}-scroll-frames.log`，统计在
-  `/tmp/agentdeck-scroll-ab.json`。GPUI 的 `frame duration` 包含 CPU 绘制、present 提交和
-  arena 清理，不是 GPU 完成耗时；低频自动滚轮不能证明持续 60 FPS。
-  右上角 FPS 统计的是 Shell render 调用频率，静止时的低数值也不代表渲染能力。
-- 最终启动的 bundle 使用 `CARGO_PROFILE_DEV_OPT_LEVEL=3 ./script/build_and_run.sh --verify`
-  构建，优化版 bundle selfcheck 与 verify 均通过。该环境变量保留 debug assertions，
-  仅用于此次本地构建；仓库的默认 dev profile 未改变，复现时需带同一变量。
+- GPUI 的 `frame duration` 包含 CPU 绘制、present 提交和 arena 清理，不是 GPU
+  完成耗时；低频自动滚轮不能证明持续 60 FPS。此对照只支持默认 dev 构建的收益结论。
+  右上角 FPS 统计 Shell render 调用频率，静止时的低数值不代表渲染能力。
 - 验证：`cargo fmt --check -p agentdeck-desktop`、
   `env -u AGENTDECK_E2E cargo test --locked -p agentdeck-desktop`（39 项）、
   `cargo run --locked -p agentdeck-desktop -- --selfcheck`、
   `bash -n script/build_and_run.sh`、`./script/build_and_run.sh --verify`、
-  `swift test`、`scripts/verify-agent-docs.sh` 通过。四张 PNG 逐像素对照旧矩阵一致；
+  `swift test`、`scripts/verify-agent-docs.sh` 通过。PNG 的像素网格、彩色与透明区域和旧矩阵
+  一致，灰色保留原 HSL 去饱和亮度，只有 8 位量化误差；
   实窗确认正文实际滚动、静止图标灰色、悬停及键盘光标图标彩色。
   本轮只验证历史 UI，未运行真实 vendor lifecycle E2E。
