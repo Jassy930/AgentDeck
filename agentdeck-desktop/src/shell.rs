@@ -324,10 +324,10 @@ pub(crate) enum SidebarRow {
     Session { index: usize, time: SharedString },
 }
 
-/// 毫秒时间戳的本地日序号、月、日、时、分。零表示 adapter 没有可显示的时间。
+/// 毫秒时间戳的本地日序号、年、月、日、时、分。零表示 adapter 没有可显示的时间。
 /// 偏移取该时刻自己的，夏令时切换当天不会错位。
 #[cfg(unix)]
-fn local_time(ms: u64) -> Option<(i64, i32, i32, i32, i32)> {
+fn local_time(ms: u64) -> Option<(i64, i32, i32, i32, i32, i32)> {
     if ms == 0 {
         return None;
     }
@@ -337,6 +337,7 @@ fn local_time(ms: u64) -> Option<(i64, i32, i32, i32, i32)> {
     unsafe { libc::localtime_r(&secs, &mut tm) };
     Some((
         (secs as i64 + tm.tm_gmtoff as i64).div_euclid(86_400),
+        tm.tm_year + 1900,
         tm.tm_mon + 1,
         tm.tm_mday,
         tm.tm_hour,
@@ -364,8 +365,9 @@ fn session_matches(item: &HistoryListItem, query: &str, agent: Option<AgentKind>
 
 /// 已过滤的会话（按最近活动倒序，带本地时间）插入分组标题。
 fn sidebar_rows(
-    visible: impl IntoIterator<Item = (usize, Option<(i64, i32, i32, i32, i32)>)>,
+    visible: impl IntoIterator<Item = (usize, Option<(i64, i32, i32, i32, i32, i32)>)>,
     today: i64,
+    current_year: i32,
 ) -> Vec<SidebarRow> {
     let mut rows = Vec::new();
     let mut current = None;
@@ -378,9 +380,11 @@ fn sidebar_rows(
             rows.push(SidebarRow::Header(group));
         }
         let time = time
-            .map(|(day, month, mday, hour, minute)| {
+            .map(|(day, year, month, mday, hour, minute)| {
                 if today - day <= 1 {
                     format!("{hour:02}:{minute:02}")
+                } else if year != current_year {
+                    format!("{year}/{month}/{mday}")
                 } else {
                     format!("{month}/{mday}")
                 }
@@ -392,6 +396,11 @@ fn sidebar_rows(
         });
     }
     rows
+}
+
+fn scroll_sidebar_to(rows: &[SidebarRow], scroll: &UniformListScrollHandle, row: usize) {
+    let offset = usize::from(row > 0 && matches!(rows[row - 1], SidebarRow::Header(_)));
+    scroll.scroll_to_item_with_offset(row, ScrollStrategy::Top, offset);
 }
 
 fn sidebar_target(
@@ -571,7 +580,7 @@ impl Shell {
         }
     }
 
-    /// 列表末尾还能加载更多的来源；有 agent 过滤时只算该来源。
+    /// 还能加载更多的来源；有 agent 过滤时只算该来源。
     pub fn load_more_kinds(&self) -> Vec<AgentKind> {
         self.agents
             .iter()
@@ -605,13 +614,15 @@ impl Shell {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_millis() as u64);
+        let (today, current_year, ..) = local_time(now).unwrap_or_default();
         self.rows = sidebar_rows(
             self.sessions
                 .iter()
                 .enumerate()
                 .filter(|(_, item)| session_matches(item, &query, self.agent_filter))
                 .map(|(index, item)| (index, local_time(item.last_active_ms))),
-            local_time(now).map_or(0, |time| time.0),
+            today,
+            current_year,
         );
         let cursor = self.sidebar_cursor.clone();
         if cursor.is_some_and(|cursor| {
@@ -667,7 +678,7 @@ impl Shell {
         });
         if let Some((row, kind, thread_id)) = target {
             self.sidebar_cursor = Some((kind, thread_id));
-            self.sidebar_scroll.scroll_to_item(row, ScrollStrategy::Top);
+            scroll_sidebar_to(&self.rows, &self.sidebar_scroll, row);
             cx.notify();
         }
     }
@@ -677,7 +688,7 @@ impl Shell {
             return;
         };
         if let SidebarRow::Session { index, .. } = self.rows[row] {
-            self.sidebar_scroll.scroll_to_item(row, ScrollStrategy::Top);
+            scroll_sidebar_to(&self.rows, &self.sidebar_scroll, row);
             self.open_session(self.sessions[index].clone(), cx);
         }
     }
@@ -1051,10 +1062,11 @@ mod tests {
     use super::sidebar_target;
     use super::{
         AgentHistory, FrameStats, ReadQueue, ReadRequest, SidebarRow, Stage, Transcript,
-        agent_label, day_group, empty_hint, project_name, session_matches, session_title,
-        sidebar_rows, transcript_list,
+        agent_label, day_group, empty_hint, local_time, project_name, scroll_sidebar_to,
+        session_matches, session_title, sidebar_rows, transcript_list,
     };
     use agentdeck_protocol::{AgentKind, HistoryListItem, HistoryWarning, ThreadId};
+    use gpui::{ScrollStrategy, UniformListScrollHandle};
 
     fn warning() -> HistoryWarning {
         HistoryWarning {
@@ -1126,13 +1138,14 @@ mod tests {
         let today = 20_000;
         let rows = sidebar_rows(
             [
-                (0, Some((today, 9, 26, 14, 5))),
-                (2, Some((today - 1, 9, 25, 9, 0))),
-                (3, Some((today - 3, 9, 23, 8, 0))),
-                (5, Some((today - 4, 9, 22, 8, 0))),
-                (7, Some((today - 30, 8, 27, 8, 0))),
+                (0, Some((today, 2026, 9, 26, 14, 5))),
+                (2, Some((today - 1, 2026, 9, 25, 9, 0))),
+                (3, Some((today - 3, 2026, 9, 23, 8, 0))),
+                (5, Some((today - 4, 2026, 9, 22, 8, 0))),
+                (7, Some((today - 30, 2026, 8, 27, 8, 0))),
             ],
             today,
+            2026,
         );
         let flat: Vec<_> = rows
             .iter()
@@ -1162,11 +1175,56 @@ mod tests {
 
     #[test]
     fn sidebar_rows_do_not_render_epoch_for_unknown_time() {
-        let rows = sidebar_rows([(0, None)], 20_000);
+        assert_eq!(local_time(0), None);
+        let rows = sidebar_rows([(0, local_time(0))], 20_000, 2026);
         assert!(matches!(
             rows.as_slice(),
             [SidebarRow::Header("更早"), SidebarRow::Session { time, .. }] if time.is_empty()
         ));
+    }
+
+    #[test]
+    fn sidebar_rows_show_the_year_except_for_yesterday() {
+        let today = 20_000;
+        let rows = sidebar_rows(
+            [
+                (0, Some((today - 1, 2025, 12, 31, 23, 59))),
+                (1, Some((today - 2, 2025, 12, 30, 8, 0))),
+            ],
+            today,
+            2026,
+        );
+        let times: Vec<_> = rows
+            .iter()
+            .filter_map(|row| match row {
+                SidebarRow::Session { time, .. } => Some(time.as_ref()),
+                SidebarRow::Header(_) => None,
+            })
+            .collect();
+        assert_eq!(times, ["23:59", "2025/12/30"]);
+    }
+
+    #[test]
+    fn sidebar_scroll_keeps_the_group_header_above_its_first_session() {
+        let rows = [
+            SidebarRow::Header("今天"),
+            SidebarRow::Session {
+                index: 0,
+                time: "12:00".into(),
+            },
+            SidebarRow::Session {
+                index: 1,
+                time: "11:00".into(),
+            },
+        ];
+        let scroll = UniformListScrollHandle::default();
+        for (row, offset) in [(1, 1), (2, 0)] {
+            scroll_sidebar_to(&rows, &scroll, row);
+            let target = scroll.0.borrow().deferred_scroll_to_item.unwrap();
+            assert_eq!(target.item_index, row);
+            assert_eq!(target.strategy, ScrollStrategy::Top);
+            assert_eq!(target.offset, offset);
+        }
     }
 
     #[test]
