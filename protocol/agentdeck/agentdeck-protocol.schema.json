@@ -973,7 +973,7 @@
           "type": "string"
         },
         "lastActiveMs": {
-          "description": "epoch milliseconds; for sorting only",
+          "description": "epoch milliseconds supplied by the adapter as a recency key. Used for ordering and local date grouping; zero means the adapter has no value.",
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
@@ -1806,7 +1806,7 @@
               "type": "string"
             },
             "lastActiveMs": {
-              "description": "epoch milliseconds; for sorting only",
+              "description": "epoch milliseconds supplied by the adapter as a recency key. Used for ordering and local date grouping; zero means the adapter has no value.",
               "format": "uint64",
               "minimum": 0.0,
               "type": "integer"
@@ -2561,7 +2561,7 @@
               "type": "string"
             },
             "lastActiveMs": {
-              "description": "epoch milliseconds; for sorting only",
+              "description": "epoch milliseconds supplied by the adapter as a recency key. Used for ordering and local date grouping; zero means the adapter has no value.",
               "format": "uint64",
               "minimum": 0.0,
               "type": "integer"

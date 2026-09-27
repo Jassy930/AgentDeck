@@ -428,7 +428,8 @@ pub struct HistoryListItem {
     pub agent_kind: AgentKind,
     pub title: Option<String>,
     pub cwd: PathBuf,
-    /// epoch milliseconds; for sorting only
+    /// epoch milliseconds supplied by the adapter as a recency key. Used for
+    /// ordering and local date grouping; zero means the adapter has no value.
     pub last_active_ms: u64,
     pub archived: bool,
 }
