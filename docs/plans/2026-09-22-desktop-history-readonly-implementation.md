@@ -443,6 +443,7 @@ macOS 进程组存在性查询在组仅剩僵尸进程时可能返回 `EPERM`；
 - 机器页每台机器一张卡片，连接错误、兼容性警告、读取错误与列表提示全部内联展开，
   不再依赖悬停提示；agent 行点击仍切换来源过滤，重试放在可点击行之外。
 - 空态卡片仍按机器 × agent 展开，多机时数量随之增长，本轮未改。
-- 验证：`cargo fmt --check`、`cargo clippy`（仅有既有警告）、desktop 45 项测试通过；
+- 验证：`cargo fmt --check`、`cargo clippy`（仅有既有警告）、desktop 45 项测试（删除随侧栏计数一并移除的 `count_label` 用例）、
+  desktop selfcheck、`./script/build_and_run.sh --verify` 通过；
   实窗临时以机器页为初始状态并追加一台不可达主机截图，确认失败卡片、重试 / 断开、
   兼容性警告换行、侧栏失败摘要与输入框宽度正常，截图后已还原临时改动。
