@@ -11,7 +11,7 @@ use gpui::{
     Window, div, img, prelude::*, px, uniform_list,
 };
 use gpui_component::{
-    ActiveTheme, InteractiveElementExt, Selectable, Sizable, StyledExt,
+    ActiveTheme, Icon, InteractiveElementExt, Selectable, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
     input::Input,
@@ -151,12 +151,12 @@ pub fn render(
         .iter()
         .filter(|machine| machine.error.is_some())
         .count();
-    let machines_label = if shell.machines.iter().any(|machine| machine.connecting) {
-        "机器 · 连接中…".to_string()
+    let machines_tooltip = if shell.machines.iter().any(|machine| machine.connecting) {
+        "机器管理 · 连接中…".to_string()
     } else if failed > 0 {
-        format!("机器 · {failed} 台失败")
+        format!("机器管理 · {failed} 台失败")
     } else {
-        "机器".to_string()
+        "机器管理".to_string()
     };
     let can_load_more = !shell.load_more_targets().is_empty();
     let brand_hint = match shell.machines.len() {
@@ -246,7 +246,8 @@ pub fn render(
                 ),
         )
         .child(
-            v_flex()
+            // 底部页面入口：一排图标按钮，后续设置、信息页在此并列。
+            h_flex()
                 .flex_shrink_0()
                 .mx_3()
                 .gap_1()
@@ -256,10 +257,10 @@ pub fn render(
                 .child(
                     Button::new("show-machines")
                         .ghost()
+                        .small()
                         .selected(matches!(shell.stage, Stage::Machines))
-                        .w_full()
-                        .justify_start()
-                        .label(machines_label)
+                        .icon(Icon::empty().path(crate::SERVER_ICON))
+                        .tooltip(machines_tooltip)
                         .when(failed > 0, |button| button.text_color(cx.theme().danger))
                         .on_click(
                             cx.listener(|shell, _, window, cx| shell.show_machines(window, cx)),

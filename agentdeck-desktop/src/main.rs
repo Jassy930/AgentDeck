@@ -7,17 +7,37 @@ mod theme;
 mod theme_tokens;
 mod transcript;
 
+use std::borrow::Cow;
 use std::env;
 
 use gpui::{
-    App, Application, KeyBinding, Menu, MenuItem, TitlebarOptions, WindowOptions, actions, point,
-    prelude::*, px, size,
+    App, Application, AssetSource, KeyBinding, Menu, MenuItem, SharedString, TitlebarOptions,
+    WindowOptions, actions, point, prelude::*, px, size,
 };
 use gpui_component::Root;
 
 use shell::Shell;
 
 actions!(agentdeck, [Quit]);
+
+/// 编译期嵌入的 SVG 图标；gpui 按路径向 AssetSource 取，渲染时随文字颜色着色。
+struct Assets;
+
+pub const SERVER_ICON: &str = "icons/server.svg";
+
+impl AssetSource for Assets {
+    fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
+        Ok(
+            (path == SERVER_ICON).then_some(Cow::Borrowed(include_bytes!(
+                "../../assets/icons/server.svg"
+            ))),
+        )
+    }
+
+    fn list(&self, _path: &str) -> gpui::Result<Vec<SharedString>> {
+        Ok(vec![SERVER_ICON.into()])
+    }
+}
 
 const SELFCHECK_REPORT: &str = r#"{"status":"ok","surface":"desktop","ui":"gpui"}"#;
 
@@ -49,7 +69,7 @@ fn open_main_window(cx: &mut App, show: bool) {
 fn main() {
     let selfcheck = env::args_os().any(|arg| arg == "--selfcheck");
 
-    Application::new().run(move |cx| {
+    Application::new().with_assets(Assets).run(move |cx| {
         gpui_component::init(cx);
         theme::apply(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
