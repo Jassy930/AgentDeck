@@ -26,19 +26,33 @@ struct Assets;
 
 pub const SERVER_ICON: &str = "icons/server.svg";
 pub const PLUS_ICON: &str = "icons/plus.svg";
+pub const CHEVRON_RIGHT_ICON: &str = "icons/chevron-right.svg";
+pub const CHEVRON_DOWN_ICON: &str = "icons/chevron-down.svg";
+pub const ALERT_ICON: &str = "icons/triangle-alert.svg";
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
         let bytes: &'static [u8] = match path {
             SERVER_ICON => include_bytes!("../../assets/icons/server.svg"),
             PLUS_ICON => include_bytes!("../../assets/icons/plus.svg"),
+            CHEVRON_RIGHT_ICON => include_bytes!("../../assets/icons/chevron-right.svg"),
+            CHEVRON_DOWN_ICON => include_bytes!("../../assets/icons/chevron-down.svg"),
+            ALERT_ICON => include_bytes!("../../assets/icons/triangle-alert.svg"),
             _ => return Ok(None),
         };
         Ok(Some(Cow::Borrowed(bytes)))
     }
 
     fn list(&self, _path: &str) -> gpui::Result<Vec<SharedString>> {
-        Ok(vec![SERVER_ICON.into(), PLUS_ICON.into()])
+        Ok([
+            SERVER_ICON,
+            PLUS_ICON,
+            CHEVRON_RIGHT_ICON,
+            CHEVRON_DOWN_ICON,
+            ALERT_ICON,
+        ]
+        .map(SharedString::from)
+        .to_vec())
     }
 }
 

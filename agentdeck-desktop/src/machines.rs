@@ -64,7 +64,7 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement + use<
         )
 }
 
-/// 连接远端：ssh 目标输入框，回车或点"连接"；下方列出 ssh config 里可快速添加的主机。
+/// 连接远端：ssh 目标输入框，回车或点"连接"；下方可展开 ssh config 里可快速添加的主机。
 fn remote_form(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement + use<> {
     // ssh config 里尚未连接的主机，一键添加。
     let quick: Vec<_> = shell
@@ -122,15 +122,30 @@ fn remote_form(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement + use
                 ),
         )
         .when(!quick.is_empty(), |form| {
-            // flex_wrap 在此布局下只按一行算高度，会压到下方卡片；固定列数的 grid 高度可靠。
+            // 默认折叠成一行，展开后才占位置。
+            let open = shell.quick_add_open;
             form.child(
-                div()
-                    .pt_2()
+                h_flex()
+                    .id("quick-add-toggle")
+                    .pt_1()
+                    .gap_1()
+                    .items_center()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("从 ssh config 快速添加"),
+                    .cursor_pointer()
+                    .hover(|style| style.text_color(cx.theme().foreground))
+                    .on_click(cx.listener(|shell, _, _, cx| shell.toggle_quick_add(cx)))
+                    .child(Icon::empty().xsmall().path(if open {
+                        crate::CHEVRON_DOWN_ICON
+                    } else {
+                        crate::CHEVRON_RIGHT_ICON
+                    }))
+                    .child(format!("从 ssh config 快速添加（{} 台）", quick.len())),
             )
-            .child(div().grid().grid_cols(4).gap_2().children(quick))
+            // flex_wrap 在此布局下只按一行算高度，会压到下方卡片；固定列数的 grid 高度可靠。
+            .when(open, |form| {
+                form.child(div().pt_1().grid().grid_cols(4).gap_2().children(quick))
+            })
         })
         .when_some(shell.remote_error.clone(), |form, error| {
             form.child(
@@ -238,7 +253,8 @@ fn machine_card(
             let filtered =
                 filter.is_some_and(|(host, kind)| *host == machine.host && *kind == agent.kind);
             let hint = version_hint(agent, shell.latest_version(agent.kind), cx);
-            agent_row(machine, agent, filtered, hint, cx)
+            let armed = shell.update_armed == Some((machine.id, agent.kind));
+            agent_row(machine, agent, filtered, hint, armed, cx)
         })
         .collect();
 
@@ -304,6 +320,7 @@ fn agent_row(
     agent: &AgentHistory,
     filtered: bool,
     hint: Option<(String, gpui::Hsla)>,
+    armed: bool,
     cx: &mut Context<Shell>,
 ) -> impl IntoElement + use<> {
     let kind = agent.kind;
@@ -359,6 +376,9 @@ fn agent_row(
                         })
                         .when_some(hint, |line, (text, color)| {
                             line.child(div().text_xs().text_color(color).child(text))
+                        })
+                        .when(!agent.warnings.is_empty(), |line| {
+                            line.child(compat_badge(&key, agent))
                         }),
                 )
                 .child(
@@ -371,13 +391,6 @@ fn agent_row(
                             status
                         }),
                 )
-                .children(agent.warnings.iter().map(|warning| {
-                    div()
-                        .text_xs()
-                        .whitespace_normal()
-                        .text_color(crate::theme_tokens::WARN)
-                        .child(format!("兼容性警告：{}", warning.message))
-                }))
                 .when_some(agent.update_result.clone(), |details, result| {
                     let (text, color) = match result {
                         Ok(output) => (
@@ -414,13 +427,31 @@ fn agent_row(
             Button::new(SharedString::from(format!("update-{key}")))
                 .ghost()
                 .xsmall()
-                .label(if updating { "更新中…" } else { "更新" })
+                .label(if updating {
+                    "更新中…"
+                } else if armed {
+                    "✓"
+                } else {
+                    "更新"
+                })
                 .disabled(updating)
-                .tooltip(format!(
-                    "在该机器上运行 {} 自带的更新命令",
-                    agent_label(kind)
-                ))
-                .on_click(cx.listener(move |shell, _, _, cx| shell.update_agent(id, kind, cx))),
+                .when(armed, |button| button.text_color(cx.theme().success))
+                .tooltip(if armed {
+                    "再点一次确认更新".to_string()
+                } else {
+                    format!("在该机器上运行 {} 自带的更新命令", agent_label(kind))
+                })
+                .on_hover({
+                    let shell = cx.entity().downgrade();
+                    move |hovered, _, cx| {
+                        if !hovered {
+                            shell
+                                .update(cx, |shell, cx| shell.disarm_update(id, kind, cx))
+                                .ok();
+                        }
+                    }
+                })
+                .on_click(cx.listener(move |shell, _, _, cx| shell.click_update(id, kind, cx))),
         )
         .when(failed, |row| {
             row.child(
@@ -430,6 +461,31 @@ fn agent_row(
                     .label("重试")
                     .on_click(cx.listener(move |shell, _, _, cx| shell.retry_agent(id, kind, cx))),
             )
+        })
+}
+
+/// 兼容性警告收成「图标 + 兼容性」，完整内容放在悬停提示里。
+fn compat_badge(key: &str, agent: &AgentHistory) -> impl IntoElement + use<> {
+    let messages: Vec<String> = agent.warnings.iter().map(|w| w.message.clone()).collect();
+    h_flex()
+        .id(SharedString::from(format!("compat-{key}")))
+        .gap_1()
+        .items_center()
+        .text_xs()
+        .text_color(crate::theme_tokens::WARN)
+        .child(Icon::empty().xsmall().path(crate::ALERT_ICON))
+        .child("兼容性")
+        .tooltip(move |window, cx| {
+            let messages = messages.clone();
+            Tooltip::element(move |_, _| {
+                v_flex()
+                    .max_w(px(420.))
+                    .gap_1()
+                    .whitespace_normal()
+                    .child(div().font_semibold().child("兼容性警告"))
+                    .children(messages.iter().map(|message| div().child(message.clone())))
+            })
+            .build(window, cx)
         })
 }
 

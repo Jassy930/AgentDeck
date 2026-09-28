@@ -528,6 +528,10 @@ pub struct Shell {
     /// npm 上各 agent CLI 的最新版本，按返回顺序追加。
     latest: Vec<(AgentKind, Result<String, String>)>,
     latest_requested: bool,
+    /// ssh config 快速添加区默认折叠，免得占掉机器列表的位置。
+    pub(crate) quick_add_open: bool,
+    /// 已点过一次、等待确认的更新按钮；鼠标移开即取消。
+    pub(crate) update_armed: Option<(u64, AgentKind)>,
 }
 
 impl Shell {
@@ -579,6 +583,8 @@ impl Shell {
             ssh_hosts: Vec::new(),
             latest: Vec::new(),
             latest_requested: false,
+            quick_add_open: false,
+            update_armed: None,
         };
         if connect_daemon {
             shell.add_machine(None, cx);
@@ -739,6 +745,28 @@ impl Shell {
             .ok();
         })
         .detach();
+    }
+
+    pub fn toggle_quick_add(&mut self, cx: &mut Context<Self>) {
+        self.quick_add_open = !self.quick_add_open;
+        cx.notify();
+    }
+
+    /// 更新按钮两段式确认：第一次点击只进入待确认，再点一次才真正更新。
+    pub fn click_update(&mut self, id: u64, kind: AgentKind, cx: &mut Context<Self>) {
+        if self.update_armed.take() == Some((id, kind)) {
+            self.update_agent(id, kind, cx);
+        } else {
+            self.update_armed = Some((id, kind));
+        }
+        cx.notify();
+    }
+
+    pub fn disarm_update(&mut self, id: u64, kind: AgentKind, cx: &mut Context<Self>) {
+        if self.update_armed == Some((id, kind)) {
+            self.update_armed = None;
+            cx.notify();
+        }
     }
 
     /// 一键更新：跑 CLI 自带的更新命令，完成后重查版本。
