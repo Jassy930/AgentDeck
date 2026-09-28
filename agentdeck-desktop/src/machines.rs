@@ -68,13 +68,7 @@ fn remote_form(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement + use
         .child(
             h_flex()
                 .gap_2()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .overflow_hidden()
-                        .child(Input::new(&shell.remote_input).small()),
-                )
+                .child(Input::new(&shell.remote_input).small().flex_1())
                 .child(
                     Button::new("connect-remote")
                         .small()
