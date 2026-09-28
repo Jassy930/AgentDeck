@@ -29,7 +29,9 @@ AgentDeckMobileCore + ios/
 唯一允许的本机桌面通路是
 `agentdeck-desktop → typed local client → agentdeckd`。该通路已落地，但当前只覆盖
 只读历史（agent list / history list / history read）；session 生命周期、turn、streaming
-和审批仍未接入，selfcheck 也不走这条通路。
+和审批仍未接入，selfcheck 也不走这条通路。设置 `AGENTDECK_REMOTE_HOST` 时，typed
+local client 把子进程换成 `ssh <host> bash -lc 'exec agentdeckd'`，协议和依赖方向不变，
+daemon 仍不监听网络。
 
 Codex 本地 transport 已决定为 `agentdeckd` 直接持有 session-scoped
 `codex app-server --listen stdio://` 子进程；不依赖用户全局 managed daemon/proxy。

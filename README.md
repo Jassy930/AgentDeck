@@ -99,6 +99,28 @@ stdin/stdout。依赖方向固定为 `desktop → typed local client → agentde
 macOS 启动 daemon 前会在子进程恢复信号接收，避免继承 GPUI 后台线程屏蔽的
 `SIGCHLD`，导致已退出的版本探测进程仍被判为超时。
 
+### 连接局域网内的远端 daemon（SSH）
+
+设置 `AGENTDECK_REMOTE_HOST=<ssh 目标>` 后，桌面端改为执行
+`ssh <host> bash -lc 'exec agentdeckd'`，其余 JSONL 通路不变；鉴权与加密由 SSH 密钥负责，
+daemon 本身不监听网络。要求：
+
+- 本机能免密 `ssh <host>`（使用 `BatchMode=yes`，不会弹密码提示）；
+- 远端 login shell 的 PATH 中有 `agentdeckd`、`codex`、`claude`；
+- ssh 通过 `ControlMaster`（`~/.ssh/agentdeck-%C`，保持 60 秒）复用连接，热连接单次请求约 20ms。
+
+远端安装（以 Linux 工作站 `dt` 为例）：
+
+```bash
+rsync -az --exclude target --exclude .git ./ dt:AgentDeck/
+ssh dt 'cd ~/AgentDeck && ~/.cargo/bin/cargo build --release --locked -p agentdeckd \
+  && install -m755 target/release/agentdeckd ~/.local/bin/ \
+  && bash -lc "agentdeckd --selfcheck"'
+AGENTDECK_REMOTE_HOST=dt ./target/debug/agentdeck-desktop
+```
+
+Linux 上 daemon 的数据目录暂时沿用 `~/Library/Application Support/AgentDeck/`。
+
 ## 依赖版本
 
 桌面 P0 固定使用：

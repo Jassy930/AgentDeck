@@ -6,12 +6,17 @@
 //! 命令，历史请求仍按 K11 生成唯一 requestId 并严格匹配回复。会话流式接入需要
 //! 长连接时再单独引入。
 //!
+//! 设置 `AGENTDECK_REMOTE_HOST` 后改为经 `ssh <host>` 在远端 login shell 里启动
+//! `agentdeckd`：stdio 协议不变，鉴权与加密交给 SSH 密钥。
+//!
 //! 所有函数都是阻塞的，调用方必须放到 GPUI 的 background executor 上。
 
-use std::io::{self, BufRead, BufReader, Write};
+use std::ffi::OsStr;
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use agentdeck_protocol::{
@@ -21,6 +26,8 @@ use agentdeck_protocol::{
 
 /// 与 CLI 一致的显式覆盖入口：一旦设置就必须指向绝对路径的可执行文件，不回退。
 const DAEMON_BIN_ENV: &str = "AGENTDECK_DAEMON_BIN";
+/// 远端主机（ssh 目标，可为 `~/.ssh/config` 别名）；设置后优先于本地 daemon。
+const REMOTE_HOST_ENV: &str = "AGENTDECK_REMOTE_HOST";
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -114,9 +121,44 @@ impl Drop for DaemonChild {
     }
 }
 
-fn daemon_command(path: &Path) -> Command {
-    let mut command = Command::new(path);
-    command.stdin(Stdio::piped()).stdout(Stdio::piped());
+/// 远端走 login shell：非交互 ssh 的 PATH 通常不含 `codex` / `claude` / `agentdeckd`。
+/// ControlMaster 复用 TCP+认证，避免每次请求都完整握手。
+fn remote_args(host: &str) -> Vec<String> {
+    [
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        "ControlPath=~/.ssh/agentdeck-%C",
+        "-o",
+        "ControlPersist=60",
+        "--",
+        host,
+        "bash -lc 'exec agentdeckd'",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+fn build_command() -> Result<Command> {
+    match std::env::var(REMOTE_HOST_ENV) {
+        Ok(host) if !host.is_empty() => {
+            let mut command = daemon_command("ssh");
+            command.args(remote_args(&host));
+            Ok(command)
+        }
+        _ => Ok(daemon_command(locate_daemon()?)),
+    }
+}
+
+fn daemon_command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -176,8 +218,7 @@ fn reply_payload(
 /// ponytail: 依赖 daemon 有界的版本探测和历史查询；若需处理整个 daemon 无响应，
 /// 再增加客户端 deadline，当前阻塞读取仍会占用一个 background 线程。
 fn round_trip(command: &ClientCommand, expected_reply: &str) -> Result<serde_json::Value> {
-    let path = locate_daemon()?;
-    retry_transport(|| round_trip_once(&path, command, expected_reply))
+    retry_transport(|| round_trip_once(build_command, command, expected_reply))
 }
 
 fn retry_transport(
@@ -206,7 +247,7 @@ fn retry_transport(
 
 // 外层保留可重试的传输错误；内层的 daemon 回复和解析错误必须直接交给用户。
 fn round_trip_once(
-    path: &Path,
+    build: impl Fn() -> Result<Command>,
     command: &ClientCommand,
     expected_reply: &str,
 ) -> io::Result<Result<serde_json::Value>> {
@@ -224,10 +265,15 @@ fn round_trip_once(
         Ok(line) => line,
         Err(source) => return Ok(Err(format!("序列化命令失败：{source}"))),
     };
-    let child = daemon_command(path).spawn().map_err(|source| {
+    let mut process = match build() {
+        Ok(process) => process,
+        Err(message) => return Ok(Err(message)),
+    };
+    let child = process.spawn().map_err(|source| {
         io::Error::new(source.kind(), format!("启动 agentdeckd 失败：{source}"))
     })?;
     let mut child = DaemonChild(child);
+    let stderr = drain_stderr(&mut child.0);
 
     {
         // 写完即关闭 stdin：daemon 在回完这条 reply 后自行退出。
@@ -259,10 +305,34 @@ fn round_trip_once(
             return Ok(payload.and_then(|value| finished.map(|()| value)));
         }
     }
+    // ssh 认证/连接失败只在 stderr 里说明原因，带进错误信息方便排查。
+    let detail = stderr
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap_or_default();
+    let detail = detail.trim();
     Err(io::Error::new(
         io::ErrorKind::UnexpectedEof,
-        format!("agentdeckd 在返回 {expected_reply} 前退出"),
+        if detail.is_empty() {
+            format!("agentdeckd 在返回 {expected_reply} 前退出")
+        } else {
+            format!("agentdeckd 在返回 {expected_reply} 前退出：{detail}")
+        },
     ))
+}
+
+/// 后台排空 stderr，避免子进程写满管道阻塞；只保留尾部用于错误信息。
+fn drain_stderr(child: &mut Child) -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    if let Some(mut stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stderr.read_to_end(&mut buf);
+            let text = String::from_utf8_lossy(&buf);
+            let tail: String = text.chars().rev().take(2000).collect();
+            let _ = tx.send(tail.chars().rev().collect());
+        });
+    }
+    rx
 }
 
 /// daemon 当前注册的 agent；侧栏据此逐个查询历史，不硬编码 vendor。
@@ -461,6 +531,14 @@ mod tests {
         );
         assert!(child.finish(Duration::from_millis(50)).is_err());
         assert_eq!(child.0.try_wait().unwrap().unwrap().signal(), Some(9));
+    }
+
+    #[test]
+    fn remote_runs_daemon_in_login_shell_without_prompting() {
+        let args = super::remote_args("dt");
+        assert_eq!(args[0], "-T");
+        assert!(args.contains(&"BatchMode=yes".to_string()));
+        assert_eq!(args[args.len() - 2..], ["dt", "bash -lc 'exec agentdeckd'"]);
     }
 
     #[test]

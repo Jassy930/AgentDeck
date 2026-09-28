@@ -17,7 +17,7 @@
 ## 项目边界
 
 - AgentDeck 是 Coding Agent 的统一原生桌面客户端，把 Codex 和 Claude Code 作为绝对一等公民，不是 IDE、不是 Codex Desktop 替代品、不是通用多 agent 聊天界面。
-- 当前 macOS 桌面端是 `agentdeck-desktop/` 下的 Rust/GPUI 外壳，已通过自带的 typed local client（`src/daemon.rs`）连接本机 `agentdeckd`，但只覆盖只读历史（agent list / history list / history read）；session、turn、streaming、审批仍未接入，也不恢复旧 AppKit 兼容层。
+- 当前 macOS 桌面端是 `agentdeck-desktop/` 下的 Rust/GPUI 外壳，已通过自带的 typed local client（`src/daemon.rs`）连接本机 `agentdeckd`（设置 `AGENTDECK_REMOTE_HOST` 时改经 `ssh` 连接远端 `agentdeckd`，stdio 协议不变），但只覆盖只读历史（agent list / history list / history read）；session、turn、streaming、审批仍未接入，也不恢复旧 AppKit 兼容层。
 - `agentdeckd` 的 Codex 本地链路固定为由 daemon 直接持有 session-scoped `codex app-server --listen stdio://` 子进程，不依赖 Codex managed daemon/proxy；M0 已完成限定环境验收，证据与剩余边界见 `docs/AGENTDECKD_STATUS.md`，GPUI desktop 目前只接入只读历史。
 - 后续会话 UI 必须通过 Rust typed router 按 `SessionCapabilities` 路由，禁止硬编码 vendor 分支（N2）。
 - IPC 主干类型严禁出现 vendor 字样；vendor 字段只能出现在 `capabilities.*` / `vendorControl.*` / `vendorPanel.*` 命名空间（N1）。
