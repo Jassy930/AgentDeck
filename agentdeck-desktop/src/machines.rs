@@ -104,14 +104,7 @@ fn remote_form(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement + use
                         .xsmall()
                         .flex_shrink_0(),
                 )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .child(host.clone()),
-                )
+                .child(div().flex_1().min_w(px(0.)).truncate().child(host.clone()))
         })
         .collect();
 

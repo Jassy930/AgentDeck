@@ -484,7 +484,7 @@ macOS 进程组存在性查询在组仅剩僵尸进程时可能返回 `EPERM`；
 ## 2026-09-28：快速添加样式、最新版本提示与 agentdeckd 安装
 
 - 快速添加：主机改为虚线边框芯片（`+` 图标、主机名省略、hover 高亮、tooltip「连接 {host}」），4 列 grid。
-  主机名文字节点必须 `flex_1`，否则在 flex 行里被压到零宽只剩省略号。
+  主机名文字节点必须 `flex_1` + `truncate()`（含 nowrap）：只有 flex_1 会被压到零宽，缺 nowrap 会按错误宽度折行只剩前几个字符。
 - 最新版本：首次打开机器页时在本机 `curl` 查 npm registry（`@openai/codex`、`@anthropic-ai/claude-code`）
   的 `latest`，与各机器安装版本比较，显示「已是最新」或「可更新到 vX」；安装版本更新（预览通道）时不下结论，
   查询失败显示「无法获取最新版本」。selfcheck 路径不联网。版本比较手写（数字核心 + 预发布更旧），
