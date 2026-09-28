@@ -272,10 +272,10 @@ fn agent_row(
         })
 }
 
-/// "2.1.191 (Claude Code)" / "codex-cli 0.156.1" → "v…"；探测失败的 "claude unknown" → "版本未知"。
+/// "2.1.191 (Claude Code)" / "codex-cli 0.156.1" → "v…"；探测或查询失败（"… unknown"）→ "拿不到版本号"。
 fn short_version(raw: &str) -> String {
     if raw.ends_with("unknown") {
-        return "版本未知".into();
+        return "拿不到版本号".into();
     }
     raw.split_whitespace()
         .find(|part| part.starts_with(|c: char| c.is_ascii_digit()))
@@ -288,6 +288,7 @@ mod tests {
     fn short_version_drops_product_suffix() {
         assert_eq!(super::short_version("2.1.191 (Claude Code)"), "v2.1.191");
         assert_eq!(super::short_version("codex-cli 0.156.1"), "v0.156.1");
-        assert_eq!(super::short_version("codex unknown"), "版本未知");
+        assert_eq!(super::short_version("codex unknown"), "拿不到版本号");
+        assert_eq!(super::short_version("unknown"), "拿不到版本号");
     }
 }

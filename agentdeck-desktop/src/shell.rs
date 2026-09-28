@@ -213,7 +213,7 @@ pub(crate) struct AgentHistory {
     limit: usize,
     has_more: bool,
     pub warnings: Vec<HistoryWarning>,
-    /// CLI 实际安装版本；None 表示仍在查询或查询失败。
+    /// CLI 实际安装版本；None 表示仍在查询，查询失败记为 "unknown"。
     pub version: Option<String>,
 }
 
@@ -619,7 +619,7 @@ impl Shell {
         .detach();
     }
 
-    /// 机器页展示用；失败只是不显示版本，不影响会话读取。
+    /// 机器页展示用；失败只影响版本显示，不影响会话读取。
     fn load_agent_version(&mut self, id: u64, kind: AgentKind, cx: &mut Context<Self>) {
         let Some(machine) = self.machine(id) else {
             return;
@@ -635,7 +635,8 @@ impl Shell {
                     .machine_mut(id)
                     .and_then(|machine| machine.agents.iter_mut().find(|a| a.kind == kind));
                 if let Some(agent) = agent {
-                    agent.version = version.ok();
+                    // 查询失败也要明示拿不到，不能留空或显示默认版本。
+                    agent.version = Some(version.unwrap_or_else(|_| "unknown".into()));
                     cx.notify();
                 }
             })
