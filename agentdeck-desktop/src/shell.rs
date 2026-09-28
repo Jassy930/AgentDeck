@@ -732,6 +732,7 @@ impl Shell {
             return;
         };
         let host = self.machines.remove(index).host;
+        daemon::disconnect(host_str(&host));
         self.sessions.retain(|session| session.host != host);
         if self
             .agent_filter

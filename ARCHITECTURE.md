@@ -15,7 +15,7 @@ AgentDeck.app
 ├─ agentdeck-desktop（Rust / GPUI / gpui-component）
 │  ├─ Application + Window
 │  ├─ Root + 外壳组件树
-│  ├─ daemon.rs（typed local client：按请求 spawn agentdeckd，JSONL round-trip）
+│  ├─ daemon.rs（typed local client：每机一个常驻 agentdeckd 连接，按 requestId 多路复用）
 │  └─ --selfcheck（不连 daemon）
 └─ agentdeckd（bundle 内自带，供上面的 client spawn）
 
@@ -29,7 +29,8 @@ AgentDeckMobileCore + ios/
 唯一允许的本机桌面通路是
 `agentdeck-desktop → typed local client → agentdeckd`。该通路已落地，但当前只覆盖
 只读历史（agent list / history list / history read）；session 生命周期、turn、streaming
-和审批仍未接入，selfcheck 也不走这条通路。对用户在界面上添加的远端机器，typed
+和审批仍未接入，selfcheck 也不走这条通路。每台机器一条常驻连接，history 按 requestId
+多路复用，进程退出后下次请求重连。对用户在界面上添加的远端机器，typed
 local client 把子进程换成 `ssh <host> bash -lc 'exec agentdeckd'`，协议和依赖方向不变，
 daemon 仍不监听网络。
 

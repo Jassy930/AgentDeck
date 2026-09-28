@@ -109,7 +109,9 @@ macOS 启动 daemon 前会在子进程恢复信号接收，避免继承 GPUI 后
 
 - 本机能免密 `ssh <host>`（使用 `BatchMode=yes`，不会弹密码提示）；
 - 远端 login shell 的 PATH 中有 `agentdeckd`、`codex`、`claude`；
-- ssh 通过 `ControlMaster`（`~/.ssh/agentdeck-%C`，保持 60 秒）复用连接，热连接单次请求约 20ms。
+- 每台机器一条常驻连接（本机一个 `agentdeckd` 子进程，远端一条 ssh 会话），所有请求复用，
+  history 按 requestId 并发；`ServerAliveInterval=15` 让对端休眠/断网后约 45 秒内断开，
+  下次请求自动重连（`ControlMaster` `~/.ssh/agentdeck-%C` 让重连免去完整握手）。
 
 远端安装（以 Linux 工作站 `dt` 为例）：
 
@@ -244,7 +246,7 @@ desktop 已经通过 typed local client 接入 daemon 的只读历史，下一�
 2. 持久 CLI 四轮曾在 0.145.0 的临时配置覆盖环境通过，包含累计 streaming、同 PID/threadId
    复用、取消后继续、回收与记录读回；升级后的 lifecycle E2E 尚未重跑，
    证据见 [M0 CLI 实施记录](docs/plans/2026-09-21-backend-m0-cli-implementation.md)。
-3. 在此之上给 desktop 接入会话启动与 turn 流（需要把 one-shot round-trip 换成长连接），
+3. 在此之上给 desktop 接入会话启动与 turn 流（每机常驻连接已就绪，需再接事件流），
    再增加审批、Markdown 和多 agent 能力。
 
 `agentdeck session live` 的 stdin 接受现有 `ClientCommand` JSONL，stdout 连续输出协议
