@@ -213,6 +213,8 @@ pub(crate) struct AgentHistory {
     limit: usize,
     has_more: bool,
     pub warnings: Vec<HistoryWarning>,
+    /// CLI 实际安装版本；None 表示仍在查询或查询失败。
+    pub version: Option<String>,
 }
 
 impl AgentHistory {
@@ -224,6 +226,7 @@ impl AgentHistory {
             limit: SIDEBAR_LIMIT,
             has_more: false,
             warnings: Vec::new(),
+            version: None,
         }
     }
 
@@ -605,9 +608,35 @@ impl Shell {
                         machine.agents = kinds.iter().copied().map(AgentHistory::new).collect();
                         for kind in kinds {
                             shell.load_agent_sessions(id, kind, cx);
+                            shell.load_agent_version(id, kind, cx);
                         }
                     }
                     Err(message) => machine.error = Some(message),
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 机器页展示用；失败只是不显示版本，不影响会话读取。
+    fn load_agent_version(&mut self, id: u64, kind: AgentKind, cx: &mut Context<Self>) {
+        let Some(machine) = self.machine(id) else {
+            return;
+        };
+        let client = machine.client.clone();
+        cx.spawn(async move |this, cx| {
+            let version = cx
+                .background_executor()
+                .spawn(async move { client.agent_version(kind) })
+                .await;
+            this.update(cx, |shell, cx| {
+                let agent = shell
+                    .machine_mut(id)
+                    .and_then(|machine| machine.agents.iter_mut().find(|a| a.kind == kind));
+                if let Some(agent) = agent {
+                    agent.version = version.ok();
+                    cx.notify();
                 }
             })
             .ok();

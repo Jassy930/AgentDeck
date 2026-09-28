@@ -57,6 +57,12 @@ pub trait Agent: Send + Sync + 'static {
     /// minimal capabilities + log a diagnostic.
     fn capabilities(&self) -> SessionCapabilities;
 
+    /// 本机实际安装的 CLI 版本（机器页展示用）。默认沿用 `capabilities()`；
+    /// capabilities 报固定版本的适配器应覆盖为真实探测。
+    async fn detected_version(&self) -> String {
+        self.capabilities().agent_version
+    }
+
     /// Start a new session and stream events to the given sender. The
     /// adapter must:
     ///   1. Send SessionStarted FIRST.

@@ -141,6 +141,15 @@ impl Agent for CodexAdapter {
         self.capabilities_for_session()
     }
 
+    /// capabilities 报的是固定验证版本；这里探测历史读取实际会用的 codex。
+    async fn detected_version(&self) -> String {
+        let (_cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
+        match crate::codex::app_server::CodexBinary::resolve_for_history(&mut cancel).await {
+            Ok(binary) => binary.version().to_string(),
+            Err(_) => "codex unknown".to_string(),
+        }
+    }
+
     async fn start_session(
         &self,
         start: SessionStart,

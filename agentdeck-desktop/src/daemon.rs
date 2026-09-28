@@ -188,11 +188,15 @@ fn daemon_command(program: impl AsRef<OsStr>) -> Command {
     command
 }
 
-/// 回复对应的等待者：history 按 requestId（daemon 并发处理、可能乱序返回）；
-/// 其余 admin reply 由 daemon 在输入循环里就地处理，按 reply 名先进先出。
+/// 回复对应的等待者：history 按 requestId、agentCapabilities 按 agentKind
+/// （daemon 并发处理、可能乱序返回）；其余 admin reply 按 reply 名先进先出。
 fn reply_key(value: &serde_json::Value) -> Option<String> {
     match value.get("reply")?.as_str()? {
         "history" => Some(format!("history:{}", value.get("requestId")?.as_str()?)),
+        "agentCapabilities" => Some(format!(
+            "agentCapabilities:{}",
+            value.get("agentKind")?.as_str()?
+        )),
         reply => Some(reply.to_string()),
     }
 }
@@ -306,6 +310,10 @@ impl Connection {
                     key,
                 )
             }
+            ClientCommand::AgentCapabilities { agent_kind } => (
+                command.clone(),
+                format!("agentCapabilities:{}", agent_kind.as_str()),
+            ),
             command => (command.clone(), expected_reply.to_string()),
         };
         let mut line = match serde_json::to_string(&command) {
@@ -518,6 +526,18 @@ impl Client {
         let mut reply = self.round_trip(&ClientCommand::AgentList, "agentList")?;
         let agents = reply["agents"].take();
         serde_json::from_value(agents).map_err(|source| format!("解析 agent 列表失败：{source}"))
+    }
+
+    /// 该机器上 agent CLI 的实际安装版本。
+    pub fn agent_version(&self, agent_kind: AgentKind) -> Result<String> {
+        let reply = self.round_trip(
+            &ClientCommand::AgentCapabilities { agent_kind },
+            "agentCapabilities",
+        )?;
+        reply["capabilities"]["agentVersion"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| "agentCapabilities 回复缺少 agentVersion".to_string())
     }
 
     fn history(&self, request: HistoryRequest) -> Result<HistoryReply> {
@@ -871,6 +891,31 @@ mod tests {
         assert!(connection.pending.lock().unwrap().is_empty());
     }
 
+    /// 两个 agent 的版本查询并发发出、daemon 乱序返回，各自拿到自己 agentKind 的版本。
+    #[test]
+    fn agent_versions_are_routed_by_agent_kind() {
+        let connection = fake_daemon(
+            r#"read -r a; read -r b
+            for l in "$b" "$a"; do
+              k=$(printf %s "$l" | sed -n 's/.*"agentKind":"\([^"]*\)".*/\1/p')
+              printf '{"reply":"agentCapabilities","agentKind":"%s","capabilities":{"agentVersion":"%s 1.0"}}\n' "$k" "$k"
+            done
+            cat >/dev/null"#,
+        );
+        let client = std::sync::Arc::new(fake_client(&connection));
+        let handles: Vec<_> = [super::AgentKind::Codex, super::AgentKind::ClaudeCode]
+            .into_iter()
+            .map(|kind| {
+                let client = std::sync::Arc::clone(&client);
+                std::thread::spawn(move || (kind, client.agent_version(kind).unwrap()))
+            })
+            .collect();
+        for handle in handles {
+            let (kind, version) = handle.join().unwrap();
+            assert_eq!(version, format!("{} 1.0", kind.as_str()));
+        }
+    }
+
     #[test]
     fn history_request_ids_are_unique() {
         let first = next_history_request_id();
@@ -879,7 +924,7 @@ mod tests {
         assert!(first.starts_with(&format!("desktop-history-{}-", std::process::id())));
     }
 
-    /// 读线程按 key 分发：history 按 requestId，其余按 reply 名；事件和缺 requestId 的
+    /// 读线程按 key 分发：history 按 requestId，agentCapabilities 按 agentKind，其余按 reply 名；事件和缺 requestId 的
     /// history 回复不会被任何等待者认领。
     #[test]
     fn replies_are_routed_by_request_id_or_reply_name() {
@@ -891,6 +936,11 @@ mod tests {
         assert_eq!(
             key(r#"{"reply":"agentList","agents":["codex"]}"#).as_deref(),
             Some("agentList")
+        );
+        assert_eq!(
+            key(r#"{"reply":"agentCapabilities","agentKind":"codex","capabilities":{}}"#)
+                .as_deref(),
+            Some("agentCapabilities:codex")
         );
         assert_eq!(
             key(

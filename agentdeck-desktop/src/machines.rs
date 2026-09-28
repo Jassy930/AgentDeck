@@ -215,7 +215,20 @@ fn agent_row(
                 .flex_1()
                 .min_w(px(0.))
                 .gap_0p5()
-                .child(div().text_sm().child(agent_label(kind)))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_baseline()
+                        .child(div().text_sm().child(agent_label(kind)))
+                        .when_some(agent.version.as_deref().map(short_version), |line, v| {
+                            line.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(v),
+                            )
+                        }),
+                )
                 .child(
                     div()
                         .text_xs()
@@ -257,4 +270,24 @@ fn agent_row(
                     .on_click(cx.listener(move |shell, _, _, cx| shell.retry_agent(id, kind, cx))),
             )
         })
+}
+
+/// "2.1.191 (Claude Code)" / "codex-cli 0.156.1" → "v…"；探测失败的 "claude unknown" → "版本未知"。
+fn short_version(raw: &str) -> String {
+    if raw.ends_with("unknown") {
+        return "版本未知".into();
+    }
+    raw.split_whitespace()
+        .find(|part| part.starts_with(|c: char| c.is_ascii_digit()))
+        .map_or_else(|| raw.into(), |v| format!("v{v}"))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn short_version_drops_product_suffix() {
+        assert_eq!(super::short_version("2.1.191 (Claude Code)"), "v2.1.191");
+        assert_eq!(super::short_version("codex-cli 0.156.1"), "v0.156.1");
+        assert_eq!(super::short_version("codex unknown"), "版本未知");
+    }
 }

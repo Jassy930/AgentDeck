@@ -448,3 +448,17 @@ macOS 进程组存在性查询在组仅剩僵尸进程时可能返回 `EPERM`；
   desktop selfcheck、`./script/build_and_run.sh --verify` 通过；
   实窗临时以机器页为初始状态并追加一台不可达主机截图，确认失败卡片、重试 / 断开、
   兼容性警告换行、侧栏失败摘要与输入框宽度正常，截图后已还原临时改动。
+
+## 2026-09-28：机器页显示 CLI 版本
+
+- 机器页 agent 名称旁显示该机器上 CLI 的实际安装版本（如 `v2.1.283`、`v0.156.1`），查询失败时不显示，
+  探测失败时显示「版本未知」。
+- daemon：`AgentCapabilities` 的 `agentVersion` 改为实际探测值。Codex 之前返回固定的已验证版本，
+  现在走 `Agent::detected_version`，用只读历史同一套 `CodexBinary::resolve_for_history` 探测；
+  Claude Code 仍沿用 `claude --version`（进程内缓存）。版本探测会起子进程，hub 改为 spawn 回复，不阻塞 stdin。
+- 桌面端：`agentCapabilities` 回复按 `agentKind` 分发给等待者（daemon 可能乱序返回）；
+  每个 agent 的版本查询独立于会话读取，失败不影响会话列表。
+- 远端机器需要重装新版 agentdeckd 后，Codex 才会显示实际版本；旧 daemon 仍返回固定版本号。
+- 验证：`cargo test -p agentdeckd`、desktop 47 项测试（新增版本乱序分发与版本号缩写用例）、
+  desktop selfcheck、`./script/build_and_run.sh --verify` 通过；本机 daemon 实测返回
+  `codex-cli 0.156.1` 和 `2.1.283 (Claude Code)`。截图时屏幕处于锁定状态，窗口不重绘，未完成实窗目视确认。

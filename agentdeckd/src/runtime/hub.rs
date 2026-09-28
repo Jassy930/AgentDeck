@@ -355,29 +355,34 @@ impl RuntimeHub {
                 let _ = admin_tx.send(reply.to_string()).await;
             }
             ClientCommand::AgentCapabilities { agent_kind } => {
-                match self.router.capabilities(agent_kind) {
-                    Some(caps) => {
+                // 版本探测会起子进程（最长数秒），spawn 出去不阻塞 stdin。
+                if self.router.list_agents().contains(&agent_kind) {
+                    let router = Arc::clone(&self.router);
+                    let admin_tx = admin_tx.clone();
+                    tokio::spawn(async move {
+                        let Some(caps) = router.detected_capabilities(agent_kind).await else {
+                            return;
+                        };
                         let reply = serde_json::json!({
                             "reply": "agentCapabilities",
                             "agentKind": agent_kind.as_str(),
                             "capabilities": caps,
                         });
                         let _ = admin_tx.send(reply.to_string()).await;
-                    }
-                    None => {
-                        let err = ServerEvent::Error {
-                            session_id: None,
-                            error: ProtocolError {
-                                code: "agent-not-registered".into(),
-                                message: format!(
-                                    "no adapter registered for agentKind={:?}",
-                                    agent_kind
-                                ),
-                                diagnostic_ref: None,
-                            },
-                        };
-                        let _ = events_tx.send(err).await;
-                    }
+                    });
+                } else {
+                    let err = ServerEvent::Error {
+                        session_id: None,
+                        error: ProtocolError {
+                            code: "agent-not-registered".into(),
+                            message: format!(
+                                "no adapter registered for agentKind={:?}",
+                                agent_kind
+                            ),
+                            diagnostic_ref: None,
+                        },
+                    };
+                    let _ = events_tx.send(err).await;
                 }
             }
             // Lifecycle commands are enqueued in wire order and awaited by one

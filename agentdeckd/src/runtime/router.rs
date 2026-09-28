@@ -49,6 +49,14 @@ impl AgentRouter {
         self.agents.get(&kind).map(|a| a.capabilities())
     }
 
+    /// `AgentCapabilities` 查询：agent_version 换成实际安装版本。
+    pub async fn detected_capabilities(&self, kind: AgentKind) -> Option<SessionCapabilities> {
+        let agent = self.agents.get(&kind)?;
+        let mut caps = agent.capabilities();
+        caps.agent_version = agent.detected_version().await;
+        Some(caps)
+    }
+
     pub async fn start_session(
         &self,
         start: SessionStart,
