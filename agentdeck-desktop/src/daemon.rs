@@ -6,8 +6,8 @@
 //! 命令，历史请求仍按 K11 生成唯一 requestId 并严格匹配回复。会话流式接入需要
 //! 长连接时再单独引入。
 //!
-//! 设置 `AGENTDECK_REMOTE_HOST` 后改为经 `ssh <host>` 在远端 login shell 里启动
-//! `agentdeckd`：stdio 协议不变，鉴权与加密交给 SSH 密钥。
+//! 每个请求都带目标机器：`None` 是本机，`Some(host)` 经 `ssh <host>` 在远端
+//! login shell 里启动 `agentdeckd`，stdio 协议不变，鉴权与加密交给 SSH 密钥。
 //!
 //! 所有函数都是阻塞的，调用方必须放到 GPUI 的 background executor 上。
 
@@ -26,8 +26,6 @@ use agentdeck_protocol::{
 
 /// 与 CLI 一致的显式覆盖入口：一旦设置就必须指向绝对路径的可执行文件，不回退。
 const DAEMON_BIN_ENV: &str = "AGENTDECK_DAEMON_BIN";
-/// 远端主机（ssh 目标，可为 `~/.ssh/config` 别名）；设置后优先于本地 daemon。
-const REMOTE_HOST_ENV: &str = "AGENTDECK_REMOTE_HOST";
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -142,14 +140,23 @@ fn remote_args(host: &str) -> Vec<String> {
     .to_vec()
 }
 
-fn build_command() -> Result<Command> {
-    match std::env::var(REMOTE_HOST_ENV) {
-        Ok(host) if !host.is_empty() => {
+/// 界面输入的主机名是信任边界：只接受 ssh 目标形态，拒绝空白和以 `-` 开头的值。
+pub fn validate_host(host: &str) -> Result<()> {
+    if host.is_empty() || host.starts_with('-') || host.chars().any(char::is_whitespace) {
+        return Err(format!("无效的主机名：{host:?}"));
+    }
+    Ok(())
+}
+
+fn build_command(host: Option<&str>) -> Result<Command> {
+    match host {
+        Some(host) => {
+            validate_host(host)?;
             let mut command = daemon_command("ssh");
-            command.args(remote_args(&host));
+            command.args(remote_args(host));
             Ok(command)
         }
-        _ => Ok(daemon_command(locate_daemon()?)),
+        None => Ok(daemon_command(locate_daemon()?)),
     }
 }
 
@@ -217,8 +224,12 @@ fn reply_payload(
 ///
 /// ponytail: 依赖 daemon 有界的版本探测和历史查询；若需处理整个 daemon 无响应，
 /// 再增加客户端 deadline，当前阻塞读取仍会占用一个 background 线程。
-fn round_trip(command: &ClientCommand, expected_reply: &str) -> Result<serde_json::Value> {
-    retry_transport(|| round_trip_once(build_command, command, expected_reply))
+fn round_trip(
+    host: Option<&str>,
+    command: &ClientCommand,
+    expected_reply: &str,
+) -> Result<serde_json::Value> {
+    retry_transport(|| round_trip_once(|| build_command(host), command, expected_reply))
 }
 
 fn retry_transport(
@@ -336,8 +347,8 @@ fn drain_stderr(child: &mut Child) -> mpsc::Receiver<String> {
 }
 
 /// daemon 当前注册的 agent；侧栏据此逐个查询历史，不硬编码 vendor。
-pub fn agent_list() -> Result<Vec<AgentKind>> {
-    let mut reply = round_trip(&ClientCommand::AgentList, "agentList")?;
+pub fn agent_list(host: Option<&str>) -> Result<Vec<AgentKind>> {
+    let mut reply = round_trip(host, &ClientCommand::AgentList, "agentList")?;
     let agents = reply["agents"].take();
     serde_json::from_value(agents).map_err(|source| format!("解析 agent 列表失败：{source}"))
 }
@@ -346,20 +357,28 @@ fn decode_history(reply: serde_json::Value) -> Result<HistoryReply> {
     serde_json::from_value(reply).map_err(|source| format!("解析历史响应失败：{source}"))
 }
 
-fn history(request: HistoryRequest) -> Result<HistoryReply> {
-    decode_history(round_trip(&ClientCommand::History(request), "history")?)
+fn history(host: Option<&str>, request: HistoryRequest) -> Result<HistoryReply> {
+    decode_history(round_trip(
+        host,
+        &ClientCommand::History(request),
+        "history",
+    )?)
 }
 
 pub fn history_list(
+    host: Option<&str>,
     agent_kind: AgentKind,
     limit: usize,
 ) -> Result<(Vec<HistoryListItem>, Vec<HistoryWarning>)> {
-    let reply = history(HistoryRequest::List {
-        request_id: None,
-        agent_kind: Some(agent_kind),
-        cwd_filter: None,
-        limit: Some(limit),
-    })?;
+    let reply = history(
+        host,
+        HistoryRequest::List {
+            request_id: None,
+            agent_kind: Some(agent_kind),
+            cwd_filter: None,
+            limit: Some(limit),
+        },
+    )?;
     match reply.response {
         HistoryResponse::List(items) => Ok((items, reply.warnings)),
         other => Err(format!("历史列表返回了意外的响应：{other:?}")),
@@ -367,14 +386,18 @@ pub fn history_list(
 }
 
 pub fn history_read(
+    host: Option<&str>,
     agent_kind: AgentKind,
     thread_id: ThreadId,
 ) -> Result<(Vec<HistoryTurn>, Vec<HistoryWarning>)> {
-    let reply = history(HistoryRequest::Read {
-        request_id: None,
-        thread_id,
-        agent_kind,
-    })?;
+    let reply = history(
+        host,
+        HistoryRequest::Read {
+            request_id: None,
+            thread_id,
+            agent_kind,
+        },
+    )?;
     match reply.response {
         HistoryResponse::Read(response) => Ok((response.turns, reply.warnings)),
         other => Err(format!("历史读取返回了意外的响应：{other:?}")),
@@ -477,7 +500,7 @@ mod tests {
             libc::sigaddset(&mut mask, libc::SIGCHLD);
             assert_eq!(libc::pthread_sigmask(libc::SIG_BLOCK, &mask, &mut saved), 0);
         }
-        let child = super::daemon_command(&std::env::current_exe().unwrap())
+        let child = super::daemon_command(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "daemon::tests::daemon_does_not_inherit_blocked_child_exit_signals",
@@ -539,6 +562,34 @@ mod tests {
         assert_eq!(args[0], "-T");
         assert!(args.contains(&"BatchMode=yes".to_string()));
         assert_eq!(args[args.len() - 2..], ["dt", "bash -lc 'exec agentdeckd'"]);
+    }
+
+    #[test]
+    fn hosts_that_could_be_parsed_as_options_are_rejected() {
+        for bad in ["", "-oProxyCommand=x", "dt extra", "a\tb"] {
+            assert!(super::validate_host(bad).is_err(), "{bad:?}");
+        }
+        for good in ["dt", "jassy@192.168.1.20", "dt.local"] {
+            assert!(super::validate_host(good).is_ok(), "{good:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn early_exit_surfaces_stderr_in_the_error() {
+        let failing = || {
+            let mut command = super::daemon_command("/bin/sh");
+            command.args(["-c", "echo 'Permission denied (publickey)' >&2; exit 255"]);
+            Ok(command)
+        };
+        let error = super::round_trip_once(
+            failing,
+            &agentdeck_protocol::ClientCommand::AgentList,
+            "agentList",
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(error.to_string().contains("Permission denied (publickey)"));
     }
 
     #[test]

@@ -1,11 +1,11 @@
-//! 全高左侧栏：品牌行、新建与搜索、按日期分组的会话列表、本机 Agent 状态。
+//! 全高左侧栏：品牌行、新建与搜索、按日期分组的会话列表、按机器分组的 Agent 状态。
 //!
-//! 会话条目来自 daemon 的跨 agent 历史列表，点击即读取该会话记录。
+//! 会话条目来自各台机器 daemon 的跨 agent 历史列表，点击即读取该会话记录。
 
 use std::ops::Range;
 use std::sync::{Arc, LazyLock};
 
-use agentdeck_protocol::{AgentKind, HistoryListItem};
+use agentdeck_protocol::AgentKind;
 use gpui::{
     App, Context, FontWeight, Image, ImageFormat, IntoElement, ParentElement, Pixels, SharedString,
     Window, div, img, prelude::*, px, uniform_list,
@@ -19,7 +19,10 @@ use gpui_component::{
     v_flex,
 };
 
-use crate::shell::{AgentHistory, Shell, SidebarRow, agent_label, project_name, session_title};
+use crate::shell::{
+    AgentHistory, Host, Machine, Session, SessionKey, Shell, SidebarRow, agent_label,
+    machine_label, project_name, session_title,
+};
 
 /// 侧栏宽度，与 Codex Desktop 的全高侧栏一致。
 const WIDTH: f32 = 248.;
@@ -28,6 +31,8 @@ const AGENT_ICON_SIZE: f32 = 16.;
 const ROW_HEIGHT: f32 = 36.;
 /// 会话行尾时间列宽度，容纳 "12/31" 或 "23:59"。
 const TIME_WIDTH: f32 = 36.;
+/// 远端会话行的主机标签宽度，过长时省略。
+const HOST_WIDTH: f32 = 40.;
 
 // 2x PNG 保留 Retina 下的像素边界；单独灰图保持 HSL 去饱和后的亮度。
 static AGENT_ICONS: LazyLock<[[Arc<Image>; 2]; 2]> = LazyLock::new(|| {
@@ -68,7 +73,7 @@ pub const TRAFFIC_LIGHT_INSET: f32 = 44.;
 
 pub fn render(
     shell: &Shell,
-    selected: Option<SharedString>,
+    selected: Option<SessionKey>,
     cx: &mut Context<Shell>,
 ) -> impl IntoElement + use<> {
     // 行高一致，用 uniform_list 只渲染可见行；行内容在布局阶段回到 Shell 取。
@@ -95,12 +100,11 @@ pub fn render(
                             .pb_1()
                             .child(section_label(label, cx)),
                         SidebarRow::Session { index, time } => {
-                            let item = &shell.sessions[*index];
-                            let is_selected = selected.as_ref().map(SharedString::as_ref)
-                                == Some(item.thread_id.0.as_str());
+                            let session = &shell.sessions[*index];
+                            let is_selected = selected.as_ref().is_some_and(|key| session.is(key));
                             // 行间距用 padding：uniform_list 按首行测量行高。
                             row_div.pb_1().child(session_row(
-                                item,
+                                session,
                                 time.clone(),
                                 is_selected,
                                 cursor == Some(start + offset),
@@ -136,21 +140,22 @@ pub fn render(
         Some("正在读取会话…".to_string())
     } else if !shell.sessions.is_empty() {
         Some("没有匹配的会话".to_string())
+    } else if shell.machines.iter().any(|machine| machine.error.is_some()) {
+        Some("连接失败，详情见下方机器列表".to_string())
     } else {
-        Some(
-            shell
-                .error
-                .clone()
-                .unwrap_or_else(|| "没有可显示的会话".to_string()),
-        )
+        Some("没有可显示的会话".to_string())
     };
 
-    let agents: Vec<_> = shell
-        .agents
+    let machines: Vec<_> = shell
+        .machines
         .iter()
-        .map(|agent| agent_row(agent, shell.agent_filter == Some(agent.kind), cx))
+        .map(|machine| machine_section(machine, shell.agent_filter.as_ref(), cx))
         .collect();
-    let can_load_more = !shell.load_more_kinds().is_empty();
+    let can_load_more = !shell.load_more_targets().is_empty();
+    let brand_hint = match shell.machines.len() {
+        0 | 1 => "本机".to_string(),
+        count => format!("{count} 台机器"),
+    };
 
     v_flex()
         .w(px(WIDTH))
@@ -186,7 +191,7 @@ pub fn render(
                             div()
                                 .text_sm()
                                 .text_color(cx.theme().muted_foreground)
-                                .child("本机"),
+                                .child(brand_hint),
                         ),
                 )
                 .child(
@@ -215,13 +220,6 @@ pub fn render(
                                 .text_color(cx.theme().muted_foreground)
                                 .child(text)
                         }))
-                        .when(shell.error.is_some(), |section| {
-                            section.child(
-                                Button::new("retry-connection").label("重试连接").on_click(
-                                    cx.listener(|shell, _, _, cx| shell.retry_connection(cx)),
-                                ),
-                            )
-                        })
                         .child(
                             sessions
                                 .flex_1()
@@ -248,18 +246,146 @@ pub fn render(
                 .pt_3()
                 .border_t_1()
                 .border_color(cx.theme().sidebar_border)
-                .children(agents),
+                .children(machines)
+                .child(remote_form(shell, cx)),
         )
 }
 
-/// 本机 agent 状态一行：图标、名称、计数；点击只看该 agent 的会话。
+/// 一台机器：标题行（名称、状态、重试 / 断开）+ 该机器上的 agent 行。
+fn machine_section(
+    machine: &Machine,
+    filter: Option<&(Host, AgentKind)>,
+    cx: &mut Context<Shell>,
+) -> impl IntoElement + use<> {
+    let id = machine.id;
+    let label = machine_label(&machine.host);
+    let status = if machine.connecting {
+        Some("连接中…")
+    } else if machine.error.is_some() {
+        Some("连接失败")
+    } else {
+        None
+    };
+    let error: Option<SharedString> = machine.error.clone().map(Into::into);
+
+    let header = h_flex()
+        .id(SharedString::from(format!("machine-{label}")))
+        .h_6()
+        .px_2()
+        .gap_2()
+        .items_center()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .text_ellipsis()
+                .child(label.clone()),
+        )
+        .children(status)
+        .when_some(error, |header, error| {
+            header.tooltip(move |window, cx| {
+                let error = error.clone();
+                Tooltip::element(move |_, _| {
+                    div()
+                        .w(px(320.))
+                        .whitespace_normal()
+                        .text_xs()
+                        .child(error.clone())
+                })
+                .p_3()
+                .rounded(px(12.))
+                .build(window, cx)
+            })
+        })
+        .when(machine.error.is_some(), |header| {
+            header.child(
+                Button::new(SharedString::from(format!("retry-machine-{label}")))
+                    .ghost()
+                    .xsmall()
+                    .label("重试")
+                    .on_click(cx.listener(move |shell, _, _, cx| shell.retry_machine(id, cx))),
+            )
+        })
+        .when(machine.host.is_some(), |header| {
+            header.child(
+                Button::new(SharedString::from(format!("remove-machine-{label}")))
+                    .ghost()
+                    .xsmall()
+                    .label("断开")
+                    .on_click(cx.listener(move |shell, _, _, cx| shell.remove_machine(id, cx))),
+            )
+        });
+
+    let agents: Vec<_> = machine
+        .agents
+        .iter()
+        .map(|agent| {
+            let filtered =
+                filter.is_some_and(|(host, kind)| *host == machine.host && *kind == agent.kind);
+            agent_row(machine, agent, filtered, cx)
+        })
+        .collect();
+    v_flex().gap_1().child(header).children(agents)
+}
+
+/// 连接远端：折叠时是一个按钮，展开后是 ssh 主机输入框（回车或点"连接"）。
+fn remote_form(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement + use<> {
+    let toggle = Button::new("toggle-remote-form")
+        .ghost()
+        .xsmall()
+        .w_full()
+        .justify_start()
+        .label(if shell.remote_form {
+            "取消"
+        } else {
+            "+ 连接远端机器"
+        })
+        .on_click(cx.listener(|shell, _, window, cx| shell.toggle_remote_form(window, cx)));
+    v_flex()
+        .gap_1()
+        .when(shell.remote_form, |form| {
+            form.child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(Input::new(&shell.remote_input).xsmall()),
+                    )
+                    .child(
+                        Button::new("connect-remote")
+                            .xsmall()
+                            .label("连接")
+                            .on_click(cx.listener(|shell, _, _, cx| shell.connect_remote(cx))),
+                    ),
+            )
+        })
+        .when_some(shell.remote_error.clone(), |form, error| {
+            form.child(
+                div()
+                    .px_2()
+                    .text_xs()
+                    .whitespace_normal()
+                    .text_color(cx.theme().danger)
+                    .child(error),
+            )
+        })
+        .child(toggle)
+}
+
+/// agent 状态一行：图标、名称、计数；点击只看该机器上该 agent 的会话。
 /// 完整状态、兼容性警告和错误详情放在悬停提示里，读取失败时行尾给出重试。
 fn agent_row(
+    machine: &Machine,
     agent: &AgentHistory,
     filtered: bool,
     cx: &mut Context<Shell>,
 ) -> impl IntoElement + use<> {
     let kind = agent.kind;
+    let (id, host) = (machine.id, machine.host.clone());
+    let key = format!("{}-{}", machine_label(&host), kind.as_str());
     let mut details: Vec<SharedString> = vec![agent.status().into()];
     details.extend(agent.list_hint().map(SharedString::from));
     details.extend(
@@ -273,7 +399,7 @@ fn agent_row(
 
     // 自绘行而不是 Button：Button 的内部容器不随宽度伸展，计数无法右对齐。
     let row = h_flex()
-        .id(SharedString::from(format!("agent-{}", kind.as_str())))
+        .id(SharedString::from(format!("agent-{key}")))
         .flex_1()
         .min_w(px(0.))
         .h_7()
@@ -301,7 +427,9 @@ fn agent_row(
                 .text_color(cx.theme().muted_foreground)
                 .child(agent.count_label()),
         )
-        .on_click(cx.listener(move |shell, _, _, cx| shell.toggle_agent_filter(kind, cx)))
+        .on_click(
+            cx.listener(move |shell, _, _, cx| shell.toggle_agent_filter(host.clone(), kind, cx)),
+        )
         .tooltip(move |window, cx| {
             let details = details.clone();
             Tooltip::element(move |_, cx| {
@@ -327,11 +455,11 @@ fn agent_row(
         .child(row)
         .when(failed, |row| {
             row.child(
-                Button::new(SharedString::from(format!("retry-{}", kind.as_str())))
+                Button::new(SharedString::from(format!("retry-{key}")))
                     .ghost()
                     .xsmall()
                     .label("重试")
-                    .on_click(cx.listener(move |shell, _, _, cx| shell.retry_agent(kind, cx))),
+                    .on_click(cx.listener(move |shell, _, _, cx| shell.retry_agent(id, kind, cx))),
             )
         })
 }
@@ -360,23 +488,30 @@ fn section_label(text: &str, cx: &Context<Shell>) -> impl IntoElement {
         .child(text.to_string())
 }
 
-/// 会话行：id 用 threadId，点击后读取该会话的真实记录。
+/// 会话行：id 用机器 + threadId，点击后读取该会话的真实记录；远端会话带主机标签。
 fn session_row(
-    item: &HistoryListItem,
+    session: &Session,
     time: SharedString,
     selected: bool,
     keyboard_cursor: bool,
     window: &Window,
     cx: &mut Context<Shell>,
 ) -> impl IntoElement + use<> {
-    let id: SharedString = item.thread_id.0.clone().into();
-    let payload = item.clone();
+    let item = &session.item;
+    let machine = machine_label(&session.host);
+    let id: SharedString = format!("{machine}-{}", item.thread_id.0).into();
+    let payload = session.clone();
     let title: SharedString = session_title(item).into();
     let folder: SharedString = project_name(item).into();
-    let path: SharedString = item.cwd.display().to_string().into();
+    let path: SharedString = format!("{machine} · {}", item.cwd.display()).into();
+    let host_badge = session.host.clone();
     let time_width = if time.len() > 5 { 72. } else { TIME_WIDTH };
-    // Button 的内部 label 容器不会收缩，扣除 padding、边框、图标、时间列与两个 gap_2。
-    let title_width = px(WIDTH - 3. - AGENT_ICON_SIZE - time_width) - window.rem_size() * 4.5;
+    // Button 的内部 label 容器不会收缩，扣除 padding、边框、图标、时间列与两个 gap_2；
+    // 远端行再扣主机标签和它的 gap_2。
+    let mut title_width = px(WIDTH - 3. - AGENT_ICON_SIZE - time_width) - window.rem_size() * 4.5;
+    if host_badge.is_some() {
+        title_width -= px(HOST_WIDTH) + window.rem_size() * 0.5;
+    }
 
     let mut button = Button::new(id)
         .group("session-row")
@@ -412,6 +547,20 @@ fn session_row(
                 .text_ellipsis()
                 .child(title.clone()),
         )
+        .when_some(host_badge, |button, host| {
+            button.child(
+                div()
+                    .w(px(HOST_WIDTH))
+                    .flex_shrink_0()
+                    .whitespace_normal()
+                    .line_clamp(1)
+                    .text_ellipsis()
+                    .text_right()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(host),
+            )
+        })
         .child(
             div()
                 .w(px(time_width))

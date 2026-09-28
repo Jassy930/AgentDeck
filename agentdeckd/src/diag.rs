@@ -229,7 +229,7 @@ mod tests {
         let p = log_path_from(None, None, Some(std::ffi::OsStr::new("/Users/example"))).unwrap();
         assert!(
             p.to_string_lossy()
-                .contains("Application Support/AgentDeck")
+                .contains(&format!("{}/AgentDeck", crate::record::PLATFORM_DATA_ROOT))
         );
         assert!(p.to_string_lossy().ends_with("diagnostic.log"));
     }
@@ -250,7 +250,10 @@ mod tests {
 
         assert_eq!(
             path.to_string_lossy(),
-            "/Users/example/Library/Application Support/AgentDeck-Dev/diagnostic.log"
+            format!(
+                "/Users/example/{}/AgentDeck-Dev/diagnostic.log",
+                crate::record::PLATFORM_DATA_ROOT
+            )
         );
     }
 

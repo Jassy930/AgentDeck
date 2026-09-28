@@ -17,14 +17,14 @@
 ## 项目边界
 
 - AgentDeck 是 Coding Agent 的统一原生桌面客户端，把 Codex 和 Claude Code 作为绝对一等公民，不是 IDE、不是 Codex Desktop 替代品、不是通用多 agent 聊天界面。
-- 当前 macOS 桌面端是 `agentdeck-desktop/` 下的 Rust/GPUI 外壳，已通过自带的 typed local client（`src/daemon.rs`）连接本机 `agentdeckd`（设置 `AGENTDECK_REMOTE_HOST` 时改经 `ssh` 连接远端 `agentdeckd`，stdio 协议不变），但只覆盖只读历史（agent list / history list / history read）；session、turn、streaming、审批仍未接入，也不恢复旧 AppKit 兼容层。
+- 当前 macOS 桌面端是 `agentdeck-desktop/` 下的 Rust/GPUI 外壳，已通过自带的 typed local client（`src/daemon.rs`）连接本机 `agentdeckd`（并可在界面上添加远端机器，经 `ssh` 连接其 `agentdeckd`，stdio 协议不变，多机会话合并展示），但只覆盖只读历史（agent list / history list / history read）；session、turn、streaming、审批仍未接入，也不恢复旧 AppKit 兼容层。
 - `agentdeckd` 的 Codex 本地链路固定为由 daemon 直接持有 session-scoped `codex app-server --listen stdio://` 子进程，不依赖 Codex managed daemon/proxy；M0 已完成限定环境验收，证据与剩余边界见 `docs/AGENTDECKD_STATUS.md`，GPUI desktop 目前只接入只读历史。
 - 后续会话 UI 必须通过 Rust typed router 按 `SessionCapabilities` 路由，禁止硬编码 vendor 分支（N2）。
 - IPC 主干类型严禁出现 vendor 字样；vendor 字段只能出现在 `capabilities.*` / `vendorControl.*` / `vendorPanel.*` 命名空间（N1）。
 - Codex 细节只能留在 `agentdeckd/src/codex/` 子模块；CC 细节只能留在 `agentdeckd/src/claude_code/` 子模块；两者互不知晓（N3）。
 - `protocol/` 中 Codex schema 必须来自官方 `codex app-server generate-json-schema`，不要手写或逆向猜测协议（K8）。
 - AgentDeck 不读取、不保存、不转发任何 vendor token（Codex 或 Claude Code）；CC 历史走 CC 原生接口，不建 `cc-meta/` 目录（K9、N8）。
-- AgentDeck 管理的 run record 与 diagnostic log 写入 `~/Library/Application Support/AgentDeck/`，不得写入用户项目 git（K5）。
+- AgentDeck 管理的 run record 与 diagnostic log 写入 `~/Library/Application Support/AgentDeck/`（Linux 为 `~/.local/share/AgentDeck/`），不得写入用户项目 git（K5）。
 - `Sources/AgentDeckMobileCore/` 是 iOS 使用的平台无关 Swift 层，禁止 import AppKit/UIKit；macOS GPUI target 不依赖它。`ios/` 是 fixture 驱动的 UIKit companion 前端，唯一数据入口是 `MobileSessionSource`，本期不含网络代码（设计见 `docs/plans/2026-07-03-ios-uikit-frontend-design.md`）。
 
 ## 工作规则

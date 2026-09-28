@@ -101,9 +101,11 @@ macOS 启动 daemon 前会在子进程恢复信号接收，避免继承 GPUI 后
 
 ### 连接局域网内的远端 daemon（SSH）
 
-设置 `AGENTDECK_REMOTE_HOST=<ssh 目标>` 后，桌面端改为执行
-`ssh <host> bash -lc 'exec agentdeckd'`，其余 JSONL 通路不变；鉴权与加密由 SSH 密钥负责，
-daemon 本身不监听网络。要求：
+在侧栏底部点「+ 连接远端机器」，输入 ssh 目标（如 `dt` 或 `user@10.0.0.2`）回车，
+桌面端即对该机器执行 `ssh <host> bash -lc 'exec agentdeckd'`，其余 JSONL 通路不变；
+鉴权与加密由 SSH 密钥负责，daemon 本身不监听网络。本机与所有远端的会话合并在同一列表，
+远端行带主机标签；侧栏机器列表按机器分组显示 agent，可逐台「重试」或「断开」。
+已连接的主机保存在数据目录的 `desktop-remotes`（一行一个），下次启动自动连接。要求：
 
 - 本机能免密 `ssh <host>`（使用 `BatchMode=yes`，不会弹密码提示）；
 - 远端 login shell 的 PATH 中有 `agentdeckd`、`codex`、`claude`；
@@ -116,10 +118,9 @@ rsync -az --exclude target --exclude .git ./ dt:AgentDeck/
 ssh dt 'cd ~/AgentDeck && ~/.cargo/bin/cargo build --release --locked -p agentdeckd \
   && install -m755 target/release/agentdeckd ~/.local/bin/ \
   && bash -lc "agentdeckd --selfcheck"'
-AGENTDECK_REMOTE_HOST=dt ./target/debug/agentdeck-desktop
 ```
 
-Linux 上 daemon 的数据目录暂时沿用 `~/Library/Application Support/AgentDeck/`。
+Linux 上 daemon 的数据目录为 `~/.local/share/AgentDeck/`（`AGENTDECK_DATA_DIR` 可覆盖）。
 
 ## 依赖版本
 

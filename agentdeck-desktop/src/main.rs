@@ -1,4 +1,5 @@
 mod daemon;
+mod remotes;
 mod shell;
 mod sidebar;
 mod theme;
