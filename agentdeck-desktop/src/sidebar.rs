@@ -1,4 +1,4 @@
-//! 全高左侧栏：品牌行、新建与搜索、按日期分组的会话列表、按机器分组的 Agent 状态。
+//! 全高左侧栏：品牌行、新建与搜索、按日期分组的会话列表、底部页面入口（机器管理）。
 //!
 //! 会话条目来自各台机器 daemon 的跨 agent 历史列表，点击即读取该会话记录。
 
@@ -20,8 +20,7 @@ use gpui_component::{
 };
 
 use crate::shell::{
-    AgentHistory, Host, Machine, Session, SessionKey, Shell, SidebarRow, agent_label,
-    machine_label, project_name, session_title,
+    Session, SessionKey, Shell, SidebarRow, Stage, machine_label, project_name, session_title,
 };
 
 /// 侧栏宽度，与 Codex Desktop 的全高侧栏一致。
@@ -77,7 +76,7 @@ pub fn render(
     cx: &mut Context<Shell>,
 ) -> impl IntoElement + use<> {
     // 行高一致，用 uniform_list 只渲染可见行；行内容在布局阶段回到 Shell 取。
-    let is_new_session = selected.is_none();
+    let is_new_session = matches!(shell.stage, Stage::Empty);
     let sessions = uniform_list(
         "session-list",
         shell.rows.len(),
@@ -141,16 +140,24 @@ pub fn render(
     } else if !shell.sessions.is_empty() {
         Some("没有匹配的会话".to_string())
     } else if shell.machines.iter().any(|machine| machine.error.is_some()) {
-        Some("连接失败，详情见下方机器列表".to_string())
+        Some("连接失败，详情见「机器」页".to_string())
     } else {
         Some("没有可显示的会话".to_string())
     };
 
-    let machines: Vec<_> = shell
+    // 机器入口带摘要：失败不能只靠用户主动点进去发现。
+    let failed = shell
         .machines
         .iter()
-        .map(|machine| machine_section(machine, shell.agent_filter.as_ref(), cx))
-        .collect();
+        .filter(|machine| machine.error.is_some())
+        .count();
+    let machines_label = if shell.machines.iter().any(|machine| machine.connecting) {
+        "机器 · 连接中…".to_string()
+    } else if failed > 0 {
+        format!("机器 · {failed} 台失败")
+    } else {
+        "机器".to_string()
+    };
     let can_load_more = !shell.load_more_targets().is_empty();
     let brand_hint = match shell.machines.len() {
         0 | 1 => "本机".to_string(),
@@ -247,232 +254,18 @@ pub fn render(
                 .border_t_1()
                 .border_color(cx.theme().sidebar_border)
                 .child(
-                    v_flex()
-                        .id("machine-list")
-                        .max_h(px(240.))
-                        .overflow_y_scroll()
-                        .gap_1()
-                        .children(machines),
-                )
-                .child(remote_form(shell, cx)),
+                    Button::new("show-machines")
+                        .ghost()
+                        .selected(matches!(shell.stage, Stage::Machines))
+                        .w_full()
+                        .justify_start()
+                        .label(machines_label)
+                        .when(failed > 0, |button| button.text_color(cx.theme().danger))
+                        .on_click(
+                            cx.listener(|shell, _, window, cx| shell.show_machines(window, cx)),
+                        ),
+                ),
         )
-}
-
-/// 一台机器：标题行（名称、状态、重试 / 断开）+ 该机器上的 agent 行。
-fn machine_section(
-    machine: &Machine,
-    filter: Option<&(Host, AgentKind)>,
-    cx: &mut Context<Shell>,
-) -> impl IntoElement + use<> {
-    let id = machine.id;
-    let label = machine_label(&machine.host);
-    let status = if machine.connecting {
-        Some("连接中…")
-    } else if machine.error.is_some() {
-        Some("连接失败")
-    } else {
-        None
-    };
-    let error: Option<SharedString> = machine.error.clone().map(Into::into);
-
-    let header = h_flex()
-        .id(SharedString::from(format!("machine-{label}")))
-        .h_6()
-        .px_2()
-        .gap_2()
-        .items_center()
-        .text_xs()
-        .text_color(cx.theme().muted_foreground)
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .text_ellipsis()
-                .child(label.clone()),
-        )
-        .children(status)
-        .when_some(error, |header, error| {
-            header.tooltip(move |window, cx| {
-                let error = error.clone();
-                Tooltip::element(move |_, _| {
-                    div()
-                        .w(px(320.))
-                        .whitespace_normal()
-                        .text_xs()
-                        .child(error.clone())
-                })
-                .p_3()
-                .rounded(px(12.))
-                .build(window, cx)
-            })
-        })
-        .when(machine.error.is_some(), |header| {
-            header.child(
-                Button::new(SharedString::from(format!("retry-machine-{label}")))
-                    .ghost()
-                    .xsmall()
-                    .label("重试")
-                    .on_click(cx.listener(move |shell, _, _, cx| shell.retry_machine(id, cx))),
-            )
-        })
-        .when(machine.host.is_some(), |header| {
-            header.child(
-                Button::new(SharedString::from(format!("remove-machine-{label}")))
-                    .ghost()
-                    .xsmall()
-                    .label("断开")
-                    .on_click(cx.listener(move |shell, _, _, cx| shell.remove_machine(id, cx))),
-            )
-        });
-
-    let agents: Vec<_> = machine
-        .agents
-        .iter()
-        .map(|agent| {
-            let filtered =
-                filter.is_some_and(|(host, kind)| *host == machine.host && *kind == agent.kind);
-            agent_row(machine, agent, filtered, cx)
-        })
-        .collect();
-    v_flex()
-        .flex_shrink_0()
-        .gap_1()
-        .child(header)
-        .children(agents)
-}
-
-/// 连接远端：折叠时是一个按钮，展开后是 ssh 主机输入框（回车或点"连接"）。
-fn remote_form(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement + use<> {
-    let toggle = Button::new("toggle-remote-form")
-        .ghost()
-        .xsmall()
-        .w_full()
-        .justify_start()
-        .label(if shell.remote_form {
-            "取消"
-        } else {
-            "+ 连接远端机器"
-        })
-        .on_click(cx.listener(|shell, _, window, cx| shell.toggle_remote_form(window, cx)));
-    v_flex()
-        .gap_1()
-        .when(shell.remote_form, |form| {
-            form.child(
-                h_flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(Input::new(&shell.remote_input).xsmall()),
-                    )
-                    .child(
-                        Button::new("connect-remote")
-                            .xsmall()
-                            .label("连接")
-                            .on_click(cx.listener(|shell, _, _, cx| shell.connect_remote(cx))),
-                    ),
-            )
-        })
-        .when_some(shell.remote_error.clone(), |form, error| {
-            form.child(
-                div()
-                    .px_2()
-                    .text_xs()
-                    .whitespace_normal()
-                    .text_color(cx.theme().danger)
-                    .child(error),
-            )
-        })
-        .child(toggle)
-}
-
-/// agent 状态一行：图标、名称、计数；点击只看该机器上该 agent 的会话。
-/// 完整状态、兼容性警告和错误详情放在悬停提示里，读取失败时行尾给出重试。
-fn agent_row(
-    machine: &Machine,
-    agent: &AgentHistory,
-    filtered: bool,
-    cx: &mut Context<Shell>,
-) -> impl IntoElement + use<> {
-    let kind = agent.kind;
-    let (id, host) = (machine.id, machine.host.clone());
-    let key = format!("{}-{}", machine_label(&host), kind.as_str());
-    let mut details: Vec<SharedString> = vec![agent.status().into()];
-    details.extend(agent.list_hint().map(SharedString::from));
-    details.extend(
-        agent
-            .warnings
-            .iter()
-            .map(|warning| format!("兼容性警告：{}", warning.message).into()),
-    );
-    details.extend(agent.error().map(|error| error.to_string().into()));
-    let failed = agent.error().is_some();
-
-    // 自绘行而不是 Button：Button 的内部容器不随宽度伸展，计数无法右对齐。
-    let row = h_flex()
-        .id(SharedString::from(format!("agent-{key}")))
-        .flex_1()
-        .min_w(px(0.))
-        .h_7()
-        .px_2()
-        .gap_2()
-        .items_center()
-        .rounded_md()
-        .border_1()
-        .border_color(if filtered {
-            cx.theme().ring
-        } else {
-            gpui::transparent_black()
-        })
-        .text_sm()
-        .cursor_pointer()
-        .when(filtered, |row| row.bg(cx.theme().accent))
-        .hover(|style| style.bg(cx.theme().accent))
-        .child(agent_icon(kind, false))
-        .child(div().flex_1().child(agent_label(kind)))
-        .when(!agent.warnings.is_empty(), |row| {
-            row.child(div().text_color(crate::theme_tokens::WARN).child("⚠"))
-        })
-        .child(
-            div()
-                .text_color(cx.theme().muted_foreground)
-                .child(agent.count_label()),
-        )
-        .on_click(
-            cx.listener(move |shell, _, _, cx| shell.toggle_agent_filter(host.clone(), kind, cx)),
-        )
-        .tooltip(move |window, cx| {
-            let details = details.clone();
-            Tooltip::element(move |_, cx| {
-                v_flex()
-                    .w(px(320.))
-                    .gap_1()
-                    .whitespace_normal()
-                    .text_xs()
-                    .children(details.iter().enumerate().map(|(ix, line)| {
-                        div()
-                            .when(ix > 0, |line| line.text_color(cx.theme().muted_foreground))
-                            .child(line.clone())
-                    }))
-            })
-            .p_3()
-            .rounded(px(12.))
-            .build(window, cx)
-        });
-
-    h_flex()
-        .gap_1()
-        .items_center()
-        .child(row)
-        .when(failed, |row| {
-            row.child(
-                Button::new(SharedString::from(format!("retry-{key}")))
-                    .ghost()
-                    .xsmall()
-                    .label("重试")
-                    .on_click(cx.listener(move |shell, _, _, cx| shell.retry_agent(id, kind, cx))),
-            )
-        })
 }
 
 /// 透明标题栏下的顶部留白：给红绿灯让位，并接管标题栏双击行为。

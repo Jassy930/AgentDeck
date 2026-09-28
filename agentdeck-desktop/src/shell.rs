@@ -1,4 +1,4 @@
-//! 桌面端外壳：全高侧栏 + 主区，主区在空态与会话态之间切换。
+//! 桌面端外壳：全高侧栏 + 主区，主区在空态、会话态和机器管理页之间切换。
 //!
 //! 会话列表和会话记录来自本机与经 ssh 连接的远端 `agentdeckd`，通过 `daemon`
 //! 模块按机器、按 agent 拉取；本期只读历史，不启动 session、不发 turn。
@@ -23,6 +23,7 @@ use gpui_component::{
 };
 
 use crate::daemon;
+use crate::machines;
 use crate::remotes;
 use crate::sidebar;
 use crate::transcript;
@@ -77,6 +78,8 @@ pub enum Stage {
         list: ListState,
         read_id: u64,
     },
+    /// 机器管理页：添加远端、查看每台机器与各 agent 的连接状态。
+    Machines,
 }
 
 /// 虚拟列表在可见区上下额外排版的高度，避免快速滚动时出现空白。
@@ -127,7 +130,7 @@ impl Stage {
 
     pub fn key(&self) -> Option<SessionKey> {
         match self {
-            Stage::Empty => None,
+            Stage::Empty | Stage::Machines => None,
             Stage::Session { session, .. } => Some(session.key()),
         }
     }
@@ -289,16 +292,6 @@ impl AgentHistory {
 
     pub fn error(&self) -> Option<&str> {
         self.result.as_ref()?.as_ref().err().map(String::as_str)
-    }
-
-    /// 侧栏 agent 行的简短计数；完整状态放在悬停详情里。
-    pub fn count_label(&self) -> String {
-        match &self.result {
-            Some(Ok(())) => self.loaded.to_string(),
-            Some(Err(_)) => "失败".to_string(),
-            None if self.loaded > 0 => format!("{}…", self.loaded),
-            None => "…".to_string(),
-        }
     }
 }
 
@@ -468,14 +461,14 @@ fn sidebar_target(
 }
 
 pub struct Shell {
-    stage: Stage,
+    pub(crate) stage: Stage,
     /// Some 表示开启开发者模式，右上角显示 FPS。
     frame_stats: Option<FrameStats>,
     next_read_id: u64,
     reads: ReadQueue,
     /// 侧栏搜索框：按标题或项目名过滤会话。
     pub(crate) search: Entity<InputState>,
-    /// 只看某台机器上某个 agent 的会话；主页卡片和侧栏 agent 行切换。
+    /// 只看某台机器上某个 agent 的会话；主页卡片和机器页 agent 行切换。
     pub(crate) agent_filter: Option<(Host, AgentKind)>,
     /// 本机固定在首位，其后是已连接的远端；每台机器各自决定按哪些 agent 拉历史。
     pub(crate) machines: Vec<Machine>,
@@ -489,9 +482,8 @@ pub struct Shell {
     sidebar_cursor: Option<SessionKey>,
     /// 尚未返回的 daemon 请求数；用于区分"还在加载"和"确实没有会话"。
     pub(crate) pending: usize,
-    /// 侧栏"连接远端"表单：输入框、是否展开、校验或保存失败的提示。
+    /// 机器页"连接远端"表单：输入框和校验或保存失败的提示。
     pub(crate) remote_input: Entity<InputState>,
-    pub(crate) remote_form: bool,
     pub(crate) remote_error: Option<String>,
 }
 
@@ -540,7 +532,6 @@ impl Shell {
             sidebar_cursor: None,
             pending: 0,
             remote_input,
-            remote_form: false,
             remote_error: None,
         };
         if connect_daemon {
@@ -689,13 +680,12 @@ impl Shell {
         }
     }
 
-    pub fn toggle_remote_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.remote_form = !self.remote_form;
+    pub fn show_machines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.stage = Stage::Machines;
+        self.reads.clear_pending();
         self.remote_error = None;
-        if self.remote_form {
-            self.remote_input
-                .update(cx, |input, cx| input.focus(window, cx));
-        }
+        self.remote_input
+            .update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
     }
 
@@ -722,9 +712,6 @@ impl Shell {
         } else {
             self.add_machine(Some(host.into()), cx);
             self.save_remotes();
-            if self.remote_error.is_none() {
-                self.remote_form = false;
-            }
         }
         cx.notify();
     }
@@ -1231,6 +1218,7 @@ impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let main = match &self.stage {
             Stage::Empty => self.render_empty(cx).into_any_element(),
+            Stage::Machines => machines::render(self, cx).into_any_element(),
             Stage::Session {
                 session,
                 transcript,
@@ -1477,18 +1465,6 @@ mod tests {
             Some(&(Some("dt".into()), AgentKind::ClaudeCode))
         ));
         assert!(!session_matches(&claude, "robodojo", None));
-    }
-
-    #[test]
-    fn agent_count_label_distinguishes_loading_failure_and_count() {
-        let mut source = AgentHistory::new(AgentKind::Codex);
-        assert_eq!(source.count_label(), "…");
-        source.complete(&mut Ok((vec![item(None); 51], vec![])));
-        assert_eq!(source.count_label(), "50");
-        assert!(source.load_more());
-        assert_eq!(source.count_label(), "50…");
-        source.complete(&mut Err("timeout".into()));
-        assert_eq!(source.count_label(), "失败");
     }
 
     #[test]
