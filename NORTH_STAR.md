@@ -46,7 +46,7 @@ AgentDeck 的桌面端使用 Rust + GPUI，优先把 macOS 做扎实，再评估
 先建立可快速迭代的 macOS 最小闭环：
 
 1. GPUI + gpui-component 的真实 `.app` 能稳定构建、启动和自检。
-2. 桌面端只通过 typed local client 连接本机 `agentdeckd`，不嵌入 daemon。
+2. 桌面端只通过 typed local client 连接 `agentdeckd`（本机，或经 SSH stdio 连接局域网内的远端机器），不嵌入 daemon。
 3. 先完成单会话 prompt → streaming → complete，再扩展历史和审批。
-4. 远程能力不在当前桌面切片中，也不作为本地开发门禁。
+4. SSH 远端当前只覆盖只读历史；真实远端验收单独进行，不作为本地离线开发门禁。
 5. 不恢复旧 AppKit 的实现细节，只保留仍有效的产品和协议不变量。

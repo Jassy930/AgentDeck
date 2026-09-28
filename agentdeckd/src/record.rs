@@ -2,7 +2,8 @@
 //!
 //! Eng premise 5 (the one the user insisted on): "留痕要留,但由 AgentDeck
 //! 管理,绝不侵入用户 git". Records live in AgentDeck's OWN directory
-//! (`~/Library/Application Support/AgentDeck/`), NEVER in the project tree
+//! (`~/Library/Application Support/AgentDeck/` on macOS,
+//! `~/.local/share/AgentDeck/` elsewhere), NEVER in the project tree
 //! or git. The deprecated repo-native `.agentdeck/runs/*.json` approach is
 //! gone.
 //!
@@ -70,11 +71,17 @@ pub fn app_data_dir_from(
     };
     let home = home?;
     let mut p = PathBuf::from(home);
-    p.push("Library");
-    p.push("Application Support");
+    p.push(PLATFORM_DATA_ROOT);
     p.push(app_dir_name);
     Some(p)
 }
+
+/// 相对 HOME 的平台数据根目录：macOS 用 Application Support，其他平台（远端
+/// Linux 工作站）用 XDG 默认的 `~/.local/share`。
+#[cfg(target_os = "macos")]
+pub(crate) const PLATFORM_DATA_ROOT: &str = "Library/Application Support";
+#[cfg(not(target_os = "macos"))]
+pub(crate) const PLATFORM_DATA_ROOT: &str = ".local/share";
 
 pub fn record_dir() -> Option<PathBuf> {
     let mut p = app_data_dir()?;
@@ -300,7 +307,7 @@ mod tests {
         // Premise 5: must be AgentDeck's own dir, never the cwd / repo.
         let d = record_dir_from(None, None, Some(OsStr::new("/Users/example"))).unwrap();
         let s = d.to_string_lossy();
-        assert!(s.contains("Library/Application Support/AgentDeck"));
+        assert!(s.contains(&format!("{PLATFORM_DATA_ROOT}/AgentDeck")));
         assert!(!s.contains(".agentdeck")); // deprecated repo-native path
     }
 
@@ -347,7 +354,7 @@ mod tests {
 
         assert_eq!(
             dir.to_string_lossy(),
-            "/Users/example/Library/Application Support/AgentDeck-Dev"
+            format!("/Users/example/{PLATFORM_DATA_ROOT}/AgentDeck-Dev")
         );
     }
 
@@ -358,7 +365,7 @@ mod tests {
 
         assert_eq!(
             dir.to_string_lossy(),
-            "/Users/example/Library/Application Support/AgentDeck"
+            format!("/Users/example/{PLATFORM_DATA_ROOT}/AgentDeck")
         );
     }
 

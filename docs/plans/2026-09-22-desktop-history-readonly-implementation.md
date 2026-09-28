@@ -4,28 +4,27 @@
 
 ## Goal
 
-把 GPUI 桌面端的示例会话换成本机 `agentdeckd` 返回的真实历史：侧栏显示真实会话
+把 GPUI 桌面端的示例会话换成本机及 SSH 远端 `agentdeckd` 返回的真实历史：侧栏显示真实会话
 列表，点击后在主区渲染该会话的真实记录。本切片只读，不启动 session、不发 turn。
 
 ## Architecture
 
-- `agentdeck-desktop/src/daemon.rs`：桌面自己的 typed local client。每次请求
-  spawn 一个 `agentdeckd` 子进程，写一行 `ClientCommand`，关闭 stdin，读到匹配的
-  admin reply 后最多等待 2 秒让 daemon 正常退出，超时则终止并回收进程。
+- `agentdeck-desktop/src/daemon.rs`：桌面自己的 typed local client。每个机器实例
+  持有一个 client，首次请求启动 `agentdeckd`（远端经 SSH stdio），后续复用连接。
+  异步任务在调度时捕获 client；显式断开取消在途请求、回收子进程，并阻止旧任务重连。
   - 不复用 `agentdeck-cli`：CLI 是 bin-only、依赖 clap/tokio，且架构上与 GUI 互相独立。
-  - 不维护长连接：history 在 daemon 内部本来就是短生命周期调用（Codex 每次另起
-    app-server，CC 每次扫描本地 JSONL），一个连接只发一条命令。每次历史请求仍按
-    K11 生成唯一 `requestId`，成功与错误回复都必须严格匹配。session streaming
-    需要长连接时再单独引入。
+  - 同一连接并发处理 history，每次请求按 K11 生成唯一 `requestId`，成功与错误回复
+    都必须严格匹配，完成后移除等待条目。daemon 内部 history 仍是短生命周期调用
+    （Codex 每次另起 app-server，CC 每次扫描本地 JSONL）；桌面尚未接入 session streaming。
   - daemon 定位：`AGENTDECK_DAEMON_BIN`（必须是绝对可执行路径，不回退）→
     可执行文件同目录（`.app` bundle 内）→ `target/debug` / `target/release`。
   - macOS 在 child `pre_exec` 中用 `sigemptyset` / `sigprocmask` 恢复空 signal mask，
     让 daemon 的 Tokio child wait 能接收 `SIGCHLD`，不改变父 GCD worker 的 mask。
   - 自动重试仅覆盖尚未取得回复的可恢复传输失败，等待 1 秒后再试一次；daemon 的明确
     错误回复（包括超时）、定位/配置错误与响应解析错误直接返回，不重复历史查询。
-- `agentdeck-desktop/src/shell.rs`：`Shell` 保存合并后的会话与各 agent 的加载结果；
+- `agentdeck-desktop/src/shell.rs`：`Shell` 保存各机器、合并后的会话与各 agent 的加载结果；
   加载中、成功计数和失败原因分别保留，侧栏与空态共用状态文案。
-  `Stage::Session` 持有 `HistoryListItem`、`Transcript`（Loading / Ready / Failed）与
+  `Stage::Session` 持有来源机器和 `HistoryListItem`、`Transcript`（Loading / Ready / Failed）与
   本次读取序号，切走后重开同一会话也只接受最新读取结果。加载顺序是先 `AgentList`，
   再按 agent 各发一次 `History::List`，谁先返回谁先进侧栏，慢的来源不挡快的。
   各来源首批显示 50 条，查询时多取 1 条判断是否还有更多；“加载更多”将该来源的
@@ -40,7 +39,9 @@
   会话读取最多执行一个，等待期间只保留最新待查会话；切回空态清空待查项，正在
   执行的读取仍由 daemon 按自身时限完成并清理。
   侧栏虚拟列表作为一个 Tab 停靠点，上下键移动键盘游标并滚入视野，Return 读取
-  目标会话；游标按来源与 threadId 定位，列表扩展或重新排序不会改变目标身份。
+  目标会话；游标按机器、agent 与 threadId 定位，列表扩展或重新排序不会改变目标身份。
+  机器区限制高度并独立滚动，连接表单位于滚动区外；移除机器后的迟到回复仍会刷新
+  全局加载状态。`desktop-remotes` 按 stable/dev profile 隔离，显式数据目录覆盖优先。
 - `agentdeck-desktop/src/transcript.rs`：把中立 `AgentItem` 映射成消息或可展开过程块，
   单段原文上限 2000 字符；后台读取完成时转换一次，渲染复用最终文本。助手和过程块
   正文使用 Markdown，代码块提供高亮与复制；用户消息保持纯文本。命令状态独立于
@@ -418,3 +419,18 @@ macOS 进程组存在性查询在组仅剩僵尸进程时可能返回 `EPERM`；
   一致，灰色保留原 HSL 去饱和亮度，只有 8 位量化误差；
   实窗确认正文实际滚动、静止图标灰色、悬停及键盘光标图标彩色。
   本轮只验证历史 UI，未运行真实 vendor lifecycle E2E。
+
+## 2026-09-28：SSH 多机连接生命周期与侧栏验收
+
+- 每个机器实例独立持有 client；显式断开取消在途和排队请求，旧实例的重试不能
+  重连，也不能影响重新添加的同名机器。完成的 history 请求移除等待条目。
+  远端配置按 stable/dev 隔离，`AGENTDECK_DATA_DIR` 优先。
+- 机器区独立滚动并保留会话列表和连接表单空间；首页卡片的长机器名在卡片内换行。
+  已移除机器的迟到回调仍通知界面更新加载状态。
+- 验证通过：desktop 46 项测试、desktop selfcheck、真实 bundle verify、
+  `scripts/verify-offline-tests.sh`、绑定当前 checkout daemon 的 CLI selfcheck 和
+  diagnostics report、文档门禁。bundle 启动注入隔离数据目录和 fake daemon/ssh。
+- 真实窗口使用离线 fixture 验收：7 台机器下会话可打开、机器区可滚至末台、连接表单
+  始终可见；连接中断开后子进程回收且没有重连，重新添加同名机器恢复列表。
+  禁用 `debug_assertions` 的桌面产物未启用 FPS 定时刷新，断开后加载提示仍自行结束；
+  长机器名换行正确。未运行真实 SSH 主机或 vendor E2E。

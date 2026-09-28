@@ -15,7 +15,7 @@ AgentDeck.app
 ├─ agentdeck-desktop（Rust / GPUI / gpui-component）
 │  ├─ Application + Window
 │  ├─ Root + 外壳组件树
-│  ├─ daemon.rs（typed local client：按请求 spawn agentdeckd，JSONL round-trip）
+│  ├─ daemon.rs（typed local client：每机一个常驻 agentdeckd 连接，按 requestId 多路复用）
 │  └─ --selfcheck（不连 daemon）
 └─ agentdeckd（bundle 内自带，供上面的 client spawn）
 
@@ -29,7 +29,12 @@ AgentDeckMobileCore + ios/
 唯一允许的本机桌面通路是
 `agentdeck-desktop → typed local client → agentdeckd`。该通路已落地，但当前只覆盖
 只读历史（agent list / history list / history read）；session 生命周期、turn、streaming
-和审批仍未接入，selfcheck 也不走这条通路。
+和审批仍未接入，selfcheck 也不走这条通路。每台机器一条常驻连接，history 按 requestId
+多路复用，进程退出后下次请求重连。每个机器实例持有独立 client，异步请求在调度时
+捕获该实例；显式断开取消其请求并回收子进程，旧实例不能自动重连或借用后来重新添加的
+同名机器连接。已完成请求及时移除等待条目。对用户在界面上添加的远端机器，typed
+local client 把子进程换成 `ssh <host> bash -lc 'exec agentdeckd'`，协议和依赖方向不变，
+daemon 仍不监听网络。
 
 Codex 本地 transport 已决定为 `agentdeckd` 直接持有 session-scoped
 `codex app-server --listen stdio://` 子进程；不依赖用户全局 managed daemon/proxy。
@@ -75,7 +80,7 @@ poison 并退出 daemon。protocol v4 增加累计消息的 item identity/state/
 - **K2**：`RuntimeHub` 必须按 `sessionId` 阻止同一 runtime 并发 turn；session 创建时 `agentKind` 不可变，整个生命周期固定到一个 adapter。
 - **K3**：每个 turn 的成功、失败或取消 terminal 发出前，worker 必须先释放 turn-local 占用；连接仍健康时 session 回到 Ready 并保留 session-scoped child。只有 `SessionClosed` 表示 session 已结束，且必须在 direct child wait、Unix 进程组消失确认、pump 停止和路由清理后发送。
 - **K4**（加强）：所有事件主干消息必须带 `agentKind` 字段。
-- **K5**：run record 与 diagnostic log 写入 `~/Library/Application Support/AgentDeck/`（stable）或 `AgentDeck-Dev/`（dev），不得写入用户项目 git。
+- **K5**：run record 与 diagnostic log 写入 `~/Library/Application Support/AgentDeck/`（stable）或 `AgentDeck-Dev/`（dev），Linux 上根目录为 `~/.local/share/`，不得写入用户项目 git。
 - **K6**：`AGENTDECK_DATA_DIR` / `--profile` / `AGENTDECK_PROFILE` 控制数据目录隔离，不影响 vendor 登录状态或 vendor 历史。
 - **K7**：写入前做 best-effort 密钥脱敏；写失败不能静默，必须在可诊断位置暴露。
 - **K8**：vendor schema 不手写，Codex 协议来自官方 `codex app-server generate-json-schema`。
