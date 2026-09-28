@@ -316,6 +316,7 @@ pub(crate) struct Machine {
     pub error: Option<String>,
     /// agentdeckd 自身版本；None 表示仍在查询或未连上，查询失败记为 "unknown"。
     pub daemon_version: Option<String>,
+    pub daemon_protocol: Option<u64>,
     pub installing: bool,
     /// 最近一次安装 agentdeckd 的结果：成功为新 daemon 的 `--version`，失败为错误。
     pub install_result: Option<Result<String, String>>,
@@ -332,9 +333,20 @@ impl Machine {
             connecting: false,
             error: None,
             daemon_version: None,
+            daemon_protocol: None,
             installing: false,
             install_result: None,
         }
+    }
+
+    pub fn has_error(&self) -> bool {
+        self.error.is_some() || self.agents.iter().any(|agent| agent.error().is_some())
+    }
+
+    pub fn can_update_agents(&self) -> bool {
+        !self.connecting
+            && !self.installing
+            && self.daemon_protocol == Some(u64::from(agentdeck_protocol::PROTOCOL_VERSION))
     }
 
     /// 远端 login PATH 与 `~/.local/bin` 里都找不到 agentdeckd。
@@ -695,11 +707,16 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             let version = cx
                 .background_executor()
-                .spawn(async move { client.daemon_version() })
+                .spawn(async move { client.daemon_info() })
                 .await;
             this.update(cx, |shell, cx| {
                 if let Some(machine) = shell.machine_mut(id) {
-                    machine.daemon_version = Some(version.unwrap_or_else(|_| "unknown".into()));
+                    let (version, protocol) = match version {
+                        Ok((version, protocol)) => (version, Some(protocol)),
+                        Err(_) => ("unknown".into(), None),
+                    };
+                    machine.daemon_version = Some(version);
+                    machine.daemon_protocol = protocol;
                     cx.notify();
                 }
             })
@@ -716,7 +733,7 @@ impl Shell {
         let Some(host) = machine.host.clone() else {
             return;
         };
-        if machine.installing {
+        if machine.installing || machine.agents.iter().any(|agent| agent.updating) {
             return;
         }
         machine.installing = true;
@@ -738,6 +755,7 @@ impl Shell {
                     machine.client.reset();
                     machine.error = None;
                     machine.daemon_version = None;
+                    machine.daemon_protocol = None;
                     shell.load_machine(id, cx);
                 }
                 cx.notify();
@@ -774,6 +792,9 @@ impl Shell {
         let Some(machine) = self.machine_mut(id) else {
             return;
         };
+        if !machine.can_update_agents() {
+            return;
+        }
         let client = machine.client.clone();
         let Some(agent) = machine.agents.iter_mut().find(|a| a.kind == kind) else {
             return;
@@ -1866,6 +1887,36 @@ mod tests {
         source.complete(&mut Ok((vec![item(None)], vec![])));
         assert!(source.warnings.is_empty());
         assert_eq!(source.loaded, 1);
+    }
+
+    #[test]
+    fn machine_error_includes_source_read_failures() {
+        let mut machine = Machine::new(1, None);
+        machine.agents.push(AgentHistory::new(AgentKind::Codex));
+        assert!(!machine.has_error());
+
+        machine.agents[0].complete(&mut Err("历史读取超时".into()));
+        assert!(machine.has_error());
+        machine.agents[0].complete(&mut Ok((vec![], vec![])));
+        assert!(!machine.has_error());
+
+        machine.error = Some("连接失败".into());
+        assert!(machine.has_error());
+    }
+
+    #[test]
+    fn cli_updates_require_a_ready_daemon_with_the_current_protocol() {
+        let mut machine = Machine::new(1, None);
+        assert!(!machine.can_update_agents());
+        machine.daemon_protocol = Some(5);
+        assert!(!machine.can_update_agents());
+        machine.daemon_protocol = Some(u64::from(agentdeck_protocol::PROTOCOL_VERSION));
+        assert!(machine.can_update_agents());
+        machine.connecting = true;
+        assert!(!machine.can_update_agents());
+        machine.connecting = false;
+        machine.installing = true;
+        assert!(!machine.can_update_agents());
     }
 
     #[test]

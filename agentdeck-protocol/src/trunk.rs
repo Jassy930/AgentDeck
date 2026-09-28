@@ -500,7 +500,7 @@ impl From<HistoryResponse> for HistoryReply {
     }
 }
 
-// ── ClientCommand — all v5 client-to-server commands ────────────────────────
+// ── ClientCommand — all v6 client-to-server commands ────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "command", rename_all = "camelCase", deny_unknown_fields)]

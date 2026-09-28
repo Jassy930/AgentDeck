@@ -1,4 +1,4 @@
-//! The agent-neutral IPC protocol — v5.
+//! The agent-neutral IPC protocol — v6.
 //!
 //! All v1 types (IpcMessage, SessionState, Lifecycle, LegacyAgentItem,
 //! LegacyActionRequest, LegacyActionDecision, HistoryThreadSummary,
@@ -38,9 +38,9 @@ pub use vendor::codex::{CodexSessionOptions, McpOverride};
 pub use vendor::codex::{CodexVendorControl, CodexVendorPanelEvent};
 
 /// 契约产物版本。改动协议形态时手动 +1，并重生成快照。
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
-/// Aggregate JSON Schema for all v5 wire types. Snapshot-tested against
+/// Aggregate JSON Schema for all v6 wire types. Snapshot-tested against
 /// `protocol/agentdeck/agentdeck-protocol.schema.json`.
 pub fn protocol_schema() -> serde_json::Value {
     use schemars::schema_for;

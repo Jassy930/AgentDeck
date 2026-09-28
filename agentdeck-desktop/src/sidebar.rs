@@ -139,8 +139,8 @@ pub fn render(
         Some("正在读取会话…".to_string())
     } else if !shell.sessions.is_empty() {
         Some("没有匹配的会话".to_string())
-    } else if shell.machines.iter().any(|machine| machine.error.is_some()) {
-        Some("连接失败，详情见「机器」页".to_string())
+    } else if shell.machines.iter().any(|machine| machine.has_error()) {
+        Some("读取失败，详情见「机器」页".to_string())
     } else {
         Some("没有可显示的会话".to_string())
     };
@@ -149,7 +149,7 @@ pub fn render(
     let failed = shell
         .machines
         .iter()
-        .filter(|machine| machine.error.is_some())
+        .filter(|machine| machine.has_error())
         .count();
     let machines_tooltip = if shell.machines.iter().any(|machine| machine.connecting) {
         "机器管理 · 连接中…".to_string()

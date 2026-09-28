@@ -39,6 +39,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, Notify, mpsc, watch};
+use tokio::task::JoinSet;
 
 /// Channel depth for the unified ServerEvent stream coming out of all
 /// sessions. 256 is generous: the writer drains it as fast as stdout
@@ -108,6 +109,8 @@ pub struct RuntimeHub {
     /// always requested through the adapter; RuntimeHub never aborts the
     /// handle as a substitute for owner cleanup.
     sessions: Arc<Mutex<HashMap<SessionId, AgentSessionHandle>>>,
+    update_cancel: watch::Sender<bool>,
+    updates: Mutex<JoinSet<()>>,
 }
 
 impl RuntimeHub {
@@ -115,6 +118,8 @@ impl RuntimeHub {
         Self {
             router,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            update_cancel: watch::channel(false).0,
+            updates: Mutex::new(JoinSet::new()),
         }
     }
 
@@ -215,6 +220,9 @@ impl RuntimeHub {
                 }
             }
         }
+
+        self.update_cancel.send_replace(true);
+        while self.updates.lock().await.join_next().await.is_some() {}
 
         // Closing the ordered queue first lets the worker drain every command
         // already read from stdin, then close/reap all retained sessions. If a
@@ -387,15 +395,17 @@ impl RuntimeHub {
                 }
             }
             ClientCommand::AgentUpdate { agent_kind } => {
-                // 更新要跑数分钟，spawn 出去不阻塞 stdin；成功与失败都用同一条回复。
                 let router = Arc::clone(&self.router);
                 let admin_tx = admin_tx.clone();
-                tokio::spawn(async move {
+                let cancel = self.update_cancel.subscribe();
+                let mut updates = self.updates.lock().await;
+                while updates.try_join_next().is_some() {}
+                updates.spawn(async move {
                     let mut reply = serde_json::json!({
                         "reply": "agentUpdate",
                         "agentKind": agent_kind.as_str(),
                     });
-                    match router.update_agent(agent_kind).await {
+                    match router.update_agent(agent_kind, cancel).await {
                         Ok(output) => reply["output"] = output.into(),
                         Err(error) => reply["error"] = serde_json::json!(error),
                     }
@@ -986,6 +996,7 @@ mod tests {
         start_calls: AtomicUsize,
         cancel_calls: AtomicUsize,
         pump: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+        update_dir: Option<std::path::PathBuf>,
     }
 
     struct SpontaneousFailureStub {
@@ -1027,6 +1038,16 @@ mod tests {
     impl Agent for LegacyRecordStub {
         fn kind(&self) -> AgentKind {
             AgentKind::Codex
+        }
+
+        async fn update_command(&self) -> Result<tokio::process::Command, ProtocolError> {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.args([
+                "-c",
+                "(echo ready > ready; sleep 0.3; echo survived > survived) & wait",
+            ]);
+            command.current_dir(self.update_dir.as_ref().expect("update fixture directory"));
+            Ok(command)
         }
 
         fn capabilities(&self) -> SessionCapabilities {
@@ -1439,6 +1460,72 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(first_line).expect("reply JSON");
         assert_eq!(parsed["reply"], "ping");
         assert_eq!(parsed["ok"], true);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connection_close_reaps_updater_and_its_children() {
+        for fail_writer in [false, true] {
+            let dir = std::env::temp_dir().join(format!("update-close-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&dir).unwrap();
+            let mut router = AgentRouter::new();
+            router.register(Arc::new(LegacyRecordStub {
+                update_dir: Some(dir.clone()),
+                ..Default::default()
+            }));
+            let hub = RuntimeHub::new(Arc::new(router));
+            let (mut client, stdin) = duplex(4096);
+            let (stdout, mut output) = duplex(4096);
+            let task = if fail_writer {
+                tokio::spawn(hub.run(
+                    stdin,
+                    FailingWriter {
+                        write_failure: Arc::new(Notify::new()),
+                    },
+                ))
+            } else {
+                tokio::spawn(hub.run(stdin, stdout))
+            };
+            write_command(
+                &mut client,
+                &ClientCommand::AgentUpdate {
+                    agent_kind: AgentKind::Codex,
+                },
+            )
+            .await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !dir.join("ready").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("fake updater child must start");
+            if fail_writer {
+                write_command(&mut client, &ClientCommand::Ping).await;
+            } else {
+                client.shutdown().await.unwrap();
+            }
+            let result = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("updater cleanup must finish before desktop kills the daemon")
+                .unwrap();
+            if fail_writer {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+            } else {
+                result.unwrap();
+                let mut reply = String::new();
+                tokio::io::AsyncReadExt::read_to_string(&mut output, &mut reply)
+                    .await
+                    .unwrap();
+                assert!(reply.contains("已终止"), "{reply}");
+            }
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            assert!(
+                !dir.join("survived").exists(),
+                "an updater child survived disconnect"
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[tokio::test]

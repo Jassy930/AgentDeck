@@ -141,7 +141,7 @@ pub const DAEMON_MISSING: &str = "agentdeckd-missing";
 /// 另补上一键安装的目录 `~/.local/bin`，它不一定在 login PATH 里。
 fn remote_args(host: &str) -> Vec<String> {
     let launch = format!(
-        "bash -lc 'PATH=\"$PATH:$HOME/.local/bin\"; command -v agentdeckd >/dev/null || {{ echo {DAEMON_MISSING} >&2; exit 127; }}; exec agentdeckd'"
+        "bash -lc 'PATH=\"$HOME/.local/bin:$PATH\"; command -v agentdeckd >/dev/null || {{ echo {DAEMON_MISSING} >&2; exit 127; }}; exec agentdeckd'"
     );
     SSH_OPTIONS
         .iter()
@@ -493,15 +493,24 @@ impl Client {
     ) -> Result<serde_json::Value> {
         retry_transport(|| {
             let connection = self.connection()?;
-            let reply = connection.request(command, expected_reply);
-            if let Err(error) = &reply {
-                connection.close(error.kind(), &error.to_string());
-                if self.inner.state.lock().unwrap().disconnected {
-                    return Err(io::Error::other("机器连接已断开"));
-                }
-            }
-            reply
+            self.request_once(&connection, command, expected_reply)
         })
+    }
+
+    fn request_once(
+        &self,
+        connection: &Connection,
+        command: &ClientCommand,
+        expected_reply: &str,
+    ) -> Reply {
+        let reply = connection.request(command, expected_reply);
+        if let Err(error) = &reply {
+            connection.close(error.kind(), &error.to_string());
+            if self.inner.state.lock().unwrap().disconnected {
+                return Err(io::Error::other("机器连接已断开"));
+            }
+        }
+        reply
     }
 }
 
@@ -562,18 +571,41 @@ impl Client {
             .ok_or_else(|| "agentCapabilities 回复缺少 agentVersion".to_string())
     }
 
-    /// daemon 自身版本；旧 daemon 的 selfcheck 没有 version 字段，按拿不到处理。
-    pub fn daemon_version(&self) -> Result<String> {
+    /// 旧 daemon 没有自身版本字段，但 selfcheck 仍提供协议版本。
+    pub fn daemon_info(&self) -> Result<(String, u64)> {
         let reply = self.round_trip(&ClientCommand::Selfcheck, "selfcheck")?;
-        reply["version"]
-            .as_str()
-            .map(str::to_owned)
-            .ok_or_else(|| "selfcheck 回复缺少 version".to_string())
+        let protocol = reply["protocolVersion"]
+            .as_u64()
+            .ok_or_else(|| "selfcheck 回复缺少 protocolVersion".to_string())?;
+        Ok((
+            reply["version"].as_str().unwrap_or("unknown").into(),
+            protocol,
+        ))
     }
 
     /// 用 CLI 自带的更新命令升级该机器上的 agent，返回命令输出。
     pub fn agent_update(&self, agent_kind: AgentKind) -> Result<String> {
-        let reply = self.round_trip(&ClientCommand::AgentUpdate { agent_kind }, "agentUpdate")?;
+        // 重连可能换成旧 daemon；必须在执行更新的同一连接上确认协议，且写操作不重放。
+        let connection = self.connection().map_err(|error| error.to_string())?;
+        let protocol = self
+            .request_once(
+                &connection,
+                &ClientCommand::ProtocolVersion,
+                "protocolVersion",
+            )
+            .map_err(|error| error.to_string())??;
+        if protocol["protocolVersion"].as_u64()
+            != Some(u64::from(agentdeck_protocol::PROTOCOL_VERSION))
+        {
+            return Err("daemon 协议不支持 CLI 更新，请先更新或重装 agentdeckd".into());
+        }
+        let reply = self
+            .request_once(
+                &connection,
+                &ClientCommand::AgentUpdate { agent_kind },
+                "agentUpdate",
+            )
+            .map_err(|error| error.to_string())??;
         Ok(reply["output"].as_str().unwrap_or_default().to_string())
     }
 
@@ -773,6 +805,38 @@ mod tests {
         assert!(launch.contains("$HOME/.local/bin") && launch.contains(super::DAEMON_MISSING));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn remote_prefers_the_daemon_installed_in_local_bin() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(next_history_request_id());
+        let old = root.join("old-bin");
+        let installed = root.join(".local/bin");
+        for (dir, version) in [(&old, "old"), (&installed, "installed")] {
+            std::fs::create_dir_all(dir).unwrap();
+            let path = dir.join("agentdeckd");
+            std::fs::write(&path, format!("#!/bin/sh\necho {version}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let args = super::remote_args("dt");
+        let script = args
+            .last()
+            .unwrap()
+            .strip_prefix("bash -lc '")
+            .unwrap()
+            .strip_suffix('\'')
+            .unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .env("HOME", &root)
+            .env("PATH", &old)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "installed");
+    }
+
     #[test]
     fn hosts_that_could_be_parsed_as_options_are_rejected() {
         for bad in ["", "-oProxyCommand=x", "dt extra", "a\tb"] {
@@ -954,6 +1018,45 @@ mod tests {
             let (kind, version) = handle.join().unwrap();
             assert_eq!(version, format!("{} 1.0", kind.as_str()));
         }
+    }
+
+    #[test]
+    fn agent_update_rejects_old_protocol_without_sending_the_update() {
+        let connection = fake_daemon(
+            r#"while read -r line; do
+              case "$line" in
+                *protocolVersion*) echo '{"reply":"protocolVersion","protocolVersion":5}' ;;
+                *agentUpdate*) echo '{"reply":"agentUpdate","agentKind":"codex","output":"unexpected update"}' ;;
+                *agentList*) echo '{"reply":"agentList","agents":[]}' ;;
+              esac
+            done"#,
+        );
+        let client = fake_client(&connection);
+        assert!(
+            client
+                .agent_update(super::AgentKind::Codex)
+                .unwrap_err()
+                .contains("请先更新或重装")
+        );
+        assert!(client.agent_list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_update_does_not_retry_a_lost_reply() {
+        let connection = fake_daemon(&format!(
+            r#"while read -r line; do
+              case "$line" in
+                *protocolVersion*) echo '{{"reply":"protocolVersion","protocolVersion":{}}}' ;;
+                *agentUpdate*) echo update-connection-lost >&2; exit 1 ;;
+              esac
+            done"#,
+            agentdeck_protocol::PROTOCOL_VERSION,
+        ));
+        let client = fake_client(&connection);
+        let error = client.agent_update(super::AgentKind::Codex).unwrap_err();
+        // fake_client 的重连地址无效；若重试，这里会变成主机校验错误。
+        assert!(error.contains("update-connection-lost"), "{error}");
+        assert!(!connection.is_alive());
     }
 
     #[test]

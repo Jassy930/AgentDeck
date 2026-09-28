@@ -219,7 +219,9 @@ fn machine_card(
                     } else {
                         label_text
                     })
-                    .disabled(machine.installing)
+                    .disabled(
+                        machine.installing || machine.agents.iter().any(|agent| agent.updating),
+                    )
                     .tooltip(format!(
                         "下载与桌面端同版本的预编译 agentdeckd v{}，装到该机器的 ~/.local/bin",
                         remotes::DAEMON_VERSION
@@ -303,6 +305,11 @@ fn daemon_install_offer(machine: &Machine) -> (Option<&'static str>, bool) {
     }
     if machine.daemon_missing() {
         return (Some("安装"), false);
+    }
+    if machine.daemon_version.is_some()
+        && machine.daemon_protocol != Some(u64::from(agentdeck_protocol::PROTOCOL_VERSION))
+    {
+        return (Some("重装 agentdeckd"), false);
     }
     match machine.daemon_version.as_deref().map(versions::extract) {
         Some(Some(version)) => {
@@ -434,9 +441,15 @@ fn agent_row(
                 } else {
                     "更新"
                 })
-                .disabled(updating)
+                .disabled(updating || !machine.can_update_agents())
                 .when(armed, |button| button.text_color(cx.theme().success))
-                .tooltip(if armed {
+                .tooltip(if !machine.can_update_agents() {
+                    if machine.daemon_version.is_none() {
+                        "正在确认 daemon 协议".to_string()
+                    } else {
+                        "请先更新或重装 agentdeckd，再更新 CLI".to_string()
+                    }
+                } else if armed {
                     "再点一次确认更新".to_string()
                 } else {
                     format!("在该机器上运行 {} 自带的更新命令", agent_label(kind))
