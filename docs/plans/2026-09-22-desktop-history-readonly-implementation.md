@@ -480,3 +480,27 @@ macOS 进程组存在性查询在组仅剩僵尸进程时可能返回 `EPERM`；
 - 验证：router `update_agent` 成功 / 失败用例，ssh config 解析用例，desktop 48 项测试；
   用假 `claude` 脚本走 daemon JSONL 端到端验证更新成功（输出与新版本）和失败（带 stderr）；
   实窗截图确认快速添加 grid、各 agent 版本与更新按钮布局，截图后已还原临时改动。未在真实机器上点击更新。
+
+## 2026-09-28：快速添加样式、最新版本提示与 agentdeckd 安装
+
+- 快速添加：主机改为虚线边框芯片（`+` 图标、主机名省略、hover 高亮、tooltip「连接 {host}」），4 列 grid。
+  主机名文字节点必须 `flex_1`，否则在 flex 行里被压到零宽只剩省略号。
+- 最新版本：首次打开机器页时在本机 `curl` 查 npm registry（`@openai/codex`、`@anthropic-ai/claude-code`）
+  的 `latest`，与各机器安装版本比较，显示「已是最新」或「可更新到 vX」；安装版本更新（预览通道）时不下结论，
+  查询失败显示「无法获取最新版本」。selfcheck 路径不联网。版本比较手写（数字核心 + 预发布更旧），
+  预发布之间只按字符串比。
+- agentdeckd 版本：selfcheck 回复新增 `version`（`CARGO_PKG_VERSION`），机器卡片头部显示；
+  旧 daemon 没有该字段时显示「拿不到版本号」，并提供「重装 agentdeckd」。
+- 缺失检测：远端启动命令补 `~/.local/bin` 到 PATH，找不到时自己往 stderr 写 `agentdeckd-missing` 并退出 127，
+  不依赖 shell 的本地化报错。
+- 安装：`uname -sm` → musl 目标三元组，本机 `curl -fsSL` 下载
+  `releases/download/v<桌面端版本>/agentdeckd-<target>.tar.gz`（钉桌面端版本，保证协议一致，也免 GitHub API 限流），
+  经 ssh stdin 解到远端临时文件，试运行 `--version` 成功才 `mv -f` 替换（避开 ETXTBSY、拦住架构不对），
+  trap 清理临时文件；成功后 `Client::reset` 关掉旧连接（允许重连）并重新读取。
+  发布流程 `.github/workflows/release.yml`：推 `v*` tag 时构建 x86_64 / aarch64 linux musl 并上传到同名 Release。
+- 验证：desktop 50 项测试（新增版本比较、uname 映射用例）、agentdeckd 177 项、selfcheck、`--verify`；
+  dt 上 `rustup target add x86_64-unknown-linux-musl` 后直接构建出 static-pie 二进制（无需 musl-tools）；
+  临时 ignored 测试走真实代码：移走 dt 的 daemon → 连接报 `agentdeckd-missing` → 用
+  `AGENTDECK_RELEASE_URL=file://` 安装 → 重连成功、版本 0.1.0；不设覆盖时得到 404 的明确报错且原二进制完好。
+  实窗截图确认芯片、版本提示、agentdeckd 版本与「未安装」状态，截图后已还原临时改动。
+- 未完成：仓库还没有任何 GitHub Release，真实下载路径未验证；需要推送 workflow 并打 `v0.1.0` tag 后才能用。

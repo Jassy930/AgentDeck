@@ -111,12 +111,20 @@ macOS 启动 daemon 前会在子进程恢复信号接收，避免继承 GPUI 后
 `AGENTDECK_DATA_DIR` 优先覆盖目录。要求：
 
 - 本机能免密 `ssh <host>`（使用 `BatchMode=yes`，不会弹密码提示）；
-- 远端 `bash -lc` 的 PATH 中有 `agentdeckd`、`codex`、`claude`；
+- 远端 `bash -lc` 的 PATH 中有 `codex`、`claude`；`agentdeckd` 在 PATH 或 `~/.local/bin` 中均可；
 - 每台机器一条常驻连接（本机一个 `agentdeckd` 子进程，远端一条 ssh 会话），所有请求复用，
   history 按 requestId 并发；`ServerAliveInterval=15` 让对端休眠/断网后约 45 秒内断开，
   下次请求自动重连（`ControlMaster` `~/.ssh/agentdeck-%C` 让重连免去完整握手）。
 
-远端安装（以 Linux 工作站 `dt` 为例）：
+一键安装：远端找不到 `agentdeckd` 时，机器页卡片显示「未安装 agentdeckd」和「安装」按钮；
+版本旧于桌面端时显示「更新 agentdeckd」。桌面端先 `ssh <host> uname -sm` 选目标（Linux x86_64 /
+aarch64），在本机 `curl` 下载与桌面端同版本的 GitHub Release 资产
+`agentdeckd-<target>.tar.gz`（`v<版本>` tag，由 `.github/workflows/release.yml` 构建 musl 静态二进制），
+经 ssh stdin 写入远端 `~/.local/bin/agentdeckd`，试运行成功后才替换并重连。
+`AGENTDECK_RELEASE_URL` 可把下载前缀改成别的地址（如 `file:///tmp/agentdeck-release`）用于测试。
+还没发布对应 Release 时，安装会报「GitHub 上可能还没有发布 … 二进制」。
+
+手动从源码安装（以 Linux 工作站 `dt` 为例）：
 
 ```bash
 rsync -az --exclude target --exclude .git ./ dt:AgentDeck/

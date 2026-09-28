@@ -27,6 +27,7 @@ use crate::machines;
 use crate::remotes;
 use crate::sidebar;
 use crate::transcript;
+use crate::versions;
 
 /// 首屏和每次扩展的显示条数；多读一条用于判断是否还有会话。
 const SIDEBAR_LIMIT: usize = 50;
@@ -313,6 +314,35 @@ pub(crate) struct Machine {
     pub connecting: bool,
     /// AgentList 的失败原因；各来源历史的错误由 AgentHistory 保留。
     pub error: Option<String>,
+    /// agentdeckd 自身版本；None 表示仍在查询或未连上，查询失败记为 "unknown"。
+    pub daemon_version: Option<String>,
+    pub installing: bool,
+    /// 最近一次安装 agentdeckd 的结果：成功为新 daemon 的 `--version`，失败为错误。
+    pub install_result: Option<Result<String, String>>,
+}
+
+impl Machine {
+    fn new(id: u64, host: Host) -> Self {
+        let client = daemon::Client::new(host_str(&host));
+        Self {
+            id,
+            host,
+            client,
+            agents: Vec::new(),
+            connecting: false,
+            error: None,
+            daemon_version: None,
+            installing: false,
+            install_result: None,
+        }
+    }
+
+    /// 远端 login PATH 与 `~/.local/bin` 里都找不到 agentdeckd。
+    pub fn daemon_missing(&self) -> bool {
+        self.error
+            .as_deref()
+            .is_some_and(|error| error.contains(daemon::DAEMON_MISSING))
+    }
 }
 
 fn empty_hint(machines: &[Machine], pending: usize, filtered_empty: bool) -> String {
@@ -495,6 +525,9 @@ pub struct Shell {
     pub(crate) remote_error: Option<String>,
     /// ssh config 里的 Host 别名，进入机器页时重读。
     pub(crate) ssh_hosts: Vec<String>,
+    /// npm 上各 agent CLI 的最新版本，按返回顺序追加。
+    latest: Vec<(AgentKind, Result<String, String>)>,
+    latest_requested: bool,
 }
 
 impl Shell {
@@ -544,6 +577,8 @@ impl Shell {
             remote_input,
             remote_error: None,
             ssh_hosts: Vec::new(),
+            latest: Vec::new(),
+            latest_requested: false,
         };
         if connect_daemon {
             shell.add_machine(None, cx);
@@ -577,15 +612,7 @@ impl Shell {
     fn add_machine(&mut self, host: Host, cx: &mut Context<Self>) {
         self.next_machine_id += 1;
         let id = self.next_machine_id;
-        let client = daemon::Client::new(host_str(&host));
-        self.machines.push(Machine {
-            id,
-            host,
-            client,
-            agents: Vec::new(),
-            connecting: false,
-            error: None,
-        });
+        self.machines.push(Machine::new(id, host));
         self.load_machine(id, cx);
     }
 
@@ -618,6 +645,7 @@ impl Shell {
                             shell.load_agent_sessions(id, kind, cx);
                             shell.load_agent_version(id, kind, cx);
                         }
+                        shell.load_daemon_version(id, cx);
                     }
                     Err(message) => machine.error = Some(message),
                 }
@@ -647,6 +675,66 @@ impl Shell {
                     agent.version = Some(version.unwrap_or_else(|_| "unknown".into()));
                     cx.notify();
                 }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn load_daemon_version(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(machine) = self.machine(id) else {
+            return;
+        };
+        let client = machine.client.clone();
+        cx.spawn(async move |this, cx| {
+            let version = cx
+                .background_executor()
+                .spawn(async move { client.daemon_version() })
+                .await;
+            this.update(cx, |shell, cx| {
+                if let Some(machine) = shell.machine_mut(id) {
+                    machine.daemon_version = Some(version.unwrap_or_else(|_| "unknown".into()));
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 装上与桌面端同版本的预编译 agentdeckd，成功后断开旧连接重新读取。
+    pub fn install_daemon(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(machine) = self.machine_mut(id) else {
+            return;
+        };
+        let Some(host) = machine.host.clone() else {
+            return;
+        };
+        if machine.installing {
+            return;
+        }
+        machine.installing = true;
+        machine.install_result = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { remotes::install_daemon(&host) })
+                .await;
+            this.update(cx, |shell, cx| {
+                let Some(machine) = shell.machine_mut(id) else {
+                    return;
+                };
+                machine.installing = false;
+                let ok = result.is_ok();
+                machine.install_result = Some(result);
+                if ok {
+                    machine.client.reset();
+                    machine.error = None;
+                    machine.daemon_version = None;
+                    shell.load_machine(id, cx);
+                }
+                cx.notify();
             })
             .ok();
         })
@@ -760,9 +848,38 @@ impl Shell {
         self.reads.clear_pending();
         self.remote_error = None;
         self.ssh_hosts = remotes::ssh_config_hosts();
+        self.load_latest_versions(cx);
         self.remote_input
             .update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
+    }
+
+    /// 各 agent CLI 在 npm 上的最新版本；首次打开机器页时查一次，selfcheck 路径不联网。
+    fn load_latest_versions(&mut self, cx: &mut Context<Self>) {
+        if std::mem::replace(&mut self.latest_requested, true) {
+            return;
+        }
+        for kind in [AgentKind::Codex, AgentKind::ClaudeCode] {
+            cx.spawn(async move |this, cx| {
+                let latest = cx
+                    .background_executor()
+                    .spawn(async move { versions::fetch_latest(kind) })
+                    .await;
+                this.update(cx, |shell, cx| {
+                    shell.latest.push((kind, latest));
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
+    pub fn latest_version(&self, kind: AgentKind) -> Option<&Result<String, String>> {
+        self.latest
+            .iter()
+            .find(|(k, _)| *k == kind)
+            .map(|(_, latest)| latest)
     }
 
     fn save_remotes(&mut self) {
@@ -1745,15 +1862,11 @@ mod tests {
     #[test]
     fn empty_hint_does_not_offer_selection_after_failure_and_zero_results() {
         let mut machines = vec![Machine {
-            id: 1,
-            host: None,
-            client: daemon::Client::new(None),
             agents: vec![
                 AgentHistory::new(AgentKind::Codex),
                 AgentHistory::new(AgentKind::ClaudeCode),
             ],
-            connecting: false,
-            error: None,
+            ..Machine::new(1, None)
         }];
         let agents = &mut machines[0].agents;
         agents[0].complete(&mut Err("历史读取超时".into()));
@@ -1764,12 +1877,8 @@ mod tests {
 
         // 远端连不上时说明是哪台机器；本机有会话后照常提示选择。
         machines.push(Machine {
-            id: 2,
-            host: Some("dt".into()),
-            client: daemon::Client::new(Some("dt")),
-            agents: Vec::new(),
-            connecting: false,
             error: Some("Permission denied".into()),
+            ..Machine::new(2, Some("dt".into()))
         });
         assert_eq!(empty_hint(&machines, 0, false), "dt：Permission denied");
 

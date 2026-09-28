@@ -296,6 +296,7 @@ impl RuntimeHub {
                 let reply = serde_json::json!({
                     "reply": "selfcheck",
                     "ok": true,
+                    "version": env!("CARGO_PKG_VERSION"),
                     "protocolVersion": PROTOCOL_VERSION,
                     "agents": agents,
                 });
@@ -2798,6 +2799,7 @@ mod tests {
         assert_eq!(parsed["reply"], "selfcheck");
         assert_eq!(parsed["ok"], true);
         assert_eq!(parsed["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(parsed["version"], env!("CARGO_PKG_VERSION"));
         assert!(parsed["agents"].is_array());
     }
 }

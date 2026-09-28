@@ -6,6 +6,7 @@ mod sidebar;
 mod theme;
 mod theme_tokens;
 mod transcript;
+mod versions;
 
 use std::borrow::Cow;
 use std::env;
@@ -24,18 +25,20 @@ actions!(agentdeck, [Quit]);
 struct Assets;
 
 pub const SERVER_ICON: &str = "icons/server.svg";
+pub const PLUS_ICON: &str = "icons/plus.svg";
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
-        Ok(
-            (path == SERVER_ICON).then_some(Cow::Borrowed(include_bytes!(
-                "../../assets/icons/server.svg"
-            ))),
-        )
+        let bytes: &'static [u8] = match path {
+            SERVER_ICON => include_bytes!("../../assets/icons/server.svg"),
+            PLUS_ICON => include_bytes!("../../assets/icons/plus.svg"),
+            _ => return Ok(None),
+        };
+        Ok(Some(Cow::Borrowed(bytes)))
     }
 
     fn list(&self, _path: &str) -> gpui::Result<Vec<SharedString>> {
-        Ok(vec![SERVER_ICON.into()])
+        Ok(vec![SERVER_ICON.into(), PLUS_ICON.into()])
     }
 }
 

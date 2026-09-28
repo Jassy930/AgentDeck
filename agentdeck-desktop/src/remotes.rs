@@ -3,6 +3,7 @@
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use crate::daemon;
 
@@ -114,6 +115,81 @@ fn save_to(path: &Path, hosts: &[&str]) -> Result<(), String> {
     std::fs::write(path, text).map_err(|source| format!("保存 {} 失败：{source}", path.display()))
 }
 
+/// 预编译 agentdeckd 的下载地址前缀；默认是与桌面端同版本的 GitHub Release，
+/// 保证装上去的 daemon 与桌面端协议一致。测试可指向 `file://` 目录。
+const RELEASE_URL_ENV: &str = "AGENTDECK_RELEASE_URL";
+
+/// 桌面端配套的 agentdeckd 版本。
+pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// `uname -sm` → Release 资产的目标三元组。
+fn release_target(uname: &str) -> Result<&'static str, String> {
+    match uname.split_whitespace().collect::<Vec<_>>()[..] {
+        ["Linux", "x86_64"] => Ok("x86_64-unknown-linux-musl"),
+        ["Linux", "aarch64" | "arm64"] => Ok("aarch64-unknown-linux-musl"),
+        _ => Err(format!("没有适用于 {uname} 的预编译 agentdeckd")),
+    }
+}
+
+fn ssh(host: &str) -> Command {
+    let mut command = Command::new("ssh");
+    command.args(daemon::SSH_OPTIONS).args(["--", host]);
+    command
+}
+
+/// 把与桌面端同版本的预编译 agentdeckd 装到远端 `~/.local/bin`：本机 curl 下载，
+/// 经 ssh stdin 传过去。先写临时文件并试运行，确认能执行（架构对）才替换，
+/// 也避开覆盖正在运行的可执行文件（ETXTBSY）。阻塞调用，返回新 daemon 的 `--version`。
+pub fn install_daemon(host: &str) -> Result<String, String> {
+    daemon::validate_host(host)?;
+    let uname = ssh(host)
+        .arg("uname -sm")
+        .output()
+        .map_err(|error| format!("运行 ssh 失败：{error}"))?;
+    if !uname.status.success() {
+        return Err(String::from_utf8_lossy(&uname.stderr).trim().to_string());
+    }
+    let target = release_target(String::from_utf8_lossy(&uname.stdout).trim())?;
+    let base = std::env::var(RELEASE_URL_ENV).unwrap_or_else(|_| {
+        format!("https://github.com/Jassy930/AgentDeck/releases/download/v{DAEMON_VERSION}")
+    });
+    let url = format!("{base}/agentdeckd-{target}.tar.gz");
+
+    // -L 必需：GitHub 的资产下载会 302 到对象存储。
+    let mut curl = Command::new("curl")
+        .args(["-fsSL", "--max-time", "300", &url])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("运行 curl 失败：{error}"))?;
+    let body = curl.stdout.take().expect("curl stdout piped");
+    let script = r#"sh -c 'set -e; d="$HOME/.local/bin"; t="$d/.agentdeckd.tmp"; trap "rm -f \"$t\"" EXIT; mkdir -p "$d"; tar -xzO agentdeckd > "$t"; chmod 755 "$t"; "$t" --version >/dev/null; mv -f "$t" "$d/agentdeckd"; "$d/agentdeckd" --version'"#;
+    let installed = ssh(host)
+        .arg(script)
+        .stdin(body)
+        .output()
+        .map_err(|error| format!("运行 ssh 失败：{error}"))?;
+    let fetched = curl
+        .wait_with_output()
+        .map_err(|error| format!("等待 curl 失败：{error}"))?;
+    // 远端先失败时 curl 会写管道失败（23）或被 SIGPIPE 杀掉，那不是下载问题。
+    if !fetched.status.success() && !matches!(fetched.status.code(), Some(23) | None) {
+        return Err(format!(
+            "下载 agentdeckd v{DAEMON_VERSION} 失败，GitHub 上可能还没有发布 {target} 二进制（{url}：{}）",
+            String::from_utf8_lossy(&fetched.stderr).trim()
+        ));
+    }
+    if !installed.status.success() {
+        return Err(format!(
+            "远端安装失败：{}",
+            String::from_utf8_lossy(&installed.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&installed.stdout)
+        .trim()
+        .to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +252,18 @@ mod tests {
         std::fs::write(&path, "dt\n\n-oProxyCommand=x\ndt\n  lab  \n").unwrap();
         assert_eq!(super::load_from(&path), ["dt", "lab"]);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn release_target_maps_uname() {
+        assert_eq!(
+            release_target("Linux x86_64"),
+            Ok("x86_64-unknown-linux-musl")
+        );
+        assert_eq!(
+            release_target("Linux aarch64"),
+            Ok("aarch64-unknown-linux-musl")
+        );
+        assert!(release_target("Darwin arm64").is_err());
     }
 }

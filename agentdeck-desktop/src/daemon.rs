@@ -116,30 +116,38 @@ impl Drop for DaemonChild {
     }
 }
 
-/// 远端走 login shell：非交互 ssh 的 PATH 通常不含 `codex` / `claude` / `agentdeckd`。
 /// ControlMaster 让断线重连免去完整握手；ServerAlive 让对端休眠/断网时 ssh
 /// 约 45 秒内退出，读线程据此让等待者失败，而不是永远挂起。
+pub(crate) const SSH_OPTIONS: [&str; 13] = [
+    "-T",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ControlMaster=auto",
+    "-o",
+    "ControlPath=~/.ssh/agentdeck-%C",
+    "-o",
+    "ControlPersist=60",
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=3",
+];
+
+/// 远端找不到 agentdeckd 时写到 stderr 的标记；自己输出而不是匹配 shell 的本地化报错。
+pub const DAEMON_MISSING: &str = "agentdeckd-missing";
+
+/// 远端走 login shell：非交互 ssh 的 PATH 通常不含 `codex` / `claude` / `agentdeckd`；
+/// 另补上一键安装的目录 `~/.local/bin`，它不一定在 login PATH 里。
 fn remote_args(host: &str) -> Vec<String> {
-    [
-        "-T",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ControlMaster=auto",
-        "-o",
-        "ControlPath=~/.ssh/agentdeck-%C",
-        "-o",
-        "ControlPersist=60",
-        "-o",
-        "ServerAliveInterval=15",
-        "-o",
-        "ServerAliveCountMax=3",
-        "--",
-        host,
-        "bash -lc 'exec agentdeckd'",
-    ]
-    .map(String::from)
-    .to_vec()
+    let launch = format!(
+        "bash -lc 'PATH=\"$PATH:$HOME/.local/bin\"; command -v agentdeckd >/dev/null || {{ echo {DAEMON_MISSING} >&2; exit 127; }}; exec agentdeckd'"
+    );
+    SSH_OPTIONS
+        .iter()
+        .map(|s| s.to_string())
+        .chain(["--".into(), host.into(), launch])
+        .collect()
 }
 
 /// 界面输入的主机名是信任边界：只接受 ssh 目标形态，拒绝空白和以 `-` 开头的值。
@@ -470,6 +478,14 @@ impl Client {
         }
     }
 
+    /// 关掉当前连接但允许重连；装完新 daemon 后用，下一次请求会启动新进程。
+    pub fn reset(&self) {
+        let connection = self.inner.state.lock().unwrap().connection.take();
+        if let Some(connection) = connection {
+            connection.close(io::ErrorKind::Other, "正在重新连接");
+        }
+    }
+
     fn round_trip(
         &self,
         command: &ClientCommand,
@@ -544,6 +560,15 @@ impl Client {
             .as_str()
             .map(str::to_owned)
             .ok_or_else(|| "agentCapabilities 回复缺少 agentVersion".to_string())
+    }
+
+    /// daemon 自身版本；旧 daemon 的 selfcheck 没有 version 字段，按拿不到处理。
+    pub fn daemon_version(&self) -> Result<String> {
+        let reply = self.round_trip(&ClientCommand::Selfcheck, "selfcheck")?;
+        reply["version"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| "selfcheck 回复缺少 version".to_string())
     }
 
     /// 用 CLI 自带的更新命令升级该机器上的 agent，返回命令输出。
@@ -742,7 +767,10 @@ mod tests {
         let args = super::remote_args("dt");
         assert_eq!(args[0], "-T");
         assert!(args.contains(&"BatchMode=yes".to_string()));
-        assert_eq!(args[args.len() - 2..], ["dt", "bash -lc 'exec agentdeckd'"]);
+        assert_eq!(args[args.len() - 2], "dt");
+        let launch = &args[args.len() - 1];
+        assert!(launch.starts_with("bash -lc '") && launch.ends_with("exec agentdeckd'"));
+        assert!(launch.contains("$HOME/.local/bin") && launch.contains(super::DAEMON_MISSING));
     }
 
     #[test]

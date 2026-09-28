@@ -4,16 +4,19 @@
 
 use gpui::{Context, IntoElement, ParentElement, SharedString, div, prelude::*, px};
 use gpui_component::{
-    ActiveTheme, Disableable, Sizable, StyledExt,
+    ActiveTheme, Disableable, Icon, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
     input::Input,
+    tooltip::Tooltip,
     v_flex,
 };
 
-use crate::shell::{AgentHistory, Host, Machine, Shell, agent_label, machine_label};
+use crate::remotes;
+use crate::shell::{AgentHistory, Machine, Shell, agent_label, machine_label};
 use crate::sidebar;
-use agentdeck_protocol::AgentKind;
+use crate::versions;
+use std::cmp::Ordering;
 
 /// 内容列宽度上限，宽窗口下保持居中可读。
 const CONTENT_WIDTH: f32 = 720.;
@@ -22,7 +25,7 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement + use<
     let cards: Vec<_> = shell
         .machines
         .iter()
-        .map(|machine| machine_card(machine, shell.agent_filter.as_ref(), cx))
+        .map(|machine| machine_card(shell, machine, cx))
         .collect();
 
     v_flex()
@@ -70,12 +73,44 @@ fn remote_form(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement + use
         .filter(|host| !shell.is_connected(host))
         .map(|host| {
             let target = host.clone();
-            Button::new(SharedString::from(format!("quick-add-{host}")))
-                .outline()
-                .xsmall()
-                .label(host.clone())
+            let tip: SharedString = format!("连接 {host}").into();
+            h_flex()
+                .id(SharedString::from(format!("quick-add-{host}")))
+                .min_w(px(0.))
+                .gap_1p5()
+                .px_2p5()
+                .py_1()
+                .items_center()
+                .rounded_md()
+                .border_1()
+                .border_dashed()
+                .border_color(cx.theme().border)
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .cursor_pointer()
+                .hover(|style| {
+                    style
+                        .bg(cx.theme().accent)
+                        .border_color(cx.theme().ring)
+                        .text_color(cx.theme().foreground)
+                })
+                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
                 .on_click(
                     cx.listener(move |shell, _, _, cx| shell.connect_host(target.clone(), cx)),
+                )
+                .child(
+                    Icon::empty()
+                        .path(crate::PLUS_ICON)
+                        .xsmall()
+                        .flex_shrink_0(),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(host.clone()),
                 )
         })
         .collect();
@@ -97,12 +132,12 @@ fn remote_form(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement + use
             // flex_wrap 在此布局下只按一行算高度，会压到下方卡片；固定列数的 grid 高度可靠。
             form.child(
                 div()
-                    .pt_1()
+                    .pt_2()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child("从 ssh config 快速添加"),
             )
-            .child(div().grid().grid_cols(6).gap_1().children(quick))
+            .child(div().grid().grid_cols(4).gap_2().children(quick))
         })
         .when_some(shell.remote_error.clone(), |form, error| {
             form.child(
@@ -117,19 +152,25 @@ fn remote_form(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement + use
 
 /// 一台机器：状态圆点、名称、状态、重试 / 断开，完整错误，以及各 agent 行。
 fn machine_card(
+    shell: &Shell,
     machine: &Machine,
-    filter: Option<&(Host, AgentKind)>,
     cx: &mut Context<Shell>,
 ) -> impl IntoElement + use<> {
+    let filter = shell.agent_filter.as_ref();
     let id = machine.id;
     let label = machine_label(&machine.host);
-    let (status, dot) = if machine.connecting {
+    let (status, dot) = if machine.installing {
+        ("安装 agentdeckd 中…", cx.theme().muted_foreground)
+    } else if machine.connecting {
         ("连接中…", cx.theme().muted_foreground)
+    } else if machine.daemon_missing() {
+        ("未安装 agentdeckd", cx.theme().danger)
     } else if machine.error.is_some() {
         ("连接失败", cx.theme().danger)
     } else {
         ("已连接", cx.theme().success)
     };
+    let (install, outdated) = daemon_install_offer(machine);
 
     let header = h_flex()
         .gap_2()
@@ -143,13 +184,42 @@ fn machine_card(
                 .child(label.clone()),
         )
         .child(
-            div()
+            h_flex()
                 .flex_1()
+                .gap_2()
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
-                .child(status),
+                .child(status)
+                .when_some(machine.daemon_version.as_deref(), |line, version| {
+                    line.child(format!("· agentdeckd {}", short_version(version)))
+                })
+                .when(outdated, |line| {
+                    line.child(
+                        div()
+                            .text_color(crate::theme_tokens::WARN)
+                            .child(format!("可更新到 v{}", remotes::DAEMON_VERSION)),
+                    )
+                }),
         )
-        .when(machine.error.is_some(), |header| {
+        .when_some(install, |header, label_text| {
+            header.child(
+                Button::new(SharedString::from(format!("install-daemon-{label}")))
+                    .ghost()
+                    .xsmall()
+                    .label(if machine.installing {
+                        "安装中…"
+                    } else {
+                        label_text
+                    })
+                    .disabled(machine.installing)
+                    .tooltip(format!(
+                        "下载与桌面端同版本的预编译 agentdeckd v{}，装到该机器的 ~/.local/bin",
+                        remotes::DAEMON_VERSION
+                    ))
+                    .on_click(cx.listener(move |shell, _, _, cx| shell.install_daemon(id, cx))),
+            )
+        })
+        .when(machine.error.is_some() && !machine.installing, |header| {
             header.child(
                 Button::new(SharedString::from(format!("retry-machine-{label}")))
                     .ghost()
@@ -174,7 +244,8 @@ fn machine_card(
         .map(|agent| {
             let filtered =
                 filter.is_some_and(|(host, kind)| *host == machine.host && *kind == agent.kind);
-            agent_row(machine, agent, filtered, cx)
+            let hint = version_hint(agent, shell.latest_version(agent.kind), cx);
+            agent_row(machine, agent, filtered, hint, cx)
         })
         .collect();
 
@@ -187,6 +258,11 @@ fn machine_card(
         .border_color(cx.theme().border)
         .child(header)
         .when_some(machine.error.clone(), |card, error| {
+            let error = if machine.daemon_missing() {
+                "目标机的 login PATH 与 ~/.local/bin 里都找不到 agentdeckd，可点「安装」装上预编译二进制。".to_string()
+            } else {
+                error
+            };
             card.child(
                 div()
                     .text_xs()
@@ -195,7 +271,38 @@ fn machine_card(
                     .child(error),
             )
         })
+        .when_some(machine.install_result.clone(), |card, result| {
+            let (text, color) = match result {
+                Ok(version) => (format!("安装完成：{version}"), cx.theme().muted_foreground),
+                Err(error) => (format!("安装失败：{error}"), cx.theme().danger),
+            };
+            card.child(
+                div()
+                    .text_xs()
+                    .whitespace_normal()
+                    .text_color(color)
+                    .child(text),
+            )
+        })
         .children(agents)
+}
+
+/// 远端 daemon 缺失、版本拿不到或旧于桌面端时，给出安装按钮文案；第二项表示是否已知过旧。
+fn daemon_install_offer(machine: &Machine) -> (Option<&'static str>, bool) {
+    if machine.host.is_none() || machine.connecting {
+        return (None, false);
+    }
+    if machine.daemon_missing() {
+        return (Some("安装"), false);
+    }
+    match machine.daemon_version.as_deref().map(versions::extract) {
+        Some(Some(version)) => {
+            let outdated = versions::compare(version, remotes::DAEMON_VERSION) == Ordering::Less;
+            (outdated.then_some("更新 agentdeckd"), outdated)
+        }
+        Some(None) => (Some("重装 agentdeckd"), false),
+        None => (None, false),
+    }
 }
 
 /// agent 一行：图标、名称、完整状态、警告与错误；点击只看该机器上该 agent 的会话。
@@ -203,6 +310,7 @@ fn agent_row(
     machine: &Machine,
     agent: &AgentHistory,
     filtered: bool,
+    hint: Option<(String, gpui::Hsla)>,
     cx: &mut Context<Shell>,
 ) -> impl IntoElement + use<> {
     let kind = agent.kind;
@@ -255,6 +363,9 @@ fn agent_row(
                                     .text_color(cx.theme().muted_foreground)
                                     .child(v),
                             )
+                        })
+                        .when_some(hint, |line, (text, color)| {
+                            line.child(div().text_xs().text_color(color).child(text))
                         }),
                 )
                 .child(
@@ -334,9 +445,27 @@ fn short_version(raw: &str) -> String {
     if raw.ends_with("unknown") {
         return "拿不到版本号".into();
     }
-    raw.split_whitespace()
-        .find(|part| part.starts_with(|c: char| c.is_ascii_digit()))
-        .map_or_else(|| raw.into(), |v| format!("v{v}"))
+    versions::extract(raw).map_or_else(|| raw.into(), |v| format!("v{v}"))
+}
+
+/// 与 npm 最新版比较后的提示；安装版本未知或比最新还新（预览通道等）时不下结论。
+fn version_hint(
+    agent: &AgentHistory,
+    latest: Option<&Result<String, String>>,
+    cx: &Context<Shell>,
+) -> Option<(String, gpui::Hsla)> {
+    let installed = versions::extract(agent.version.as_deref()?)?;
+    match latest? {
+        Err(_) => Some(("无法获取最新版本".into(), cx.theme().muted_foreground)),
+        Ok(latest) => match versions::compare(installed, latest) {
+            Ordering::Less => Some((
+                format!("可更新到 v{latest}"),
+                crate::theme_tokens::WARN.into(),
+            )),
+            Ordering::Equal => Some(("已是最新".into(), cx.theme().success)),
+            Ordering::Greater => None,
+        },
+    }
 }
 
 /// 更新命令的输出可能多行，只取最后一行非空内容作摘要。
