@@ -246,7 +246,14 @@ pub fn render(
                 .pt_3()
                 .border_t_1()
                 .border_color(cx.theme().sidebar_border)
-                .children(machines)
+                .child(
+                    v_flex()
+                        .id("machine-list")
+                        .max_h(px(240.))
+                        .overflow_y_scroll()
+                        .gap_1()
+                        .children(machines),
+                )
                 .child(remote_form(shell, cx)),
         )
 }
@@ -327,7 +334,11 @@ fn machine_section(
             agent_row(machine, agent, filtered, cx)
         })
         .collect();
-    v_flex().gap_1().child(header).children(agents)
+    v_flex()
+        .flex_shrink_0()
+        .gap_1()
+        .child(header)
+        .children(agents)
 }
 
 /// 连接远端：折叠时是一个按钮，展开后是 ssh 主机输入框（回车或点"连接"）。

@@ -13,7 +13,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use agentdeck_protocol::{
@@ -222,14 +222,28 @@ type Pending = Mutex<HashMap<String, VecDeque<mpsc::Sender<Reply>>>>;
 /// 一台机器一条常驻连接：一个 `agentdeckd`（远端即一条 ssh 会话）服务该机器的
 /// 全部请求。读线程只持有 stdout 与等待表，不持有 `Connection`，丢弃连接即回收进程。
 struct Connection {
-    stdin: Mutex<ChildStdin>,
+    stdin: Mutex<Option<ChildStdin>>,
     pending: Arc<Pending>,
     alive: Arc<AtomicBool>,
-    child: Option<DaemonChild>,
+    child: Mutex<Option<DaemonChild>>,
 }
 
-static POOL: LazyLock<Mutex<HashMap<Option<String>, Arc<Connection>>>> =
-    LazyLock::new(Default::default);
+/// 一次机器连接的身份；后台任务持有它，避免移除后排队的请求重新连接同名机器。
+#[derive(Clone)]
+pub struct Client {
+    inner: Arc<ClientInner>,
+}
+
+struct ClientInner {
+    host: Option<String>,
+    state: Mutex<ClientState>,
+}
+
+#[derive(Default)]
+struct ClientState {
+    disconnected: bool,
+    connection: Option<Arc<Connection>>,
+}
 
 impl Connection {
     fn spawn(mut command: Command) -> io::Result<Arc<Self>> {
@@ -255,15 +269,31 @@ impl Connection {
             std::thread::spawn(move || read_replies(stdout, stderr, &pending, &alive));
         }
         Ok(Arc::new(Self {
-            stdin: Mutex::new(stdin),
+            stdin: Mutex::new(Some(stdin)),
             pending,
             alive,
-            child: Some(child),
+            child: Mutex::new(Some(child)),
         }))
     }
 
     fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
+    }
+
+    fn close(&self, kind: io::ErrorKind, message: &str) {
+        {
+            let mut pending = self.pending.lock().unwrap();
+            self.alive.store(false, Ordering::Release);
+            for waiter in pending.drain().flat_map(|(_, waiters)| waiters) {
+                let _ = waiter.send(Err(io::Error::new(kind, message.to_string())));
+            }
+        }
+        self.stdin.lock().unwrap().take();
+        if let Some(mut child) = self.child.lock().unwrap().take() {
+            std::thread::spawn(move || {
+                let _ = child.finish(Duration::from_secs(2));
+            });
+        }
     }
 
     fn request(&self, command: &ClientCommand, expected_reply: &str) -> Reply {
@@ -296,8 +326,11 @@ impl Connection {
             }
             pending.entry(key).or_default().push_back(tx);
         }
-        if let Err(source) = self.stdin.lock().unwrap().write_all(line.as_bytes()) {
-            self.alive.store(false, Ordering::Release);
+        let written = match self.stdin.lock().unwrap().as_mut() {
+            Some(stdin) => stdin.write_all(line.as_bytes()),
+            None => Err(io::Error::other("机器连接已断开")),
+        };
+        if let Err(source) = written {
             return Err(io::Error::new(
                 source.kind(),
                 format!("写入 agentdeckd 失败：{source}"),
@@ -305,16 +338,13 @@ impl Connection {
         }
         match rx.recv_timeout(REQUEST_TIMEOUT) {
             Ok(reply) => reply,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                self.alive.store(false, Ordering::Release);
-                Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "agentdeckd {}s 内未返回 {expected_reply}，已断开连接",
-                        REQUEST_TIMEOUT.as_secs()
-                    ),
-                ))
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "agentdeckd {}s 内未返回 {expected_reply}，已断开连接",
+                    REQUEST_TIMEOUT.as_secs()
+                ),
+            )),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "agentdeckd 连接已断开",
@@ -325,13 +355,7 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        // 字段 stdin 在本函数返回后才关闭，daemon 随即读到 EOF 正常退出；
-        // 回收放到后台线程，断开远端时不阻塞 UI。
-        if let Some(mut child) = self.child.take() {
-            std::thread::spawn(move || {
-                let _ = child.finish(Duration::from_secs(2));
-            });
-        }
+        self.close(io::ErrorKind::Other, "机器连接已断开");
     }
 }
 
@@ -372,11 +396,14 @@ fn read_replies(
         let Some(key) = reply_key(&value) else {
             continue;
         };
-        let waiter = pending
-            .lock()
-            .unwrap()
-            .get_mut(&key)
-            .and_then(VecDeque::pop_front);
+        let waiter = {
+            let mut pending = pending.lock().unwrap();
+            let waiter = pending.get_mut(&key).and_then(VecDeque::pop_front);
+            if pending.get(&key).is_some_and(VecDeque::is_empty) {
+                pending.remove(&key);
+            }
+            waiter
+        };
         if let Some(waiter) = waiter {
             let _ = waiter.send(Ok(reply_result(value)));
         }
@@ -388,33 +415,64 @@ fn read_replies(
     }
 }
 
-/// 取该机器的常驻连接；不存在或已断开时重新建立。
-fn connection(host: Option<&str>) -> io::Result<Arc<Connection>> {
-    let mut pool = POOL.lock().unwrap();
-    let key = host.map(str::to_string);
-    if let Some(connection) = pool.get(&key).filter(|connection| connection.is_alive()) {
-        return Ok(Arc::clone(connection));
+impl Client {
+    pub fn new(host: Option<&str>) -> Self {
+        Self {
+            inner: Arc::new(ClientInner {
+                host: host.map(str::to_string),
+                state: Mutex::default(),
+            }),
+        }
     }
-    let command = build_command(host)
-        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
-    let connection = Connection::spawn(command)?;
-    pool.insert(key, Arc::clone(&connection));
-    Ok(connection)
-}
 
-/// 断开某台机器：进程在后台退出，之后的请求会重新连接。
-pub fn disconnect(host: Option<&str>) {
-    let connection = POOL.lock().unwrap().remove(&host.map(str::to_string));
-    drop(connection);
-}
+    fn connection(&self) -> io::Result<Arc<Connection>> {
+        let mut state = self.inner.state.lock().unwrap();
+        if state.disconnected {
+            return Err(io::Error::other("机器连接已断开"));
+        }
+        if let Some(connection) = state
+            .connection
+            .as_ref()
+            .filter(|connection| connection.is_alive())
+        {
+            return Ok(Arc::clone(connection));
+        }
+        let command = build_command(self.inner.host.as_deref())
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+        let connection = Connection::spawn(command)?;
+        state.connection = Some(Arc::clone(&connection));
+        Ok(connection)
+    }
 
-/// 发一条命令并等待对应的 admin reply；连接断了（如远端休眠后 ssh 退出）重连一次。
-fn round_trip(
-    host: Option<&str>,
-    command: &ClientCommand,
-    expected_reply: &str,
-) -> Result<serde_json::Value> {
-    retry_transport(|| connection(host)?.request(command, expected_reply))
+    /// 显式断开不可自动重连；重新添加同名机器会创建另一个 Client。
+    pub fn disconnect(&self) {
+        let connection = {
+            let mut state = self.inner.state.lock().unwrap();
+            state.disconnected = true;
+            state.connection.take()
+        };
+        if let Some(connection) = connection {
+            connection.close(io::ErrorKind::Other, "机器连接已断开");
+        }
+    }
+
+    fn round_trip(
+        &self,
+        command: &ClientCommand,
+        expected_reply: &str,
+    ) -> Result<serde_json::Value> {
+        retry_transport(|| {
+            let connection = self.connection()?;
+            let reply = connection.request(command, expected_reply);
+            if let Err(error) = &reply {
+                connection.close(error.kind(), &error.to_string());
+                if self.inner.state.lock().unwrap().disconnected {
+                    return Err(io::Error::other("机器连接已断开"));
+                }
+            }
+            reply
+        })
+    }
 }
 
 fn retry_transport(mut read: impl FnMut() -> Reply) -> Result<serde_json::Value> {
@@ -454,62 +512,54 @@ fn drain_stderr(child: &mut Child) -> mpsc::Receiver<String> {
     rx
 }
 
-/// daemon 当前注册的 agent；侧栏据此逐个查询历史，不硬编码 vendor。
-pub fn agent_list(host: Option<&str>) -> Result<Vec<AgentKind>> {
-    let mut reply = round_trip(host, &ClientCommand::AgentList, "agentList")?;
-    let agents = reply["agents"].take();
-    serde_json::from_value(agents).map_err(|source| format!("解析 agent 列表失败：{source}"))
-}
+impl Client {
+    /// daemon 当前注册的 agent；侧栏据此逐个查询历史，不硬编码 vendor。
+    pub fn agent_list(&self) -> Result<Vec<AgentKind>> {
+        let mut reply = self.round_trip(&ClientCommand::AgentList, "agentList")?;
+        let agents = reply["agents"].take();
+        serde_json::from_value(agents).map_err(|source| format!("解析 agent 列表失败：{source}"))
+    }
 
-fn decode_history(reply: serde_json::Value) -> Result<HistoryReply> {
-    serde_json::from_value(reply).map_err(|source| format!("解析历史响应失败：{source}"))
-}
+    fn history(&self, request: HistoryRequest) -> Result<HistoryReply> {
+        decode_history(self.round_trip(&ClientCommand::History(request), "history")?)
+    }
 
-fn history(host: Option<&str>, request: HistoryRequest) -> Result<HistoryReply> {
-    decode_history(round_trip(
-        host,
-        &ClientCommand::History(request),
-        "history",
-    )?)
-}
-
-pub fn history_list(
-    host: Option<&str>,
-    agent_kind: AgentKind,
-    limit: usize,
-) -> Result<(Vec<HistoryListItem>, Vec<HistoryWarning>)> {
-    let reply = history(
-        host,
-        HistoryRequest::List {
+    pub fn history_list(
+        &self,
+        agent_kind: AgentKind,
+        limit: usize,
+    ) -> Result<(Vec<HistoryListItem>, Vec<HistoryWarning>)> {
+        let reply = self.history(HistoryRequest::List {
             request_id: None,
             agent_kind: Some(agent_kind),
             cwd_filter: None,
             limit: Some(limit),
-        },
-    )?;
-    match reply.response {
-        HistoryResponse::List(items) => Ok((items, reply.warnings)),
-        other => Err(format!("历史列表返回了意外的响应：{other:?}")),
+        })?;
+        match reply.response {
+            HistoryResponse::List(items) => Ok((items, reply.warnings)),
+            other => Err(format!("历史列表返回了意外的响应：{other:?}")),
+        }
     }
-}
 
-pub fn history_read(
-    host: Option<&str>,
-    agent_kind: AgentKind,
-    thread_id: ThreadId,
-) -> Result<(Vec<HistoryTurn>, Vec<HistoryWarning>)> {
-    let reply = history(
-        host,
-        HistoryRequest::Read {
+    pub fn history_read(
+        &self,
+        agent_kind: AgentKind,
+        thread_id: ThreadId,
+    ) -> Result<(Vec<HistoryTurn>, Vec<HistoryWarning>)> {
+        let reply = self.history(HistoryRequest::Read {
             request_id: None,
             thread_id,
             agent_kind,
-        },
-    )?;
-    match reply.response {
-        HistoryResponse::Read(response) => Ok((response.turns, reply.warnings)),
-        other => Err(format!("历史读取返回了意外的响应：{other:?}")),
+        })?;
+        match reply.response {
+            HistoryResponse::Read(response) => Ok((response.turns, reply.warnings)),
+            other => Err(format!("历史读取返回了意外的响应：{other:?}")),
+        }
     }
+}
+
+fn decode_history(reply: serde_json::Value) -> Result<HistoryReply> {
+    serde_json::from_value(reply).map_err(|source| format!("解析历史响应失败：{source}"))
 }
 
 #[cfg(test)]
@@ -679,6 +729,82 @@ mod tests {
         super::Connection::spawn(command).unwrap()
     }
 
+    fn fake_client(connection: &std::sync::Arc<super::Connection>) -> super::Client {
+        // 意外重连也不能执行真实 ssh。
+        let client = super::Client::new(Some("-offline-test"));
+        client.inner.state.lock().unwrap().connection = Some(connection.clone());
+        client
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !condition() {
+            assert!(std::time::Instant::now() < deadline, "condition timed out");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disconnect_cancels_pending_and_delayed_requests_and_reaps_the_child() {
+        let connection = fake_daemon("while read -r line; do :; done");
+        let pid = connection.child.lock().unwrap().as_ref().unwrap().0.id();
+        let client = fake_client(&connection);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let requests: Vec<_> = (0..2)
+            .map(|_| {
+                let client = client.clone();
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    tx.send(client.round_trip(&list_request(), "history"))
+                        .unwrap();
+                })
+            })
+            .collect();
+        wait_until(|| connection.pending.lock().unwrap().len() == 2);
+        client.disconnect();
+        for _ in 0..2 {
+            assert_eq!(
+                rx.recv_timeout(std::time::Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap_err(),
+                "机器连接已断开"
+            );
+        }
+        for request in requests {
+            request.join().unwrap();
+        }
+        assert_eq!(client.agent_list().unwrap_err(), "机器连接已断开");
+        assert!(connection.pending.lock().unwrap().is_empty());
+        assert!(connection.stdin.lock().unwrap().is_none());
+        assert!(connection.child.lock().unwrap().is_none());
+        wait_until(|| unsafe { libc::kill(pid as libc::pid_t, 0) } != 0);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disconnect_during_retry_does_not_reconnect_or_touch_a_new_client() {
+        let connection = fake_daemon("read -r line; exit 1");
+        let client = fake_client(&connection);
+        let old = client.clone();
+        let request = std::thread::spawn(move || old.agent_list());
+        wait_until(|| connection.child.lock().unwrap().is_none());
+        client.disconnect();
+
+        let replacement_connection =
+            fake_daemon(r#"while read -r line; do echo '{"reply":"agentList","agents":[]}'; done"#);
+        let replacement = fake_client(&replacement_connection);
+        assert!(replacement.agent_list().unwrap().is_empty());
+        assert_eq!(request.join().unwrap().unwrap_err(), "机器连接已断开");
+        assert!(replacement.agent_list().unwrap().is_empty());
+        assert!(client.inner.state.lock().unwrap().connection.is_none());
+        replacement.disconnect();
+    }
+
     fn list_request() -> agentdeck_protocol::ClientCommand {
         agentdeck_protocol::ClientCommand::History(agentdeck_protocol::HistoryRequest::List {
             request_id: None,
@@ -742,6 +868,7 @@ mod tests {
             assert_eq!(reply["reply"], "agentList");
         }
         assert!(connection.is_alive());
+        assert!(connection.pending.lock().unwrap().is_empty());
     }
 
     #[test]

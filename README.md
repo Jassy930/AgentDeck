@@ -17,9 +17,9 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
 - 初始化 `gpui-component` 并挂载 `Root`。
 - 界面固定使用深色，配色来自设计系统 SSOT 生成的 codex 颜色；警告使用与品牌橙区分的琥珀色。
 - 渲染外壳布局：全高左侧栏（品牌行 / 新建会话与搜索框 / 按日期分组的会话列表 /
-  本机 Agent 状态）、空态（居中标题、按已注册 agent 生成的过滤卡片、一行只读提示），
+  按机器分组的 Agent 状态）、空态（居中标题、按已注册 agent 生成的过滤卡片、一行只读提示），
   以及会话态（thread header、会话记录、底部一行只读提示）。
-- **接入本机 `agentdeckd` 的只读历史**：启动时先问 daemon 注册了哪些 agent，再按
+- **接入本机及 SSH 远端 `agentdeckd` 的只读历史**：启动时先问各机器的 daemon 注册了哪些 agent，再按
   agent 分别拉取会话列表（首批各显示 50 条），谁先返回谁先进侧栏；固定在列表下方的
   “加载更多”为仍有更多的来源（有 agent 过滤时只为该来源）各扩展 50 条。读完或达到
   每来源 2,000 条上限时在 agent 行的悬停详情中提示；继续加载或失败时保留已有会话与计数。点击条目按
@@ -64,7 +64,7 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
 
 - 启动会话、发送 turn、streaming、审批和 vendor 控制；也没有 composer 输入框。
 - 用户消息中注入上下文块（如 `<system-reminder>`）的识别与折叠、会话正文全文搜索与按项目分组。
-- 远程机器、网络数据源和配对流程。
+- daemon 网络监听和配对流程。
 - 对旧 AppKit 界面或行为的兼容层。
 
 这些能力只按新的纵向切片逐步加入；当前仓库先收敛本地最小闭环。
@@ -93,7 +93,7 @@ docs/                    架构、诊断、质量规则与计划
 ```
 
 `agentdeck-desktop` 依赖 `agentdeck-protocol`，并通过自带的 typed local client
-（`agentdeck-desktop/src/daemon.rs`）按请求 spawn 一个 `agentdeckd` 子进程走 JSONL
+（`agentdeck-desktop/src/daemon.rs`）为每台机器维持一个 `agentdeckd` 子进程连接，走 JSONL
 stdin/stdout。依赖方向固定为 `desktop → typed local client → agentdeckd`；UI 不直接
 解析 vendor JSON，也不把 daemon 嵌入 GUI 进程，更不依赖 `agentdeck-cli`。
 macOS 启动 daemon 前会在子进程恢复信号接收，避免继承 GPUI 后台线程屏蔽的
@@ -104,11 +104,14 @@ macOS 启动 daemon 前会在子进程恢复信号接收，避免继承 GPUI 后
 在侧栏底部点「+ 连接远端机器」，输入 ssh 目标（如 `dt` 或 `user@10.0.0.2`）回车，
 桌面端即对该机器执行 `ssh <host> bash -lc 'exec agentdeckd'`，其余 JSONL 通路不变；
 鉴权与加密由 SSH 密钥负责，daemon 本身不监听网络。本机与所有远端的会话合并在同一列表，
-远端行带主机标签；侧栏机器列表按机器分组显示 agent，可逐台「重试」或「断开」。
-已连接的主机保存在数据目录的 `desktop-remotes`（一行一个），下次启动自动连接。要求：
+远端行带主机标签；侧栏机器列表按机器分组显示 agent，超过高度上限时独立滚动，
+连接表单保持可见。可逐台「重试」或「断开」；断开会取消该机器的在途请求并回收连接，
+旧请求不能重新连接已移除的机器。已连接的主机保存在数据目录的 `desktop-remotes`
+（一行一个），下次启动自动连接；遵循 `AGENTDECK_PROFILE` 的 stable/dev 隔离，
+`AGENTDECK_DATA_DIR` 优先覆盖目录。要求：
 
 - 本机能免密 `ssh <host>`（使用 `BatchMode=yes`，不会弹密码提示）；
-- 远端 login shell 的 PATH 中有 `agentdeckd`、`codex`、`claude`；
+- 远端 `bash -lc` 的 PATH 中有 `agentdeckd`、`codex`、`claude`；
 - 每台机器一条常驻连接（本机一个 `agentdeckd` 子进程，远端一条 ssh 会话），所有请求复用，
   history 按 requestId 并发；`ServerAliveInterval=15` 让对端休眠/断网后约 45 秒内断开，
   下次请求自动重连（`ControlMaster` `~/.ssh/agentdeck-%C` 让重连免去完整握手）。
@@ -118,6 +121,7 @@ macOS 启动 daemon 前会在子进程恢复信号接收，避免继承 GPUI 后
 ```bash
 rsync -az --exclude target --exclude .git ./ dt:AgentDeck/
 ssh dt 'cd ~/AgentDeck && ~/.cargo/bin/cargo build --release --locked -p agentdeckd \
+  && mkdir -p ~/.local/bin \
   && install -m755 target/release/agentdeckd ~/.local/bin/ \
   && bash -lc "agentdeckd --selfcheck"'
 ```
@@ -178,7 +182,7 @@ cargo run -p agentdeck-desktop -- --selfcheck
 
 `script/build_and_run.sh` 是唯一桌面 build/run 入口。它构建
 `agentdeck-desktop` 与 `agentdeckd`、装配 `dist/AgentDeck.app`、写入 macOS 15 最低版本并
-启动最新产物。桌面按请求启动 bundle 内自带的 `agentdeckd` 读取历史。
+启动最新产物。桌面维持到 bundle 内自带 `agentdeckd` 的本机连接，复用它读取历史。
 
 macOS 应用图标和侧栏品牌行使用统一的 04C 图标；iOS companion 使用同款满版
 AppIcon。正式资源和重新生成 `.icns` 的方式见 [图标资源](assets/brand/README.md)。

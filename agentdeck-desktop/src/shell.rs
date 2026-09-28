@@ -135,7 +135,7 @@ impl Stage {
 
 struct ReadRequest {
     id: u64,
-    host: Host,
+    client: daemon::Client,
     kind: AgentKind,
     thread_id: ThreadId,
 }
@@ -307,6 +307,7 @@ pub(crate) struct Machine {
     /// 每次连接新分配；移除后再添加同名主机，也不会接受旧请求的迟到回复。
     pub id: u64,
     pub host: Host,
+    client: daemon::Client,
     pub agents: Vec<AgentHistory>,
     pub connecting: bool,
     /// AgentList 的失败原因；各来源历史的错误由 AgentHistory 保留。
@@ -574,9 +575,11 @@ impl Shell {
     fn add_machine(&mut self, host: Host, cx: &mut Context<Self>) {
         self.next_machine_id += 1;
         let id = self.next_machine_id;
+        let client = daemon::Client::new(host_str(&host));
         self.machines.push(Machine {
             id,
             host,
+            client,
             agents: Vec::new(),
             connecting: false,
             error: None,
@@ -591,15 +594,16 @@ impl Shell {
             return;
         };
         machine.connecting = true;
-        let host = machine.host.clone();
+        let client = machine.client.clone();
         self.pending += 1;
         cx.spawn(async move |this, cx| {
             let agents = cx
                 .background_executor()
-                .spawn(async move { daemon::agent_list(host_str(&host)) })
+                .spawn(async move { client.agent_list() })
                 .await;
             this.update(cx, |shell, cx| {
                 shell.pending -= 1;
+                cx.notify();
                 // 机器已被移除：丢弃迟到的回复。
                 let Some(machine) = shell.machine_mut(id) else {
                     return;
@@ -614,7 +618,6 @@ impl Shell {
                     }
                     Err(message) => machine.error = Some(message),
                 }
-                cx.notify();
             })
             .ok();
         })
@@ -630,15 +633,16 @@ impl Shell {
         };
         let limit = agent.request_limit();
         let host = machine.host.clone();
+        let client = machine.client.clone();
         self.pending += 1;
         cx.spawn(async move |this, cx| {
-            let request_host = host.clone();
             let mut listed = cx
                 .background_executor()
-                .spawn(async move { daemon::history_list(host_str(&request_host), kind, limit) })
+                .spawn(async move { client.history_list(kind, limit) })
                 .await;
             this.update(cx, |shell, cx| {
                 shell.pending -= 1;
+                cx.notify();
                 let Some(machine) = shell.machine_mut(id) else {
                     return;
                 };
@@ -658,7 +662,6 @@ impl Shell {
                         .sort_by_key(|s| std::cmp::Reverse(s.item.last_active_ms));
                     shell.rebuild_rows(cx);
                 }
-                cx.notify();
             })
             .ok();
         })
@@ -731,8 +734,9 @@ impl Shell {
         let Some(index) = self.machines.iter().position(|machine| machine.id == id) else {
             return;
         };
-        let host = self.machines.remove(index).host;
-        daemon::disconnect(host_str(&host));
+        let machine = self.machines.remove(index);
+        machine.client.disconnect();
+        let host = machine.host;
         self.sessions.retain(|session| session.host != host);
         if self
             .agent_filter
@@ -866,6 +870,10 @@ impl Shell {
 
     pub fn open_session(&mut self, session: Session, cx: &mut Context<Self>) {
         let (host, kind, thread_id) = session.key();
+        let Some(machine) = self.machines.iter().find(|machine| machine.host == host) else {
+            return;
+        };
+        let client = machine.client.clone();
         self.sidebar_cursor = Some(session.key());
         self.next_read_id += 1;
         let read_id = self.next_read_id;
@@ -879,7 +887,7 @@ impl Shell {
 
         if let Some(request) = self.reads.push(ReadRequest {
             id: read_id,
-            host,
+            client,
             kind,
             thread_id,
         }) {
@@ -893,7 +901,9 @@ impl Shell {
             let read = cx
                 .background_executor()
                 .spawn(async move {
-                    daemon::history_read(host_str(&request.host), request.kind, request.thread_id)
+                    request
+                        .client
+                        .history_read(request.kind, request.thread_id)
                         .map(|(turns, warnings)| (transcript::prepare(turns), warnings))
                 })
                 .await;
@@ -1195,7 +1205,15 @@ fn connector_card(
                 .gap_2()
                 .items_center()
                 .child(sidebar::agent_icon(kind, false))
-                .child(div().text_sm().font_semibold().child(title)),
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .whitespace_normal()
+                        .text_sm()
+                        .font_semibold()
+                        .child(title),
+                ),
         )
         .child(
             div()
@@ -1259,6 +1277,7 @@ mod tests {
         Transcript, agent_label, day_group, empty_hint, local_time, project_name,
         scroll_sidebar_to, session_matches, session_title, sidebar_rows, transcript_list,
     };
+    use crate::daemon;
     use agentdeck_protocol::{AgentKind, HistoryListItem, HistoryWarning, ThreadId};
     use gpui::{ScrollStrategy, UniformListScrollHandle};
 
@@ -1528,7 +1547,7 @@ mod tests {
     fn read_request(id: u64, thread: &str) -> ReadRequest {
         ReadRequest {
             id,
-            host: None,
+            client: daemon::Client::new(None),
             kind: AgentKind::Codex,
             thread_id: ThreadId(thread.into()),
         }
@@ -1670,6 +1689,7 @@ mod tests {
         let mut machines = vec![Machine {
             id: 1,
             host: None,
+            client: daemon::Client::new(None),
             agents: vec![
                 AgentHistory::new(AgentKind::Codex),
                 AgentHistory::new(AgentKind::ClaudeCode),
@@ -1688,6 +1708,7 @@ mod tests {
         machines.push(Machine {
             id: 2,
             host: Some("dt".into()),
+            client: daemon::Client::new(Some("dt")),
             agents: Vec::new(),
             connecting: false,
             error: Some("Permission denied".into()),
