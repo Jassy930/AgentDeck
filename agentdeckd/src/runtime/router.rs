@@ -16,6 +16,9 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
+/// CLI 自更新要下载安装包，给足时间；桌面端等待上限需大于它。
+pub(crate) const AGENT_UPDATE_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Leave two seconds below the hub's 32-second request deadline so a hung
 /// source cannot discard items already returned by another source.
 const HISTORY_SOURCE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -47,6 +50,45 @@ impl AgentRouter {
 
     pub fn capabilities(&self, kind: AgentKind) -> Option<SessionCapabilities> {
         self.agents.get(&kind).map(|a| a.capabilities())
+    }
+
+    /// `AgentUpdate`：跑 CLI 自更新命令，返回合并后的输出；非零退出或超时即失败。
+    pub async fn update_agent(&self, kind: AgentKind) -> Result<String, ProtocolError> {
+        let failed = |message: String| ProtocolError {
+            code: "agent-update-failed".into(),
+            message,
+            diagnostic_ref: None,
+        };
+        let agent = self.agents.get(&kind).ok_or_else(|| ProtocolError {
+            code: "agent-not-registered".into(),
+            message: format!("no adapter registered for agentKind={kind:?}"),
+            diagnostic_ref: None,
+        })?;
+        let mut command = agent.update_command().await?;
+        command
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(AGENT_UPDATE_TIMEOUT, command.output())
+            .await
+            .map_err(|_| {
+                failed(format!(
+                    "更新超过 {}s 未完成，已终止",
+                    AGENT_UPDATE_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(|error| failed(format!("无法启动更新命令：{error}")))?;
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .trim()
+        .to_string();
+        if output.status.success() {
+            Ok(text)
+        } else {
+            Err(failed(format!("更新失败（{}）：{text}", output.status)))
+        }
     }
 
     /// `AgentCapabilities` 查询：agent_version 换成实际安装版本。
@@ -563,6 +605,16 @@ mod tests {
             Ok(())
         }
 
+        async fn update_command(&self) -> Result<tokio::process::Command, ProtocolError> {
+            let script = match self.kind {
+                AgentKind::Codex => "echo updated",
+                AgentKind::ClaudeCode => "echo boom >&2; exit 3",
+            };
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.args(["-c", script]);
+            Ok(command)
+        }
+
         async fn handle_history(&self, _: HistoryRequest) -> Result<HistoryReply, ProtocolError> {
             match &self.behavior {
                 HistoryBehavior::Immediate(items) => {
@@ -591,6 +643,27 @@ mod tests {
             cwd_filter: None,
             limit: None,
         }
+    }
+
+    #[tokio::test]
+    async fn update_agent_reports_output_or_failure_with_stderr() {
+        let mut router = AgentRouter::new();
+        for kind in [AgentKind::Codex, AgentKind::ClaudeCode] {
+            router.register(Arc::new(HistoryOnlyAgent {
+                kind,
+                behavior: HistoryBehavior::Pending,
+            }));
+        }
+        assert_eq!(
+            router.update_agent(AgentKind::Codex).await.unwrap(),
+            "updated"
+        );
+        let error = router
+            .update_agent(AgentKind::ClaudeCode)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "agent-update-failed");
+        assert!(error.message.contains("boom"), "{}", error.message);
     }
 
     #[tokio::test]

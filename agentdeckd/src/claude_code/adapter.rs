@@ -467,6 +467,19 @@ impl Agent for ClaudeCodeAdapter {
         AgentKind::ClaudeCode
     }
 
+    /// capabilities 的版本在进程内缓存；机器页（尤其更新之后）要现探。
+    async fn detected_version(&self) -> String {
+        tokio::task::spawn_blocking(crate::claude_code::capabilities::probe_claude_code_version)
+            .await
+            .unwrap_or_else(|_| "claude unknown".to_string())
+    }
+
+    async fn update_command(&self) -> Result<tokio::process::Command, ProtocolError> {
+        let mut command = tokio::process::Command::new("claude");
+        command.arg("update");
+        Ok(command)
+    }
+
     fn capabilities(&self) -> SessionCapabilities {
         self.capabilities_for_v2()
     }

@@ -385,6 +385,22 @@ impl RuntimeHub {
                     let _ = events_tx.send(err).await;
                 }
             }
+            ClientCommand::AgentUpdate { agent_kind } => {
+                // 更新要跑数分钟，spawn 出去不阻塞 stdin；成功与失败都用同一条回复。
+                let router = Arc::clone(&self.router);
+                let admin_tx = admin_tx.clone();
+                tokio::spawn(async move {
+                    let mut reply = serde_json::json!({
+                        "reply": "agentUpdate",
+                        "agentKind": agent_kind.as_str(),
+                    });
+                    match router.update_agent(agent_kind).await {
+                        Ok(output) => reply["output"] = output.into(),
+                        Err(error) => reply["error"] = serde_json::json!(error),
+                    }
+                    let _ = admin_tx.send(reply.to_string()).await;
+                });
+            }
             // Lifecycle commands are enqueued in wire order and awaited by one
             // worker. This keeps Ping/admin responsive without allowing
             // start→close or turnStart→cancel to overtake each other.

@@ -215,6 +215,9 @@ pub(crate) struct AgentHistory {
     pub warnings: Vec<HistoryWarning>,
     /// CLI 实际安装版本；None 表示仍在查询，查询失败记为 "unknown"。
     pub version: Option<String>,
+    pub updating: bool,
+    /// 最近一次一键更新的结果：成功为命令输出，失败为错误。
+    pub update_result: Option<Result<String, String>>,
 }
 
 impl AgentHistory {
@@ -227,6 +230,8 @@ impl AgentHistory {
             has_more: false,
             warnings: Vec::new(),
             version: None,
+            updating: false,
+            update_result: None,
         }
     }
 
@@ -488,6 +493,8 @@ pub struct Shell {
     /// 机器页"连接远端"表单：输入框和校验或保存失败的提示。
     pub(crate) remote_input: Entity<InputState>,
     pub(crate) remote_error: Option<String>,
+    /// ssh config 里的 Host 别名，进入机器页时重读。
+    pub(crate) ssh_hosts: Vec<String>,
 }
 
 impl Shell {
@@ -536,6 +543,7 @@ impl Shell {
             pending: 0,
             remote_input,
             remote_error: None,
+            ssh_hosts: Vec::new(),
         };
         if connect_daemon {
             shell.add_machine(None, cx);
@@ -645,6 +653,43 @@ impl Shell {
         .detach();
     }
 
+    /// 一键更新：跑 CLI 自带的更新命令，完成后重查版本。
+    pub fn update_agent(&mut self, id: u64, kind: AgentKind, cx: &mut Context<Self>) {
+        let Some(machine) = self.machine_mut(id) else {
+            return;
+        };
+        let client = machine.client.clone();
+        let Some(agent) = machine.agents.iter_mut().find(|a| a.kind == kind) else {
+            return;
+        };
+        if agent.updating {
+            return;
+        }
+        agent.updating = true;
+        agent.update_result = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.agent_update(kind) })
+                .await;
+            this.update(cx, |shell, cx| {
+                let agent = shell
+                    .machine_mut(id)
+                    .and_then(|machine| machine.agents.iter_mut().find(|a| a.kind == kind));
+                if let Some(agent) = agent {
+                    agent.updating = false;
+                    agent.update_result = Some(result);
+                    agent.version = None;
+                    shell.load_agent_version(id, kind, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn load_agent_sessions(&mut self, id: u64, kind: AgentKind, cx: &mut Context<Self>) {
         let Some(machine) = self.machine(id) else {
             return;
@@ -714,6 +759,7 @@ impl Shell {
         self.stage = Stage::Machines;
         self.reads.clear_pending();
         self.remote_error = None;
+        self.ssh_hosts = remotes::ssh_config_hosts();
         self.remote_input
             .update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
@@ -731,13 +777,19 @@ impl Shell {
     /// 连接输入框里的主机：校验、去重、持久化，然后像本机一样拉取历史。
     pub fn connect_remote(&mut self, cx: &mut Context<Self>) {
         let host = self.remote_input.read(cx).value().trim().to_string();
+        self.connect_host(host, cx);
+    }
+
+    pub fn is_connected(&self, host: &str) -> bool {
+        self.machines
+            .iter()
+            .any(|machine| host_str(&machine.host) == Some(host))
+    }
+
+    pub fn connect_host(&mut self, host: String, cx: &mut Context<Self>) {
         if let Err(message) = daemon::validate_host(&host) {
             self.remote_error = Some(message);
-        } else if self
-            .machines
-            .iter()
-            .any(|machine| host_str(&machine.host) == Some(host.as_str()))
-        {
+        } else if self.is_connected(&host) {
             self.remote_error = Some(format!("{host} 已连接"));
         } else {
             self.add_machine(Some(host.into()), cx);

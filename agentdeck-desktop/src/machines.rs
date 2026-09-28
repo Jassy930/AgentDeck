@@ -4,7 +4,7 @@
 
 use gpui::{Context, IntoElement, ParentElement, SharedString, div, prelude::*, px};
 use gpui_component::{
-    ActiveTheme, Sizable, StyledExt,
+    ActiveTheme, Disableable, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
     input::Input,
@@ -61,8 +61,25 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement + use<
         )
 }
 
-/// 连接远端：ssh 目标输入框，回车或点"连接"。
+/// 连接远端：ssh 目标输入框，回车或点"连接"；下方列出 ssh config 里可快速添加的主机。
 fn remote_form(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement + use<> {
+    // ssh config 里尚未连接的主机，一键添加。
+    let quick: Vec<_> = shell
+        .ssh_hosts
+        .iter()
+        .filter(|host| !shell.is_connected(host))
+        .map(|host| {
+            let target = host.clone();
+            Button::new(SharedString::from(format!("quick-add-{host}")))
+                .outline()
+                .xsmall()
+                .label(host.clone())
+                .on_click(
+                    cx.listener(move |shell, _, _, cx| shell.connect_host(target.clone(), cx)),
+                )
+        })
+        .collect();
+
     v_flex()
         .gap_1()
         .child(
@@ -76,6 +93,17 @@ fn remote_form(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement + use
                         .on_click(cx.listener(|shell, _, _, cx| shell.connect_remote(cx))),
                 ),
         )
+        .when(!quick.is_empty(), |form| {
+            // flex_wrap 在此布局下只按一行算高度，会压到下方卡片；固定列数的 grid 高度可靠。
+            form.child(
+                div()
+                    .pt_1()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("从 ssh config 快速添加"),
+            )
+            .child(div().grid().grid_cols(6).gap_1().children(quick))
+        })
         .when_some(shell.remote_error.clone(), |form, error| {
             form.child(
                 div()
@@ -246,6 +274,22 @@ fn agent_row(
                         .text_color(crate::theme_tokens::WARN)
                         .child(format!("兼容性警告：{}", warning.message))
                 }))
+                .when_some(agent.update_result.clone(), |details, result| {
+                    let (text, color) = match result {
+                        Ok(output) => (
+                            format!("更新完成：{}", last_line(&output)),
+                            cx.theme().muted_foreground,
+                        ),
+                        Err(error) => (format!("更新失败：{error}"), cx.theme().danger),
+                    };
+                    details.child(
+                        div()
+                            .text_xs()
+                            .whitespace_normal()
+                            .text_color(color)
+                            .child(text),
+                    )
+                })
                 .when_some(error, |details, error| {
                     details.child(
                         div()
@@ -257,10 +301,23 @@ fn agent_row(
                 }),
         );
 
+    let updating = agent.updating;
     h_flex()
         .gap_1()
         .items_center()
         .child(row)
+        .child(
+            Button::new(SharedString::from(format!("update-{key}")))
+                .ghost()
+                .xsmall()
+                .label(if updating { "更新中…" } else { "更新" })
+                .disabled(updating)
+                .tooltip(format!(
+                    "在该机器上运行 {} 自带的更新命令",
+                    agent_label(kind)
+                ))
+                .on_click(cx.listener(move |shell, _, _, cx| shell.update_agent(id, kind, cx))),
+        )
         .when(failed, |row| {
             row.child(
                 Button::new(SharedString::from(format!("retry-{key}")))
@@ -280,6 +337,16 @@ fn short_version(raw: &str) -> String {
     raw.split_whitespace()
         .find(|part| part.starts_with(|c: char| c.is_ascii_digit()))
         .map_or_else(|| raw.into(), |v| format!("v{v}"))
+}
+
+/// 更新命令的输出可能多行，只取最后一行非空内容作摘要。
+fn last_line(output: &str) -> &str {
+    output
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("无输出")
 }
 
 #[cfg(test)]

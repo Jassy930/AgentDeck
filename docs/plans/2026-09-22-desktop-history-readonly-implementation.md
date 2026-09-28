@@ -463,3 +463,20 @@ macOS 进程组存在性查询在组仅剩僵尸进程时可能返回 `EPERM`；
 - 验证：`cargo test -p agentdeckd`、desktop 47 项测试（新增版本乱序分发与版本号缩写用例）、
   desktop selfcheck、`./script/build_and_run.sh --verify` 通过；本机 daemon 实测返回
   `codex-cli 0.156.1` 和 `2.1.283 (Claude Code)`。截图时屏幕处于锁定状态，窗口不重绘，未完成实窗目视确认。
+
+## 2026-09-28：ssh config 快速添加与一键更新 CLI
+
+- 远端列表来源：已添加的远端写在数据目录的 `desktop-remotes`（每行一个 ssh 目标），启动时读取；不是写死，也不是自动发现。
+- 快速添加：进入机器页时读取 `~/.ssh/config`，跟随 `Include`（仅具体路径，不展开 glob），
+  列出不含通配符、尚未连接的 Host 别名，点击即连接并保存。flex_wrap 在该布局下只按一行计算高度、
+  会压到下方卡片，改用 6 列 grid。
+- 一键更新：协议新增 `ClientCommand::AgentUpdate { agentKind }`，回复 `agentUpdate`（`output` 或 `error`），
+  schema 快照已重新生成。更新命令由 adapter 提供（`Agent::update_command`）：Codex 为历史读取所用 codex 的 `update`，
+  Claude Code 为 `claude update`。daemon spawn 执行，stdin 置空，上限 600s；非零退出时把输出带进错误。
+  桌面端对该请求放宽等待到 620s，完成后重查版本。Claude Code 的 `detected_version` 改为现探，
+  不再用进程内缓存，否则更新后版本不变。
+- 风险：Codex live session 要求精确的已验证版本（`protocol/CODEX_VERSION.txt`），一键更新后可能偏离，
+  只读历史仍可用但会出现兼容性警告。
+- 验证：router `update_agent` 成功 / 失败用例，ssh config 解析用例，desktop 48 项测试；
+  用假 `claude` 脚本走 daemon JSONL 端到端验证更新成功（输出与新版本）和失败（带 stderr）；
+  实窗截图确认快速添加 grid、各 agent 版本与更新按钮布局，截图后已还原临时改动。未在真实机器上点击更新。

@@ -946,6 +946,26 @@
             "command"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "用 agent CLI 自带的更新命令升级 daemon 所在机器上的 CLI。",
+          "properties": {
+            "agentKind": {
+              "$ref": "#/definitions/AgentKind"
+            },
+            "command": {
+              "enum": [
+                "agentUpdate"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "agentKind",
+            "command"
+          ],
+          "type": "object"
         }
       ],
       "title": "ClientCommand"

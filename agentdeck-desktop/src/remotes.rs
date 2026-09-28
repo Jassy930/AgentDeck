@@ -62,6 +62,48 @@ fn load_from(path: &Path) -> Vec<String> {
     hosts
 }
 
+/// `~/.ssh/config`（含 `Include`）里的具体 Host 别名，供机器页快速添加；带通配符的模式跳过。
+pub fn ssh_config_hosts() -> Vec<String> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let mut hosts = Vec::new();
+    collect_ssh_hosts(&home.join(".ssh/config"), &home, &mut hosts, 0);
+    hosts
+}
+
+// ponytail: Include 只认具体路径，不展开 glob；有需要再接 glob 匹配。
+fn collect_ssh_hosts(path: &Path, home: &Path, hosts: &mut Vec<String>, depth: usize) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for line in text.lines() {
+        let mut words = line.split_whitespace();
+        let (Some(key), rest) = (words.next(), words) else {
+            continue;
+        };
+        if key.eq_ignore_ascii_case("host") {
+            for host in rest {
+                if !host.contains(['*', '?', '!'])
+                    && daemon::validate_host(host).is_ok()
+                    && !hosts.iter().any(|known| known == host)
+                {
+                    hosts.push(host.to_string());
+                }
+            }
+        } else if key.eq_ignore_ascii_case("include") && depth < 8 {
+            for include in rest {
+                let include = match include.strip_prefix("~/") {
+                    Some(rel) => home.join(rel),
+                    None if include.starts_with('/') => PathBuf::from(include),
+                    None => home.join(".ssh").join(include),
+                };
+                collect_ssh_hosts(&include, home, hosts, depth + 1);
+            }
+        }
+    }
+}
+
 fn save_to(path: &Path, hosts: &[&str]) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
@@ -104,6 +146,22 @@ mod tests {
             ),
             Some(PathBuf::from("/tmp/agentdeck-custom/desktop-remotes"))
         );
+    }
+
+    #[test]
+    fn ssh_config_hosts_follow_includes_and_skip_patterns() {
+        let home = std::env::temp_dir().join(format!("agentdeck-ssh-{}", std::process::id()));
+        std::fs::create_dir_all(home.join(".ssh/conf.d")).unwrap();
+        std::fs::write(
+            home.join(".ssh/config"),
+            "Host dt\n  HostName 10.0.0.2\nHost * !bad\nhost a b.example.com a\nInclude conf.d/more\n",
+        )
+        .unwrap();
+        std::fs::write(home.join(".ssh/conf.d/more"), "Host thor-1 thor-*\n").unwrap();
+        let mut hosts = Vec::new();
+        collect_ssh_hosts(&home.join(".ssh/config"), &home, &mut hosts, 0);
+        assert_eq!(hosts, ["dt", "a", "b.example.com", "thor-1"]);
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

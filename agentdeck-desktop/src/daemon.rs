@@ -188,15 +188,14 @@ fn daemon_command(program: impl AsRef<OsStr>) -> Command {
     command
 }
 
-/// 回复对应的等待者：history 按 requestId、agentCapabilities 按 agentKind
+/// 回复对应的等待者：history 按 requestId、agentCapabilities / agentUpdate 按 agentKind
 /// （daemon 并发处理、可能乱序返回）；其余 admin reply 按 reply 名先进先出。
 fn reply_key(value: &serde_json::Value) -> Option<String> {
     match value.get("reply")?.as_str()? {
         "history" => Some(format!("history:{}", value.get("requestId")?.as_str()?)),
-        "agentCapabilities" => Some(format!(
-            "agentCapabilities:{}",
-            value.get("agentKind")?.as_str()?
-        )),
+        reply @ ("agentCapabilities" | "agentUpdate") => {
+            Some(format!("{reply}:{}", value.get("agentKind")?.as_str()?))
+        }
         reply => Some(reply.to_string()),
     }
 }
@@ -219,6 +218,8 @@ fn reply_result(value: serde_json::Value) -> Result<serde_json::Value> {
 
 /// 客户端兜底：daemon 自己的历史超时是 32 秒，超过这里说明管道已不通。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(40);
+/// CLI 自更新要下载安装包；比 daemon 侧 600s 上限略长，让 daemon 先报超时。
+const UPDATE_TIMEOUT: Duration = Duration::from_secs(620);
 
 type Reply = io::Result<Result<serde_json::Value>>;
 type Pending = Mutex<HashMap<String, VecDeque<mpsc::Sender<Reply>>>>;
@@ -310,9 +311,10 @@ impl Connection {
                     key,
                 )
             }
-            ClientCommand::AgentCapabilities { agent_kind } => (
+            ClientCommand::AgentCapabilities { agent_kind }
+            | ClientCommand::AgentUpdate { agent_kind } => (
                 command.clone(),
-                format!("agentCapabilities:{}", agent_kind.as_str()),
+                format!("{expected_reply}:{}", agent_kind.as_str()),
             ),
             command => (command.clone(), expected_reply.to_string()),
         };
@@ -344,13 +346,17 @@ impl Connection {
                 format!("写入 agentdeckd 失败：{source}"),
             ));
         }
-        match rx.recv_timeout(REQUEST_TIMEOUT) {
+        let timeout = match command {
+            ClientCommand::AgentUpdate { .. } => UPDATE_TIMEOUT,
+            _ => REQUEST_TIMEOUT,
+        };
+        match rx.recv_timeout(timeout) {
             Ok(reply) => reply,
             Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
                     "agentdeckd {}s 内未返回 {expected_reply}，已断开连接",
-                    REQUEST_TIMEOUT.as_secs()
+                    timeout.as_secs()
                 ),
             )),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::new(
@@ -538,6 +544,12 @@ impl Client {
             .as_str()
             .map(str::to_owned)
             .ok_or_else(|| "agentCapabilities 回复缺少 agentVersion".to_string())
+    }
+
+    /// 用 CLI 自带的更新命令升级该机器上的 agent，返回命令输出。
+    pub fn agent_update(&self, agent_kind: AgentKind) -> Result<String> {
+        let reply = self.round_trip(&ClientCommand::AgentUpdate { agent_kind }, "agentUpdate")?;
+        Ok(reply["output"].as_str().unwrap_or_default().to_string())
     }
 
     fn history(&self, request: HistoryRequest) -> Result<HistoryReply> {

@@ -543,6 +543,11 @@ pub enum ClientCommand {
         #[serde(rename = "agentKind")]
         agent_kind: AgentKind,
     },
+    /// 用 agent CLI 自带的更新命令升级 daemon 所在机器上的 CLI。
+    AgentUpdate {
+        #[serde(rename = "agentKind")]
+        agent_kind: AgentKind,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

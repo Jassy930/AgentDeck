@@ -150,6 +150,16 @@ impl Agent for CodexAdapter {
         }
     }
 
+    /// 更新的是历史读取实际会用的那个 codex，与版本显示一致。
+    async fn update_command(&self) -> Result<tokio::process::Command, ProtocolError> {
+        let (_cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
+        let binary =
+            crate::codex::app_server::CodexBinary::resolve_for_history(&mut cancel).await?;
+        let mut command = tokio::process::Command::new(binary.path());
+        command.arg("update");
+        Ok(command)
+    }
+
     async fn start_session(
         &self,
         start: SessionStart,
