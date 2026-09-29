@@ -155,9 +155,7 @@ impl Agent for CodexAdapter {
         let (_cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
         let binary =
             crate::codex::app_server::CodexBinary::resolve_for_history(&mut cancel).await?;
-        let mut command = tokio::process::Command::new(binary.path());
-        command.arg("update");
-        Ok(command)
+        update_command_for_binary(binary.path())
     }
 
     async fn start_session(
@@ -351,6 +349,25 @@ impl Default for CodexAdapter {
     }
 }
 
+fn update_command_for_binary(path: &Path) -> Result<tokio::process::Command, ProtocolError> {
+    let bundle = path.ancestors().find_map(|ancestor| {
+        let parent = ancestor.parent()?;
+        (ancestor.file_name()? == "Contents" && parent.extension()? == "app").then_some(parent)
+    });
+    if let Some(bundle) = bundle {
+        return Err(error(
+            "agent-update-unsupported",
+            format!(
+                "当前 Codex 由 {} 内置管理，请通过对应 App 更新。",
+                bundle.display()
+            ),
+        ));
+    }
+    let mut command = tokio::process::Command::new(path);
+    command.arg("update");
+    Ok(command)
+}
+
 fn validate_cwd(cwd: &Path) -> Result<(), ProtocolError> {
     if !cwd.is_absolute() || !cwd.is_dir() {
         return Err(error(
@@ -415,6 +432,32 @@ mod tests {
     use async_trait::async_trait;
     use std::path::PathBuf;
     use tokio::sync::watch;
+
+    #[test]
+    fn update_command_rejects_app_bundles_and_keeps_standalone_target() {
+        for path in [
+            "/Applications/ChatGPT.app/Contents/Resources/codex",
+            "/Users/test/Applications/Codex Desktop.app/Contents/MacOS/codex",
+        ] {
+            let error = update_command_for_binary(Path::new(path)).unwrap_err();
+            assert_eq!(error.code, "agent-update-unsupported");
+            assert!(error.message.contains("请通过对应 App 更新"));
+            assert!(
+                error
+                    .message
+                    .contains(path.split("/Contents/").next().unwrap())
+            );
+        }
+        for path in [
+            "/opt/homebrew/bin/codex",
+            "/home/test/.local/bin/codex",
+            "/tmp/tools.app/bin/codex",
+        ] {
+            let command = update_command_for_binary(Path::new(path)).unwrap();
+            assert_eq!(command.as_std().get_program(), Path::new(path).as_os_str());
+            assert_eq!(command.as_std().get_args().collect::<Vec<_>>(), ["update"]);
+        }
+    }
 
     struct PendingFactory;
 

@@ -244,6 +244,10 @@ fn machine_card(
                     .ghost()
                     .xsmall()
                     .label("断开")
+                    .disabled(machine.installing)
+                    .when(machine.installing, |button| {
+                        button.tooltip("请等待 agentdeckd 安装完成后再断开")
+                    })
                     .on_click(cx.listener(move |shell, _, _, cx| shell.remove_machine(id, cx))),
             )
         });

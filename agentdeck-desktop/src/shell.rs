@@ -969,6 +969,9 @@ impl Shell {
         let Some(index) = self.machines.iter().position(|machine| machine.id == id) else {
             return;
         };
+        if self.machines[index].installing {
+            return;
+        }
         let machine = self.machines.remove(index);
         machine.client.disconnect();
         let host = machine.host;

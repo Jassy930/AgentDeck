@@ -513,3 +513,21 @@ macOS 进程组存在性查询在组仅剩僵尸进程时可能返回 `EPERM`；
   鼠标移开（`Button::on_hover` 为 false）即恢复「更新」。状态为 `Shell::update_armed`，同一时间只有一个按钮待确认。
 - 验证：desktop 测试、`--verify`；实窗截图确认折叠行、徽标与「✓」态（临时初始状态，已还原）。
   悬停提示换行与鼠标移开恢复「更新」已由用户在实窗手动确认。
+
+## 2026-09-29：机器页更新与安装生命周期
+
+- IPC 升至 v6，Rust/schema 与 Swift mirror 同步 `AgentUpdate` 和 selfcheck 版本字段。
+  桌面只向协议匹配的 daemon 发送更新，并在发送所用连接上重新核对；旧 daemon 仍可读取历史，
+  更新按钮禁用并提示先重装。更新请求不经传输重试，避免丢失回复后重复执行。
+- daemon 在 stdin EOF、stdout 写失败或更新超时后取消更新任务，终止 updater 的独立进程组并等待回收。
+  App 内置 Codex 返回通过对应 App 更新的指引；独立 CLI 保持自身更新命令。
+- 远端连接优先使用 `~/.local/bin` 中安装的 daemon；CLI 更新与 daemon 重装互斥。
+  安装期间禁止断开机器，结束后恢复按钮并保留结果。侧栏失败摘要包含来源历史读取失败。
+- 验证通过：完整 `scripts/verify-offline-tests.sh`（desktop 55 项、daemon lib 180 项及集成测试）、
+  Swift 测试（XCTest 75 项、Swift Testing 31 项）、iPhone 17 Simulator 21 项测试；
+  desktop selfcheck、真实 bundle verify、绑定当前 checkout daemon 的 CLI selfcheck（protocolVersion 6）
+  与 diagnostics report、格式和文档门禁。
+- 真实窗口使用隔离数据目录及 fake daemon/ssh：协议 5 的更新按钮禁用且不发送更新请求；
+  安装期间“断开”禁用且机器卡片保留，安装成功后显示版本与结果、自动重连并恢复按钮；
+  来源失败使入口标红，当前协议更新按钮可进入二次确认状态。
+  本轮未执行真实 vendor 更新、真实远端安装、GitHub Release 下载或 aarch64 实机验收。
