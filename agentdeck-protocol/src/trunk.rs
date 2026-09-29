@@ -500,7 +500,7 @@ impl From<HistoryResponse> for HistoryReply {
     }
 }
 
-// ── ClientCommand — all v5 client-to-server commands ────────────────────────
+// ── ClientCommand — all v6 client-to-server commands ────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "command", rename_all = "camelCase", deny_unknown_fields)]
@@ -540,6 +540,11 @@ pub enum ClientCommand {
     ProtocolVersion,
     AgentList,
     AgentCapabilities {
+        #[serde(rename = "agentKind")]
+        agent_kind: AgentKind,
+    },
+    /// 用 agent CLI 自带的更新命令升级 daemon 所在机器上的 CLI。
+    AgentUpdate {
         #[serde(rename = "agentKind")]
         agent_kind: AgentKind,
     },

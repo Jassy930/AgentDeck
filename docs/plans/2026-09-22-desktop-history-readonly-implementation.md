@@ -434,3 +434,109 @@ macOS 进程组存在性查询在组仅剩僵尸进程时可能返回 `EPERM`；
   始终可见；连接中断开后子进程回收且没有重连，重新添加同名机器恢复列表。
   禁用 `debug_assertions` 的桌面产物未启用 FPS 定时刷新，断开后加载提示仍自行结束；
   长机器名换行正确。未运行真实 SSH 主机或 vendor E2E。
+
+## 2026-09-28：机器管理改为独立页面
+
+- 侧栏底部的机器列表与连接表单移到独立的机器管理页（`Stage::Machines`，
+  `agentdeck-desktop/src/machines.rs`），侧栏左下角只留一个服务器图标按钮（SVG 经 `AssetSource` 编译期嵌入，随文字颜色着色），
+  悬停提示显示连接中或失败台数，失败时图标标红。
+  后续设置、信息等页面沿用同一做法：`Stage` 加一个变体，侧栏底部加一个入口。
+- 机器页每台机器一张卡片，连接错误、兼容性警告、读取错误与列表提示全部内联展开，
+  不再依赖悬停提示；agent 行点击仍切换来源过滤，重试放在可点击行之外。
+- 空态卡片仍按机器 × agent 展开，多机时数量随之增长，本轮未改。
+- 验证：`cargo fmt --check`、`cargo clippy`（仅有既有警告）、desktop 45 项测试（删除随侧栏计数一并移除的 `count_label` 用例）、
+  desktop selfcheck、`./script/build_and_run.sh --verify` 通过；
+  实窗临时以机器页为初始状态并追加一台不可达主机截图，确认失败卡片、重试 / 断开、
+  兼容性警告换行、侧栏失败摘要与输入框宽度正常，截图后已还原临时改动。
+
+## 2026-09-28：机器页显示 CLI 版本
+
+- 机器页 agent 名称旁显示该机器上 CLI 的实际安装版本（如 `v2.1.283`、`v0.156.1`），探测或查询失败时
+  明示「拿不到版本号」，不显示任何默认版本。
+- daemon：`AgentCapabilities` 的 `agentVersion` 改为实际探测值。Codex 之前返回固定的已验证版本，
+  现在走 `Agent::detected_version`，用只读历史同一套 `CodexBinary::resolve_for_history` 探测；
+  Claude Code 仍沿用 `claude --version`（进程内缓存）。版本探测会起子进程，hub 改为 spawn 回复，不阻塞 stdin。
+- 桌面端：`agentCapabilities` 回复按 `agentKind` 分发给等待者（daemon 可能乱序返回）；
+  每个 agent 的版本查询独立于会话读取，失败不影响会话列表。
+- 远端机器需要重装新版 agentdeckd 后，Codex 才会显示实际版本；旧 daemon 仍返回固定版本号。
+  dt 已按 README 流程重装，实测返回 `codex-cli 0.155.0-alpha.16` 与 `2.1.160 (Claude Code)`。
+- 验证：`cargo test -p agentdeckd`、desktop 47 项测试（新增版本乱序分发与版本号缩写用例）、
+  desktop selfcheck、`./script/build_and_run.sh --verify` 通过；本机 daemon 实测返回
+  `codex-cli 0.156.1` 和 `2.1.283 (Claude Code)`。截图时屏幕处于锁定状态，窗口不重绘，未完成实窗目视确认。
+
+## 2026-09-28：ssh config 快速添加与一键更新 CLI
+
+- 远端列表来源：已添加的远端写在数据目录的 `desktop-remotes`（每行一个 ssh 目标），启动时读取；不是写死，也不是自动发现。
+- 快速添加：进入机器页时读取 `~/.ssh/config`，跟随 `Include`（仅具体路径，不展开 glob），
+  列出不含通配符、尚未连接的 Host 别名，点击即连接并保存。flex_wrap 在该布局下只按一行计算高度、
+  会压到下方卡片，改用 6 列 grid。
+- 一键更新：协议新增 `ClientCommand::AgentUpdate { agentKind }`，回复 `agentUpdate`（`output` 或 `error`），
+  schema 快照已重新生成。更新命令由 adapter 提供（`Agent::update_command`）：Codex 为历史读取所用 codex 的 `update`，
+  Claude Code 为 `claude update`。daemon spawn 执行，stdin 置空，上限 600s；非零退出时把输出带进错误。
+  桌面端对该请求放宽等待到 620s，完成后重查版本。Claude Code 的 `detected_version` 改为现探，
+  不再用进程内缓存，否则更新后版本不变。
+- 风险：Codex live session 要求精确的已验证版本（`protocol/CODEX_VERSION.txt`），一键更新后可能偏离，
+  只读历史仍可用但会出现兼容性警告。
+- 验证：router `update_agent` 成功 / 失败用例，ssh config 解析用例，desktop 48 项测试；
+  用假 `claude` 脚本走 daemon JSONL 端到端验证更新成功（输出与新版本）和失败（带 stderr）；
+  实窗截图确认快速添加 grid、各 agent 版本与更新按钮布局，截图后已还原临时改动。未在真实机器上点击更新。
+
+## 2026-09-28：快速添加样式、最新版本提示与 agentdeckd 安装
+
+- 快速添加：主机改为虚线边框芯片（`+` 图标、主机名省略、hover 高亮、tooltip「连接 {host}」），4 列 grid。
+  主机名文字节点必须 `flex_1` + `truncate()`（含 nowrap）：只有 flex_1 会被压到零宽，缺 nowrap 会按错误宽度折行只剩前几个字符。
+- 最新版本：首次打开机器页时在本机 `curl` 查 npm registry（`@openai/codex`、`@anthropic-ai/claude-code`）
+  的 `latest`，与各机器安装版本比较，显示「已是最新」或「可更新到 vX」；安装版本更新（预览通道）时不下结论，
+  查询失败显示「无法获取最新版本」。selfcheck 路径不联网。版本比较手写（数字核心 + 预发布更旧），
+  预发布之间只按字符串比。
+- agentdeckd 版本：selfcheck 回复新增 `version`（`CARGO_PKG_VERSION`），机器卡片头部显示；
+  旧 daemon 没有该字段时显示「拿不到版本号」，并提供「重装 agentdeckd」。
+- 缺失检测：远端启动命令补 `~/.local/bin` 到 PATH，找不到时自己往 stderr 写 `agentdeckd-missing` 并退出 127，
+  不依赖 shell 的本地化报错。
+- 安装：`uname -sm` → musl 目标三元组，本机 `curl -fsSL` 下载
+  `releases/download/v<桌面端版本>/agentdeckd-<target>.tar.gz`（钉桌面端版本，保证协议一致，也免 GitHub API 限流），
+  经 ssh stdin 解到远端临时文件，试运行 `--version` 成功才 `mv -f` 替换（避开 ETXTBSY、拦住架构不对），
+  trap 清理临时文件；成功后 `Client::reset` 关掉旧连接（允许重连）并重新读取。
+  发布流程 `.github/workflows/release.yml`：推 `v*` tag 时构建 x86_64 / aarch64 linux musl 并上传到同名 Release。
+- 验证：desktop 50 项测试（新增版本比较、uname 映射用例）、agentdeckd 177 项、selfcheck、`--verify`；
+  dt 上 `rustup target add x86_64-unknown-linux-musl` 后直接构建出 static-pie 二进制（无需 musl-tools）；
+  临时 ignored 测试走真实代码：移走 dt 的 daemon → 连接报 `agentdeckd-missing` → 用
+  `AGENTDECK_RELEASE_URL=file://` 安装 → 重连成功、版本 0.1.0；不设覆盖时得到 404 的明确报错且原二进制完好。
+  实窗截图确认芯片、版本提示、agentdeckd 版本与「未安装」状态，截图后已还原临时改动。
+- 未完成：仓库还没有任何 GitHub Release，真实下载路径未验证；需要推送 workflow 并打 `v0.1.0` tag 后才能用。
+
+## 2026-09-28：机器页收紧：快速添加折叠、兼容性徽标、更新二次确认
+
+- 快速添加默认折叠成一行「› 从 ssh config 快速添加（N 台）」，点击展开 4 列芯片（`Shell::quick_add_open`）。
+- 兼容性警告不再整段铺开：版本行尾只留「⚠ 兼容性」徽标，悬停显示完整警告（`Tooltip::element`，最宽 420px 自动换行）。
+- 更新按钮两段式确认：第一次点击变成绿色「✓」（tooltip「再点一次确认更新」），再点才发 `AgentUpdate`；
+  鼠标移开（`Button::on_hover` 为 false）即恢复「更新」。状态为 `Shell::update_armed`，同一时间只有一个按钮待确认。
+- 验证：desktop 测试、`--verify`；实窗截图确认折叠行、徽标与「✓」态（临时初始状态，已还原）。
+  悬停提示换行与鼠标移开恢复「更新」已由用户在实窗手动确认。
+
+## 2026-09-29：机器页更新与安装生命周期
+
+- IPC 升至 v6，Rust/schema 与 Swift mirror 同步 `AgentUpdate` 和 selfcheck 版本字段。
+  桌面只向协议匹配的 daemon 发送更新，并在发送所用连接上重新核对；旧 daemon 仍可读取历史，
+  更新按钮禁用并提示先重装。更新请求不经传输重试，避免丢失回复后重复执行。
+- daemon 在 stdin EOF、stdout 写失败或更新超时后取消更新任务，终止 updater 的独立进程组并等待回收。
+  App 内置 Codex 返回通过对应 App 更新的指引；独立 CLI 保持自身更新命令。
+- 远端连接优先使用 `~/.local/bin` 中安装的 daemon；CLI 更新与 daemon 重装互斥。
+  安装期间禁止断开机器，结束后恢复按钮并保留结果。侧栏失败摘要包含来源历史读取失败。
+- 验证通过：完整 `scripts/verify-offline-tests.sh`（desktop 55 项、daemon lib 180 项及集成测试）、
+  Swift 测试（XCTest 75 项、Swift Testing 31 项）、iPhone 17 Simulator 21 项测试；
+  desktop selfcheck、真实 bundle verify、绑定当前 checkout daemon 的 CLI selfcheck（protocolVersion 6）
+  与 diagnostics report、格式和文档门禁。
+- 真实窗口使用隔离数据目录及 fake daemon/ssh：协议 5 的更新按钮禁用且不发送更新请求；
+  安装期间“断开”禁用且机器卡片保留，安装成功后显示版本与结果、自动重连并恢复按钮；
+  来源失败使入口标红，当前协议更新按钮可进入二次确认状态。
+  本轮未执行真实 vendor 更新、真实远端安装、GitHub Release 下载或 aarch64 实机验收。
+
+## 2026-09-29：macOS 更新进程组回收
+
+- 更新清理的零信号探测遇到 `EPERM` 时继续等待进程组消失，覆盖 Darwin 仅剩僵尸进程的状态；
+  发送终止信号时的权限错误仍返回清理失败。
+- 新增 macOS 实际进程回归：保留未回收子进程，验证零信号探测继续等待、终止信号的权限错误仍上报，
+  回收后确认进程组消失。断开与超时清理回归同时通过。
+- 完整离线门禁通过（daemon lib 181 项），绑定当前 checkout 的 CLI selfcheck 与 diagnostics report、
+  格式和文档检查通过；未执行真实 vendor 更新。

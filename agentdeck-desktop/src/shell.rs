@@ -1,4 +1,4 @@
-//! 桌面端外壳：全高侧栏 + 主区，主区在空态与会话态之间切换。
+//! 桌面端外壳：全高侧栏 + 主区，主区在空态、会话态和机器管理页之间切换。
 //!
 //! 会话列表和会话记录来自本机与经 ssh 连接的远端 `agentdeckd`，通过 `daemon`
 //! 模块按机器、按 agent 拉取；本期只读历史，不启动 session、不发 turn。
@@ -23,9 +23,11 @@ use gpui_component::{
 };
 
 use crate::daemon;
+use crate::machines;
 use crate::remotes;
 use crate::sidebar;
 use crate::transcript;
+use crate::versions;
 
 /// 首屏和每次扩展的显示条数；多读一条用于判断是否还有会话。
 const SIDEBAR_LIMIT: usize = 50;
@@ -77,6 +79,8 @@ pub enum Stage {
         list: ListState,
         read_id: u64,
     },
+    /// 机器管理页：添加远端、查看每台机器与各 agent 的连接状态。
+    Machines,
 }
 
 /// 虚拟列表在可见区上下额外排版的高度，避免快速滚动时出现空白。
@@ -127,7 +131,7 @@ impl Stage {
 
     pub fn key(&self) -> Option<SessionKey> {
         match self {
-            Stage::Empty => None,
+            Stage::Empty | Stage::Machines => None,
             Stage::Session { session, .. } => Some(session.key()),
         }
     }
@@ -210,6 +214,11 @@ pub(crate) struct AgentHistory {
     limit: usize,
     has_more: bool,
     pub warnings: Vec<HistoryWarning>,
+    /// CLI 实际安装版本；None 表示仍在查询，查询失败记为 "unknown"。
+    pub version: Option<String>,
+    pub updating: bool,
+    /// 最近一次一键更新的结果：成功为命令输出，失败为错误。
+    pub update_result: Option<Result<String, String>>,
 }
 
 impl AgentHistory {
@@ -221,6 +230,9 @@ impl AgentHistory {
             limit: SIDEBAR_LIMIT,
             has_more: false,
             warnings: Vec::new(),
+            version: None,
+            updating: false,
+            update_result: None,
         }
     }
 
@@ -290,16 +302,6 @@ impl AgentHistory {
     pub fn error(&self) -> Option<&str> {
         self.result.as_ref()?.as_ref().err().map(String::as_str)
     }
-
-    /// 侧栏 agent 行的简短计数；完整状态放在悬停详情里。
-    pub fn count_label(&self) -> String {
-        match &self.result {
-            Some(Ok(())) => self.loaded.to_string(),
-            Some(Err(_)) => "失败".to_string(),
-            None if self.loaded > 0 => format!("{}…", self.loaded),
-            None => "…".to_string(),
-        }
-    }
 }
 
 /// 一台机器上的 daemon：AgentList 结果和各 agent 的历史读取状态。
@@ -312,6 +314,47 @@ pub(crate) struct Machine {
     pub connecting: bool,
     /// AgentList 的失败原因；各来源历史的错误由 AgentHistory 保留。
     pub error: Option<String>,
+    /// agentdeckd 自身版本；None 表示仍在查询或未连上，查询失败记为 "unknown"。
+    pub daemon_version: Option<String>,
+    pub daemon_protocol: Option<u64>,
+    pub installing: bool,
+    /// 最近一次安装 agentdeckd 的结果：成功为新 daemon 的 `--version`，失败为错误。
+    pub install_result: Option<Result<String, String>>,
+}
+
+impl Machine {
+    fn new(id: u64, host: Host) -> Self {
+        let client = daemon::Client::new(host_str(&host));
+        Self {
+            id,
+            host,
+            client,
+            agents: Vec::new(),
+            connecting: false,
+            error: None,
+            daemon_version: None,
+            daemon_protocol: None,
+            installing: false,
+            install_result: None,
+        }
+    }
+
+    pub fn has_error(&self) -> bool {
+        self.error.is_some() || self.agents.iter().any(|agent| agent.error().is_some())
+    }
+
+    pub fn can_update_agents(&self) -> bool {
+        !self.connecting
+            && !self.installing
+            && self.daemon_protocol == Some(u64::from(agentdeck_protocol::PROTOCOL_VERSION))
+    }
+
+    /// 远端 login PATH 与 `~/.local/bin` 里都找不到 agentdeckd。
+    pub fn daemon_missing(&self) -> bool {
+        self.error
+            .as_deref()
+            .is_some_and(|error| error.contains(daemon::DAEMON_MISSING))
+    }
 }
 
 fn empty_hint(machines: &[Machine], pending: usize, filtered_empty: bool) -> String {
@@ -468,14 +511,14 @@ fn sidebar_target(
 }
 
 pub struct Shell {
-    stage: Stage,
+    pub(crate) stage: Stage,
     /// Some 表示开启开发者模式，右上角显示 FPS。
     frame_stats: Option<FrameStats>,
     next_read_id: u64,
     reads: ReadQueue,
     /// 侧栏搜索框：按标题或项目名过滤会话。
     pub(crate) search: Entity<InputState>,
-    /// 只看某台机器上某个 agent 的会话；主页卡片和侧栏 agent 行切换。
+    /// 只看某台机器上某个 agent 的会话；主页卡片和机器页 agent 行切换。
     pub(crate) agent_filter: Option<(Host, AgentKind)>,
     /// 本机固定在首位，其后是已连接的远端；每台机器各自决定按哪些 agent 拉历史。
     pub(crate) machines: Vec<Machine>,
@@ -489,10 +532,18 @@ pub struct Shell {
     sidebar_cursor: Option<SessionKey>,
     /// 尚未返回的 daemon 请求数；用于区分"还在加载"和"确实没有会话"。
     pub(crate) pending: usize,
-    /// 侧栏"连接远端"表单：输入框、是否展开、校验或保存失败的提示。
+    /// 机器页"连接远端"表单：输入框和校验或保存失败的提示。
     pub(crate) remote_input: Entity<InputState>,
-    pub(crate) remote_form: bool,
     pub(crate) remote_error: Option<String>,
+    /// ssh config 里的 Host 别名，进入机器页时重读。
+    pub(crate) ssh_hosts: Vec<String>,
+    /// npm 上各 agent CLI 的最新版本，按返回顺序追加。
+    latest: Vec<(AgentKind, Result<String, String>)>,
+    latest_requested: bool,
+    /// ssh config 快速添加区默认折叠，免得占掉机器列表的位置。
+    pub(crate) quick_add_open: bool,
+    /// 已点过一次、等待确认的更新按钮；鼠标移开即取消。
+    pub(crate) update_armed: Option<(u64, AgentKind)>,
 }
 
 impl Shell {
@@ -540,8 +591,12 @@ impl Shell {
             sidebar_cursor: None,
             pending: 0,
             remote_input,
-            remote_form: false,
             remote_error: None,
+            ssh_hosts: Vec::new(),
+            latest: Vec::new(),
+            latest_requested: false,
+            quick_add_open: false,
+            update_armed: None,
         };
         if connect_daemon {
             shell.add_machine(None, cx);
@@ -575,15 +630,7 @@ impl Shell {
     fn add_machine(&mut self, host: Host, cx: &mut Context<Self>) {
         self.next_machine_id += 1;
         let id = self.next_machine_id;
-        let client = daemon::Client::new(host_str(&host));
-        self.machines.push(Machine {
-            id,
-            host,
-            client,
-            agents: Vec::new(),
-            connecting: false,
-            error: None,
-        });
+        self.machines.push(Machine::new(id, host));
         self.load_machine(id, cx);
     }
 
@@ -614,10 +661,166 @@ impl Shell {
                         machine.agents = kinds.iter().copied().map(AgentHistory::new).collect();
                         for kind in kinds {
                             shell.load_agent_sessions(id, kind, cx);
+                            shell.load_agent_version(id, kind, cx);
                         }
+                        shell.load_daemon_version(id, cx);
                     }
                     Err(message) => machine.error = Some(message),
                 }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 机器页展示用；失败只影响版本显示，不影响会话读取。
+    fn load_agent_version(&mut self, id: u64, kind: AgentKind, cx: &mut Context<Self>) {
+        let Some(machine) = self.machine(id) else {
+            return;
+        };
+        let client = machine.client.clone();
+        cx.spawn(async move |this, cx| {
+            let version = cx
+                .background_executor()
+                .spawn(async move { client.agent_version(kind) })
+                .await;
+            this.update(cx, |shell, cx| {
+                let agent = shell
+                    .machine_mut(id)
+                    .and_then(|machine| machine.agents.iter_mut().find(|a| a.kind == kind));
+                if let Some(agent) = agent {
+                    // 查询失败也要明示拿不到，不能留空或显示默认版本。
+                    agent.version = Some(version.unwrap_or_else(|_| "unknown".into()));
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn load_daemon_version(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(machine) = self.machine(id) else {
+            return;
+        };
+        let client = machine.client.clone();
+        cx.spawn(async move |this, cx| {
+            let version = cx
+                .background_executor()
+                .spawn(async move { client.daemon_info() })
+                .await;
+            this.update(cx, |shell, cx| {
+                if let Some(machine) = shell.machine_mut(id) {
+                    let (version, protocol) = match version {
+                        Ok((version, protocol)) => (version, Some(protocol)),
+                        Err(_) => ("unknown".into(), None),
+                    };
+                    machine.daemon_version = Some(version);
+                    machine.daemon_protocol = protocol;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 装上与桌面端同版本的预编译 agentdeckd，成功后断开旧连接重新读取。
+    pub fn install_daemon(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(machine) = self.machine_mut(id) else {
+            return;
+        };
+        let Some(host) = machine.host.clone() else {
+            return;
+        };
+        if machine.installing || machine.agents.iter().any(|agent| agent.updating) {
+            return;
+        }
+        machine.installing = true;
+        machine.install_result = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { remotes::install_daemon(&host) })
+                .await;
+            this.update(cx, |shell, cx| {
+                let Some(machine) = shell.machine_mut(id) else {
+                    return;
+                };
+                machine.installing = false;
+                let ok = result.is_ok();
+                machine.install_result = Some(result);
+                if ok {
+                    machine.client.reset();
+                    machine.error = None;
+                    machine.daemon_version = None;
+                    machine.daemon_protocol = None;
+                    shell.load_machine(id, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn toggle_quick_add(&mut self, cx: &mut Context<Self>) {
+        self.quick_add_open = !self.quick_add_open;
+        cx.notify();
+    }
+
+    /// 更新按钮两段式确认：第一次点击只进入待确认，再点一次才真正更新。
+    pub fn click_update(&mut self, id: u64, kind: AgentKind, cx: &mut Context<Self>) {
+        if self.update_armed.take() == Some((id, kind)) {
+            self.update_agent(id, kind, cx);
+        } else {
+            self.update_armed = Some((id, kind));
+        }
+        cx.notify();
+    }
+
+    pub fn disarm_update(&mut self, id: u64, kind: AgentKind, cx: &mut Context<Self>) {
+        if self.update_armed == Some((id, kind)) {
+            self.update_armed = None;
+            cx.notify();
+        }
+    }
+
+    /// 一键更新：跑 CLI 自带的更新命令，完成后重查版本。
+    pub fn update_agent(&mut self, id: u64, kind: AgentKind, cx: &mut Context<Self>) {
+        let Some(machine) = self.machine_mut(id) else {
+            return;
+        };
+        if !machine.can_update_agents() {
+            return;
+        }
+        let client = machine.client.clone();
+        let Some(agent) = machine.agents.iter_mut().find(|a| a.kind == kind) else {
+            return;
+        };
+        if agent.updating {
+            return;
+        }
+        agent.updating = true;
+        agent.update_result = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.agent_update(kind) })
+                .await;
+            this.update(cx, |shell, cx| {
+                let agent = shell
+                    .machine_mut(id)
+                    .and_then(|machine| machine.agents.iter_mut().find(|a| a.kind == kind));
+                if let Some(agent) = agent {
+                    agent.updating = false;
+                    agent.update_result = Some(result);
+                    agent.version = None;
+                    shell.load_agent_version(id, kind, cx);
+                }
+                cx.notify();
             })
             .ok();
         })
@@ -689,14 +892,43 @@ impl Shell {
         }
     }
 
-    pub fn toggle_remote_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.remote_form = !self.remote_form;
+    pub fn show_machines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.stage = Stage::Machines;
+        self.reads.clear_pending();
         self.remote_error = None;
-        if self.remote_form {
-            self.remote_input
-                .update(cx, |input, cx| input.focus(window, cx));
-        }
+        self.ssh_hosts = remotes::ssh_config_hosts();
+        self.load_latest_versions(cx);
+        self.remote_input
+            .update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
+    }
+
+    /// 各 agent CLI 在 npm 上的最新版本；首次打开机器页时查一次，selfcheck 路径不联网。
+    fn load_latest_versions(&mut self, cx: &mut Context<Self>) {
+        if std::mem::replace(&mut self.latest_requested, true) {
+            return;
+        }
+        for kind in [AgentKind::Codex, AgentKind::ClaudeCode] {
+            cx.spawn(async move |this, cx| {
+                let latest = cx
+                    .background_executor()
+                    .spawn(async move { versions::fetch_latest(kind) })
+                    .await;
+                this.update(cx, |shell, cx| {
+                    shell.latest.push((kind, latest));
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
+    pub fn latest_version(&self, kind: AgentKind) -> Option<&Result<String, String>> {
+        self.latest
+            .iter()
+            .find(|(k, _)| *k == kind)
+            .map(|(_, latest)| latest)
     }
 
     fn save_remotes(&mut self) {
@@ -711,20 +943,23 @@ impl Shell {
     /// 连接输入框里的主机：校验、去重、持久化，然后像本机一样拉取历史。
     pub fn connect_remote(&mut self, cx: &mut Context<Self>) {
         let host = self.remote_input.read(cx).value().trim().to_string();
+        self.connect_host(host, cx);
+    }
+
+    pub fn is_connected(&self, host: &str) -> bool {
+        self.machines
+            .iter()
+            .any(|machine| host_str(&machine.host) == Some(host))
+    }
+
+    pub fn connect_host(&mut self, host: String, cx: &mut Context<Self>) {
         if let Err(message) = daemon::validate_host(&host) {
             self.remote_error = Some(message);
-        } else if self
-            .machines
-            .iter()
-            .any(|machine| host_str(&machine.host) == Some(host.as_str()))
-        {
+        } else if self.is_connected(&host) {
             self.remote_error = Some(format!("{host} 已连接"));
         } else {
             self.add_machine(Some(host.into()), cx);
             self.save_remotes();
-            if self.remote_error.is_none() {
-                self.remote_form = false;
-            }
         }
         cx.notify();
     }
@@ -734,6 +969,9 @@ impl Shell {
         let Some(index) = self.machines.iter().position(|machine| machine.id == id) else {
             return;
         };
+        if self.machines[index].installing {
+            return;
+        }
         let machine = self.machines.remove(index);
         machine.client.disconnect();
         let host = machine.host;
@@ -1231,6 +1469,7 @@ impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let main = match &self.stage {
             Stage::Empty => self.render_empty(cx).into_any_element(),
+            Stage::Machines => machines::render(self, cx).into_any_element(),
             Stage::Session {
                 session,
                 transcript,
@@ -1480,18 +1719,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_count_label_distinguishes_loading_failure_and_count() {
-        let mut source = AgentHistory::new(AgentKind::Codex);
-        assert_eq!(source.count_label(), "…");
-        source.complete(&mut Ok((vec![item(None); 51], vec![])));
-        assert_eq!(source.count_label(), "50");
-        assert!(source.load_more());
-        assert_eq!(source.count_label(), "50…");
-        source.complete(&mut Err("timeout".into()));
-        assert_eq!(source.count_label(), "失败");
-    }
-
-    #[test]
     fn reopening_a_thread_rejects_results_from_its_previous_read() {
         let first = item(Some("A"));
         let mut other = item(Some("B"));
@@ -1666,6 +1893,36 @@ mod tests {
     }
 
     #[test]
+    fn machine_error_includes_source_read_failures() {
+        let mut machine = Machine::new(1, None);
+        machine.agents.push(AgentHistory::new(AgentKind::Codex));
+        assert!(!machine.has_error());
+
+        machine.agents[0].complete(&mut Err("历史读取超时".into()));
+        assert!(machine.has_error());
+        machine.agents[0].complete(&mut Ok((vec![], vec![])));
+        assert!(!machine.has_error());
+
+        machine.error = Some("连接失败".into());
+        assert!(machine.has_error());
+    }
+
+    #[test]
+    fn cli_updates_require_a_ready_daemon_with_the_current_protocol() {
+        let mut machine = Machine::new(1, None);
+        assert!(!machine.can_update_agents());
+        machine.daemon_protocol = Some(5);
+        assert!(!machine.can_update_agents());
+        machine.daemon_protocol = Some(u64::from(agentdeck_protocol::PROTOCOL_VERSION));
+        assert!(machine.can_update_agents());
+        machine.connecting = true;
+        assert!(!machine.can_update_agents());
+        machine.connecting = false;
+        machine.installing = true;
+        assert!(!machine.can_update_agents());
+    }
+
+    #[test]
     fn each_agent_keeps_its_loading_failure_and_empty_result_distinct() {
         let mut fast = AgentHistory::new(AgentKind::ClaudeCode);
         let mut slow = AgentHistory::new(AgentKind::Codex);
@@ -1687,15 +1944,11 @@ mod tests {
     #[test]
     fn empty_hint_does_not_offer_selection_after_failure_and_zero_results() {
         let mut machines = vec![Machine {
-            id: 1,
-            host: None,
-            client: daemon::Client::new(None),
             agents: vec![
                 AgentHistory::new(AgentKind::Codex),
                 AgentHistory::new(AgentKind::ClaudeCode),
             ],
-            connecting: false,
-            error: None,
+            ..Machine::new(1, None)
         }];
         let agents = &mut machines[0].agents;
         agents[0].complete(&mut Err("历史读取超时".into()));
@@ -1706,12 +1959,8 @@ mod tests {
 
         // 远端连不上时说明是哪台机器；本机有会话后照常提示选择。
         machines.push(Machine {
-            id: 2,
-            host: Some("dt".into()),
-            client: daemon::Client::new(Some("dt")),
-            agents: Vec::new(),
-            connecting: false,
             error: Some("Permission denied".into()),
+            ..Machine::new(2, Some("dt".into()))
         });
         assert_eq!(empty_hint(&machines, 0, false), "dt：Permission denied");
 

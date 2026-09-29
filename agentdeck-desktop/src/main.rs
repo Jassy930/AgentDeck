@@ -1,22 +1,60 @@
 mod daemon;
+mod machines;
 mod remotes;
 mod shell;
 mod sidebar;
 mod theme;
 mod theme_tokens;
 mod transcript;
+mod versions;
 
+use std::borrow::Cow;
 use std::env;
 
 use gpui::{
-    App, Application, KeyBinding, Menu, MenuItem, TitlebarOptions, WindowOptions, actions, point,
-    prelude::*, px, size,
+    App, Application, AssetSource, KeyBinding, Menu, MenuItem, SharedString, TitlebarOptions,
+    WindowOptions, actions, point, prelude::*, px, size,
 };
 use gpui_component::Root;
 
 use shell::Shell;
 
 actions!(agentdeck, [Quit]);
+
+/// 编译期嵌入的 SVG 图标；gpui 按路径向 AssetSource 取，渲染时随文字颜色着色。
+struct Assets;
+
+pub const SERVER_ICON: &str = "icons/server.svg";
+pub const PLUS_ICON: &str = "icons/plus.svg";
+pub const CHEVRON_RIGHT_ICON: &str = "icons/chevron-right.svg";
+pub const CHEVRON_DOWN_ICON: &str = "icons/chevron-down.svg";
+pub const ALERT_ICON: &str = "icons/triangle-alert.svg";
+
+impl AssetSource for Assets {
+    fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
+        let bytes: &'static [u8] = match path {
+            SERVER_ICON => include_bytes!("../../assets/icons/server.svg"),
+            PLUS_ICON => include_bytes!("../../assets/icons/plus.svg"),
+            CHEVRON_RIGHT_ICON => include_bytes!("../../assets/icons/chevron-right.svg"),
+            CHEVRON_DOWN_ICON => include_bytes!("../../assets/icons/chevron-down.svg"),
+            ALERT_ICON => include_bytes!("../../assets/icons/triangle-alert.svg"),
+            _ => return Ok(None),
+        };
+        Ok(Some(Cow::Borrowed(bytes)))
+    }
+
+    fn list(&self, _path: &str) -> gpui::Result<Vec<SharedString>> {
+        Ok([
+            SERVER_ICON,
+            PLUS_ICON,
+            CHEVRON_RIGHT_ICON,
+            CHEVRON_DOWN_ICON,
+            ALERT_ICON,
+        ]
+        .map(SharedString::from)
+        .to_vec())
+    }
+}
 
 const SELFCHECK_REPORT: &str = r#"{"status":"ok","surface":"desktop","ui":"gpui"}"#;
 
@@ -48,7 +86,7 @@ fn open_main_window(cx: &mut App, show: bool) {
 fn main() {
     let selfcheck = env::args_os().any(|arg| arg == "--selfcheck");
 
-    Application::new().run(move |cx| {
+    Application::new().with_assets(Assets).run(move |cx| {
         gpui_component::init(cx);
         theme::apply(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());

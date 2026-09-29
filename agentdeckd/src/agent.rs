@@ -57,6 +57,21 @@ pub trait Agent: Send + Sync + 'static {
     /// minimal capabilities + log a diagnostic.
     fn capabilities(&self) -> SessionCapabilities;
 
+    /// 本机实际安装的 CLI 版本（机器页展示用）。默认沿用 `capabilities()`；
+    /// capabilities 报固定版本的适配器应覆盖为真实探测。
+    async fn detected_version(&self) -> String {
+        self.capabilities().agent_version
+    }
+
+    /// CLI 自带的自更新命令（机器页一键更新）。默认不支持。
+    async fn update_command(&self) -> Result<tokio::process::Command, ProtocolError> {
+        Err(ProtocolError {
+            code: "agent-update-unsupported".into(),
+            message: format!("{} 不支持一键更新", self.kind().as_str()),
+            diagnostic_ref: None,
+        })
+    }
+
     /// Start a new session and stream events to the given sender. The
     /// adapter must:
     ///   1. Send SessionStarted FIRST.

@@ -11,14 +11,119 @@ use agentdeck_protocol::{
     effective_history_list_limit,
 };
 use std::collections::{BTreeMap, HashMap};
+use std::io;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
+use tokio::sync::{Mutex, watch};
 use tokio::task::JoinSet;
+
+/// CLI 自更新要下载安装包，给足时间；桌面端等待上限需大于它。
+pub(crate) const AGENT_UPDATE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Leave two seconds below the hub's 32-second request deadline so a hung
 /// source cannot discard items already returned by another source.
 const HISTORY_SOURCE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn update_failed(message: impl Into<String>) -> ProtocolError {
+    ProtocolError {
+        code: "agent-update-failed".into(),
+        message: message.into(),
+        diagnostic_ref: None,
+    }
+}
+
+async fn run_agent_update(
+    mut command: Command,
+    mut cancel: watch::Receiver<bool>,
+    timeout: Duration,
+) -> Result<String, ProtocolError> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .map_err(|error| update_failed(format!("无法启动更新命令：{error}")))?;
+    let pid = child.id().expect("newly spawned updater has a pid");
+    let mut stdout = child.stdout.take().expect("updater stdout is piped");
+    let mut stderr = child.stderr.take().expect("updater stderr is piped");
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let result = tokio::select! {
+        biased;
+        _ = cancel.wait_for(|cancelled| *cancelled) => Err("更新已取消".to_string()),
+        _ = tokio::time::sleep(timeout) => Err(format!("更新超过 {}s 未完成", timeout.as_secs())),
+        result = async {
+            tokio::try_join!(child.wait(), stdout.read_to_end(&mut out), stderr.read_to_end(&mut err))
+        } => result.map(|(status, _, _)| status).map_err(|error| format!("读取更新结果失败：{error}")),
+    };
+    let status = match result {
+        Ok(status) => status,
+        Err(message) => {
+            // 包管理器会再启动安装脚本；只杀 CLI 会留下仍在写文件的后代。
+            let cleanup = async {
+                signal_update_group(pid, 9)?;
+                if child.id().is_some() {
+                    child.start_kill()?;
+                }
+                child.wait().await?;
+                while signal_update_group(pid, 0)? {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok::<_, io::Error>(())
+            };
+            return Err(update_failed(
+                match tokio::time::timeout(Duration::from_secs(1), cleanup).await {
+                    Ok(Ok(())) => format!("{message}，已终止"),
+                    Ok(Err(error)) => format!("{message}；更新进程清理失败：{error}"),
+                    Err(_) => format!("{message}；更新进程清理超时"),
+                },
+            ));
+        }
+    };
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out),
+        String::from_utf8_lossy(&err)
+    )
+    .trim()
+    .to_string();
+    if status.success() {
+        Ok(text)
+    } else {
+        Err(update_failed(format!("更新失败（{status}）：{text}")))
+    }
+}
+
+#[cfg(unix)]
+fn signal_update_group(pid: u32, signal: i32) -> io::Result<bool> {
+    unsafe extern "C" {
+        #[link_name = "kill"]
+        fn kill_group(pid: i32, signal: i32) -> i32;
+    }
+    if unsafe { kill_group(-(pid as i32), signal) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(3) {
+        Ok(false)
+    } else if signal == 0 && error.raw_os_error() == Some(1) {
+        // Darwin 在进程组只剩僵尸进程时返回 EPERM，仍须等待系统回收。
+        Ok(true)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_update_group(_pid: u32, _signal: i32) -> io::Result<bool> {
+    Ok(false)
+}
 
 /// Routes by AgentKind; holds per-session ownership to enforce K2.
 pub struct AgentRouter {
@@ -47,6 +152,33 @@ impl AgentRouter {
 
     pub fn capabilities(&self, kind: AgentKind) -> Option<SessionCapabilities> {
         self.agents.get(&kind).map(|a| a.capabilities())
+    }
+
+    /// `AgentUpdate`：跑 CLI 自更新命令，返回合并后的输出；非零退出或超时即失败。
+    pub async fn update_agent(
+        &self,
+        kind: AgentKind,
+        mut cancel: watch::Receiver<bool>,
+    ) -> Result<String, ProtocolError> {
+        let agent = self.agents.get(&kind).ok_or_else(|| ProtocolError {
+            code: "agent-not-registered".into(),
+            message: format!("no adapter registered for agentKind={kind:?}"),
+            diagnostic_ref: None,
+        })?;
+        let command = tokio::select! {
+            biased;
+            _ = cancel.wait_for(|cancelled| *cancelled) => return Err(update_failed("更新已取消")),
+            command = agent.update_command() => command?,
+        };
+        run_agent_update(command, cancel, AGENT_UPDATE_TIMEOUT).await
+    }
+
+    /// `AgentCapabilities` 查询：agent_version 换成实际安装版本。
+    pub async fn detected_capabilities(&self, kind: AgentKind) -> Option<SessionCapabilities> {
+        let agent = self.agents.get(&kind)?;
+        let mut caps = agent.capabilities();
+        caps.agent_version = agent.detected_version().await;
+        Some(caps)
     }
 
     pub async fn start_session(
@@ -555,6 +687,16 @@ mod tests {
             Ok(())
         }
 
+        async fn update_command(&self) -> Result<tokio::process::Command, ProtocolError> {
+            let script = match self.kind {
+                AgentKind::Codex => "echo updated",
+                AgentKind::ClaudeCode => "echo boom >&2; exit 3",
+            };
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.args(["-c", script]);
+            Ok(command)
+        }
+
         async fn handle_history(&self, _: HistoryRequest) -> Result<HistoryReply, ProtocolError> {
             match &self.behavior {
                 HistoryBehavior::Immediate(items) => {
@@ -583,6 +725,77 @@ mod tests {
             cwd_filter: None,
             limit: None,
         }
+    }
+
+    #[tokio::test]
+    async fn update_agent_reports_output_or_failure_with_stderr() {
+        let mut router = AgentRouter::new();
+        for kind in [AgentKind::Codex, AgentKind::ClaudeCode] {
+            router.register(Arc::new(HistoryOnlyAgent {
+                kind,
+                behavior: HistoryBehavior::Pending,
+            }));
+        }
+        let (_cancel_tx, cancel) = watch::channel(false);
+        assert_eq!(
+            router
+                .update_agent(AgentKind::Codex, cancel.clone())
+                .await
+                .unwrap(),
+            "updated"
+        );
+        let error = router
+            .update_agent(AgentKind::ClaudeCode, cancel)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "agent-update-failed");
+        assert!(error.message.contains("boom"), "{}", error.message);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn update_group_probe_waits_for_zombie_reaping() {
+        use std::os::unix::process::CommandExt;
+
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("10")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        // 保留未回收的子进程，让 Darwin 的 zombie-only 进程组状态稳定可测。
+        let mut signal_result = signal_update_group(pid, 9);
+        while signal_result.is_ok() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+            signal_result = signal_update_group(pid, 9);
+        }
+        let probe_result = signal_update_group(pid, 0);
+        child.wait().unwrap();
+
+        assert_eq!(signal_result.unwrap_err().raw_os_error(), Some(1));
+        assert!(probe_result.unwrap());
+        assert!(!signal_update_group(pid, 0).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn update_timeout_reaps_updater_and_its_children() {
+        let marker = std::env::temp_dir().join(format!("update-timeout-{}", uuid::Uuid::new_v4()));
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "(sleep 0.3; echo survived > \"$1\") & wait",
+            "updater",
+        ]);
+        command.arg(&marker);
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let error = run_agent_update(command, cancel, Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(error.message.ends_with("已终止"), "{}", error.message);
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(!marker.exists(), "an updater child survived its timeout");
     }
 
     #[tokio::test]

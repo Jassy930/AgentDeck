@@ -2,7 +2,7 @@ import AgentDeckMobileCore
 import Foundation
 import XCTest
 
-/// Verifies the v5 wire shapes decode correctly on the Swift side. These
+/// Verifies the v6 wire shapes decode correctly on the Swift side. These
 /// are guardrails for the cross-language IPC seam — daemon emits Rust
 /// `serde_json` output, Swift decodes via `JSONDecoder`; both must agree
 /// on field names, tag discriminators, and enum value renames.
@@ -261,6 +261,22 @@ final class ProtocolV2DecodingTests: XCTestCase {
     func testEncodeClientCommandPing() throws {
         let line = try encodeClientCommand(.ping)
         XCTAssertTrue(line.contains("\"command\":\"ping\""), "got: \(line)")
+    }
+
+    func testAgentUpdateWireEncodingAndDecoding() throws {
+        for kind in [AgentKind.codex, .claudeCode] {
+            let expected = ["command": "agentUpdate", "agentKind": kind.rawValue]
+            let encoded = try JSONEncoder().encode(ClientCommand.agentUpdate(agentKind: kind))
+            let object = try JSONSerialization.jsonObject(with: encoded) as? [String: String]
+            XCTAssertEqual(object, expected)
+
+            let wire = try JSONSerialization.data(withJSONObject: expected)
+            let decoded = try JSONDecoder().decode(ClientCommand.self, from: wire)
+            guard case let .agentUpdate(decodedKind) = decoded else {
+                return XCTFail("expected agentUpdate, got \(decoded)")
+            }
+            XCTAssertEqual(decodedKind, kind)
+        }
     }
 
     func testEncodeClientCommandSessionStartCodex() throws {
