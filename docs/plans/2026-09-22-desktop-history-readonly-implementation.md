@@ -540,3 +540,20 @@ macOS 进程组存在性查询在组仅剩僵尸进程时可能返回 `EPERM`；
   回收后确认进程组消失。断开与超时清理回归同时通过。
 - 完整离线门禁通过（daemon lib 181 项），绑定当前 checkout 的 CLI selfcheck 与 diagnostics report、
   格式和文档检查通过；未执行真实 vendor 更新。
+
+## 2026-09-29：过程分组与会话滚动条
+
+- 连续两个以上的过程块默认折叠成一行摘要，折叠组仅占一个列表项；展开时按可见区域渲染成员，
+  收起再展开保留单块状态。摘要在读取完成时计算，切换组时同步调整可见行与滚动锚点。
+- 会话记录右侧常驻滚动条，支持拖动定位；总高按已测量条目估算，滑块长度会随滚动微调。
+- desktop 57 项测试、selfcheck、真实 bundle verify、格式与文档门禁通过。
+  实窗连接隔离 fake daemon/ssh，验证千项组展开收起、单块状态保留、多组切换、滚动条拖动、
+  搜索后正文保留、机器页切换至远端小会话及重新打开长会话时默认折叠。
+  未运行真实 vendor E2E，也未量化帧耗时。
+
+## 2026-09-29：同 ID 会话的侧栏交互隔离
+
+- 侧栏按钮 ID 使用机器、agentKind 与 threadId，两个 agent 的同 ID 会话独立响应点击。
+- desktop 57 项测试、selfcheck、真实 bundle verify、格式与文档门禁通过。
+  实窗连接隔离 fake daemon/ssh，本机与远端的 Codex、Claude Code 四个同 ID 会话均可打开，
+  正文及 history read 请求中的机器、agentKind 和 threadId 均正确。未运行真实 vendor E2E。
