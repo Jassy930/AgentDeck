@@ -293,7 +293,6 @@ fn section_label(text: &str, cx: &Context<Shell>) -> impl IntoElement {
         .child(text.to_string())
 }
 
-/// 会话行：id 用机器 + threadId，点击后读取该会话的真实记录；远端会话带主机标签。
 fn session_row(
     session: &Session,
     time: SharedString,
@@ -304,7 +303,13 @@ fn session_row(
 ) -> impl IntoElement + use<> {
     let item = &session.item;
     let machine = machine_label(&session.host);
-    let id: SharedString = format!("{machine}-{}", item.thread_id.0).into();
+    // 不同 agent 可以使用相同 threadId，按钮交互状态必须按来源隔离。
+    let id: SharedString = format!(
+        "{machine}-{}-{}",
+        item.agent_kind.as_str(),
+        item.thread_id.0
+    )
+    .into();
     let payload = session.clone();
     let title: SharedString = session_title(item).into();
     let folder: SharedString = project_name(item).into();

@@ -550,3 +550,10 @@ macOS 进程组存在性查询在组仅剩僵尸进程时可能返回 `EPERM`；
   实窗连接隔离 fake daemon/ssh，验证千项组展开收起、单块状态保留、多组切换、滚动条拖动、
   搜索后正文保留、机器页切换至远端小会话及重新打开长会话时默认折叠。
   未运行真实 vendor E2E，也未量化帧耗时。
+
+## 2026-09-29：同 ID 会话的侧栏交互隔离
+
+- 侧栏按钮 ID 使用机器、agentKind 与 threadId，两个 agent 的同 ID 会话独立响应点击。
+- desktop 57 项测试、selfcheck、真实 bundle verify、格式与文档门禁通过。
+  实窗连接隔离 fake daemon/ssh，本机与远端的 Codex、Claude Code 四个同 ID 会话均可打开，
+  正文及 history read 请求中的机器、agentKind 和 threadId 均正确。未运行真实 vendor E2E。
