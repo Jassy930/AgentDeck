@@ -112,6 +112,9 @@ fn signal_update_group(pid: u32, signal: i32) -> io::Result<bool> {
     let error = io::Error::last_os_error();
     if error.raw_os_error() == Some(3) {
         Ok(false)
+    } else if signal == 0 && error.raw_os_error() == Some(1) {
+        // Darwin 在进程组只剩僵尸进程时返回 EPERM，仍须等待系统回收。
+        Ok(true)
     } else {
         Err(error)
     }
@@ -747,6 +750,32 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "agent-update-failed");
         assert!(error.message.contains("boom"), "{}", error.message);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn update_group_probe_waits_for_zombie_reaping() {
+        use std::os::unix::process::CommandExt;
+
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("10")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        // 保留未回收的子进程，让 Darwin 的 zombie-only 进程组状态稳定可测。
+        let mut signal_result = signal_update_group(pid, 9);
+        while signal_result.is_ok() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+            signal_result = signal_update_group(pid, 9);
+        }
+        let probe_result = signal_update_group(pid, 0);
+        child.wait().unwrap();
+
+        assert_eq!(signal_result.unwrap_err().raw_os_error(), Some(1));
+        assert!(probe_result.unwrap());
+        assert!(!signal_update_group(pid, 0).unwrap());
     }
 
     #[cfg(unix)]
