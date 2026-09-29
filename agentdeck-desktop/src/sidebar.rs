@@ -1,97 +1,63 @@
-//! 全高左侧栏：品牌行、快捷入口、真实会话列表、本机 Agent 状态。
+//! 全高左侧栏：品牌行、新建与搜索、按日期分组的会话列表、底部页面入口（机器管理）。
 //!
-//! 会话条目来自 daemon 的跨 agent 历史列表，点击即读取该会话记录。
+//! 会话条目来自各台机器 daemon 的跨 agent 历史列表，点击即读取该会话记录。
 
 use std::ops::Range;
 use std::sync::{Arc, LazyLock};
 
-use agentdeck_protocol::{AgentKind, HistoryListItem};
+use agentdeck_protocol::AgentKind;
 use gpui::{
-    App, Bounds, Context, FontWeight, Image, ImageFormat, IntoElement, ParentElement, Pixels,
-    SharedString, Window, canvas, div, fill, img, point, prelude::*, px, rgb, size, uniform_list,
+    App, Context, FontWeight, Image, ImageFormat, IntoElement, ParentElement, Pixels, SharedString,
+    Window, div, img, prelude::*, px, uniform_list,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, InteractiveElementExt, Selectable, StyledExt,
+    ActiveTheme, Icon, InteractiveElementExt, Selectable, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
+    input::Input,
     tooltip::Tooltip,
     v_flex,
 };
 
-use crate::shell::{Shell, agent_label, project_name, session_title};
+use crate::shell::{
+    Session, SessionKey, Shell, SidebarRow, Stage, machine_label, project_name, session_title,
+};
 
 /// 侧栏宽度，与 Codex Desktop 的全高侧栏一致。
 const WIDTH: f32 = 248.;
 const AGENT_ICON_SIZE: f32 = 16.;
+/// 会话行与分组标题共用的行高：uniform_list 按首行测量，两者必须一致。
+const ROW_HEIGHT: f32 = 36.;
+/// 会话行尾时间列宽度，容纳 "12/31" 或 "23:59"。
+const TIME_WIDTH: f32 = 36.;
+/// 远端会话行的主机标签宽度，过长时省略。
+const HOST_WIDTH: f32 = 40.;
 
-const CODEX_PIXELS: [&[u8; 16]; 16] = [
-    b".....bbb........",
-    b"...bbbbbbbb.....",
-    b"..bbbbbbbbbbb...",
-    b".bbbbbbbbbbbbb..",
-    b".bbbddddddddbb..",
-    b".bbbdfddddddbb..",
-    b".bbbddfdddddbb..",
-    b".bbbdfddfffdbb..",
-    b"..bbddddddddbb..",
-    b"...bbbbbbbbbb...",
-    b"....bbbbbbb.....",
-    b"...bbbbbbbbb....",
-    b"..bbbfbbffbbb...",
-    b"..bb.bbbbbb.bb..",
-    b".....bb.bb......",
-    b".....bb.bb......",
-];
+// 2x PNG 保留 Retina 下的像素边界；单独灰图保持 HSL 去饱和后的亮度。
+static AGENT_ICONS: LazyLock<[[Arc<Image>; 2]; 2]> = LazyLock::new(|| {
+    let sources: [[&[u8]; 2]; 2] = [
+        [
+            include_bytes!("../../assets/agents/codex.png"),
+            include_bytes!("../../assets/agents/codex-gray.png"),
+        ],
+        [
+            include_bytes!("../../assets/agents/claude.png"),
+            include_bytes!("../../assets/agents/claude-gray.png"),
+        ],
+    ];
+    sources.map(|variants| {
+        variants.map(|bytes| Arc::new(Image::from_bytes(ImageFormat::Png, bytes.to_vec())))
+    })
+});
 
-const CLAUDE_PIXELS: [&[u8; 16]; 16] = [
-    b"................",
-    b"................",
-    b"................",
-    b"...cccccccccc...",
-    b"...cccccccccc...",
-    b"...cccccccccc...",
-    b".cccc.cccc.cccc.",
-    b".cccc.cccc.cccc.",
-    b".cccccccccccccc.",
-    b"...cccccccccc...",
-    b"...cccccccccc...",
-    b"...cc.c..c.cc...",
-    b"...cc.c..c.cc...",
-    b"...cc.c..c.cc...",
-    b"................",
-    b"................",
-];
-
-fn agent_icon(kind: AgentKind) -> impl IntoElement {
-    let pixels = match kind {
-        AgentKind::Codex => &CODEX_PIXELS,
-        AgentKind::ClaudeCode => &CLAUDE_PIXELS,
+pub fn agent_icon(kind: AgentKind, grayscale: bool) -> impl IntoElement + use<> {
+    let index = match kind {
+        AgentKind::Codex => 0,
+        AgentKind::ClaudeCode => 1,
     };
-    canvas(
-        |_, _, _| (),
-        move |bounds, _, window, _| {
-            for (y, row) in pixels.iter().enumerate() {
-                for (x, pixel) in row.iter().enumerate() {
-                    let color = match pixel {
-                        b'b' => rgb(0x7495ff),
-                        b'd' => rgb(0x25386f),
-                        b'f' => rgb(0xa7f3f0),
-                        b'c' => rgb(0xc87555),
-                        _ => continue,
-                    };
-                    window.paint_quad(fill(
-                        Bounds::new(
-                            bounds.origin + point(px(x as f32), px(y as f32)),
-                            size(px(1.), px(1.)),
-                        ),
-                        color,
-                    ));
-                }
-            }
-        },
-    )
-    .size(px(AGENT_ICON_SIZE))
-    .flex_shrink_0()
+    img(AGENT_ICONS[index][usize::from(grayscale)].clone())
+        .size(px(AGENT_ICON_SIZE))
+        .flex_shrink_0()
 }
 
 static BRAND_ICON: LazyLock<Arc<Image>> = LazyLock::new(|| {
@@ -106,46 +72,52 @@ pub const TRAFFIC_LIGHT_INSET: f32 = 44.;
 
 pub fn render(
     shell: &Shell,
-    selected: Option<SharedString>,
+    selected: Option<SessionKey>,
     cx: &mut Context<Shell>,
 ) -> impl IntoElement + use<> {
     // 行高一致，用 uniform_list 只渲染可见行；行内容在布局阶段回到 Shell 取。
-    let is_new_session = selected.is_none();
+    let is_new_session = matches!(shell.stage, Stage::Empty);
     let sessions = uniform_list(
         "session-list",
-        shell.sessions.len(),
+        shell.rows.len(),
         cx.processor(move |shell, range: Range<usize>, window, cx| {
             let cursor = shell
                 .sidebar_focus
                 .is_focused(window)
-                .then(|| shell.sidebar_cursor_index())
+                .then(|| shell.sidebar_cursor_row())
                 .flatten();
             let start = range.start;
-            shell.sessions[range]
+            shell.rows[range]
                 .iter()
                 .enumerate()
-                .map(|(offset, item)| {
-                    let is_selected = selected.as_ref().map(SharedString::as_ref)
-                        == Some(item.thread_id.0.as_str());
-                    // 行间距用 padding：uniform_list 按首行测量行高。
-                    div().pb_1().child(session_row(
-                        item,
-                        is_selected,
-                        cursor == Some(start + offset),
-                        window,
-                        cx,
-                    ))
+                .map(|(offset, row)| {
+                    let row_div = div().h(px(ROW_HEIGHT));
+                    match row {
+                        SidebarRow::Header(label) => row_div
+                            .flex()
+                            .items_end()
+                            .pb_1()
+                            .child(section_label(label, cx)),
+                        SidebarRow::Session { index, time } => {
+                            let session = &shell.sessions[*index];
+                            let is_selected = selected.as_ref().is_some_and(|key| session.is(key));
+                            // 行间距用 padding：uniform_list 按首行测量行高。
+                            row_div.pb_1().child(session_row(
+                                session,
+                                time.clone(),
+                                is_selected,
+                                cursor == Some(start + offset),
+                                window,
+                                cx,
+                            ))
+                        }
+                    }
                 })
                 .collect()
         }),
     )
     .track_scroll(shell.sidebar_scroll.clone())
-    .track_focus(
-        &shell
-            .sidebar_focus
-            .clone()
-            .tab_stop(!shell.sessions.is_empty()),
-    )
+    .track_focus(&shell.sidebar_focus.clone().tab_stop(!shell.rows.is_empty()))
     .on_key_down(
         cx.listener(|shell, event: &gpui::KeyDownEvent, window, cx| {
             if !shell.sidebar_focus.is_focused(window) || event.keystroke.modifiers.modified() {
@@ -161,34 +133,36 @@ pub fn render(
         }),
     );
 
-    let status = if shell.pending > 0 {
+    let status = if !shell.rows.is_empty() {
+        None
+    } else if shell.pending > 0 {
         Some("正在读取会话…".to_string())
     } else if !shell.sessions.is_empty() {
-        None
+        Some("没有匹配的会话".to_string())
+    } else if shell.machines.iter().any(|machine| machine.has_error()) {
+        Some("读取失败，详情见「机器」页".to_string())
     } else {
-        Some(
-            shell
-                .error
-                .clone()
-                .unwrap_or_else(|| "没有可显示的会话".to_string()),
-        )
+        Some("没有可显示的会话".to_string())
     };
 
-    let agents: Vec<_> = shell
-        .agents
+    // 机器入口带摘要：失败不能只靠用户主动点进去发现。
+    let failed = shell
+        .machines
         .iter()
-        .map(|agent| {
-            (
-                agent.kind,
-                agent_label(agent.kind),
-                agent.status(),
-                agent.error().map(str::to_string),
-                agent.can_load_more(),
-                agent.list_hint(),
-                agent.warnings.clone(),
-            )
-        })
-        .collect();
+        .filter(|machine| machine.has_error())
+        .count();
+    let machines_tooltip = if shell.machines.iter().any(|machine| machine.connecting) {
+        "机器管理 · 连接中…".to_string()
+    } else if failed > 0 {
+        format!("机器管理 · {failed} 台失败")
+    } else {
+        "机器管理".to_string()
+    };
+    let can_load_more = !shell.load_more_targets().is_empty();
+    let brand_hint = match shell.machines.len() {
+        0 | 1 => "本机".to_string(),
+        count => format!("{count} 台机器"),
+    };
 
     v_flex()
         .w(px(WIDTH))
@@ -223,8 +197,8 @@ pub fn render(
                         .child(
                             div()
                                 .text_sm()
-                                .text_color(cx.theme().sidebar_foreground.opacity(0.72))
-                                .child("本机"),
+                                .text_color(cx.theme().muted_foreground)
+                                .child(brand_hint),
                         ),
                 )
                 .child(
@@ -239,144 +213,59 @@ pub fn render(
                                 .label("新建会话")
                                 .on_click(cx.listener(|shell, _, _, cx| shell.show_empty(cx))),
                         )
-                        .child(
-                            Button::new("search")
-                                .ghost()
-                                .w_full()
-                                .justify_start()
-                                .label("搜索（未开放）")
-                                .disabled(true),
-                        ),
+                        .child(Input::new(&shell.search).small().cleanable(true)),
                 )
                 .child(
                     v_flex()
                         .flex_1()
                         .gap_1()
                         .overflow_hidden()
-                        .child(section_label("最近会话", cx))
                         .children(status.map(|text| {
                             div()
                                 .px_2()
                                 .text_sm()
-                                .text_color(cx.theme().sidebar_foreground.opacity(0.72))
+                                .text_color(cx.theme().muted_foreground)
                                 .child(text)
                         }))
-                        .when(shell.error.is_some(), |section| {
-                            section.child(
-                                Button::new("retry-connection").label("重试连接").on_click(
-                                    cx.listener(|shell, _, _, cx| shell.retry_connection(cx)),
-                                ),
-                            )
-                        })
                         .child(
                             sessions
                                 .flex_1()
                                 // 同 transcript：flex item 需要 min_h(0) 才会真正滚动。
                                 .min_h(px(0.)),
-                        ),
+                        )
+                        .when(can_load_more, |section| {
+                            section.child(
+                                Button::new("load-more")
+                                    .ghost()
+                                    .small()
+                                    .w_full()
+                                    .label("加载更多")
+                                    .on_click(cx.listener(|shell, _, _, cx| shell.load_more(cx))),
+                            )
+                        }),
                 ),
         )
         .child(
-            v_flex()
+            // 底部页面入口：一排图标按钮，后续设置、信息页在此并列。
+            h_flex()
                 .flex_shrink_0()
                 .mx_3()
                 .gap_1()
                 .pt_3()
                 .border_t_1()
                 .border_color(cx.theme().sidebar_border)
-                .child(section_label("本机 Agent", cx))
-                .children(agents.into_iter().map(
-                    |(kind, name, status, error, can_load_more, list_hint, warnings)| {
-                        v_flex()
-                            .px_2()
-                            .text_sm()
-                            .gap_1()
-                            .child(
-                                v_flex().gap_1().child(name).child(
-                                    div()
-                                        .text_color(cx.theme().sidebar_foreground.opacity(0.72))
-                                        .child(status),
-                                ),
-                            )
-                            .when(can_load_more, |section| {
-                                section.child(
-                                    Button::new(SharedString::from(format!(
-                                        "load-more-{}",
-                                        kind.as_str()
-                                    )))
-                                    .label("加载更多")
-                                    .on_click(cx.listener(move |shell, _, _, cx| {
-                                        shell.load_more_agent(kind, cx)
-                                    })),
-                                )
-                            })
-                            .children(list_hint.map(|hint| {
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().sidebar_foreground.opacity(0.72))
-                                    .child(hint)
-                            }))
-                            .when(!warnings.is_empty(), |section| {
-                                section.child(
-                                    div()
-                                        .id(SharedString::from(format!(
-                                            "warnings-{}",
-                                            kind.as_str()
-                                        )))
-                                        .w_full()
-                                        .min_w(px(0.))
-                                        .max_h(px(96.))
-                                        .overflow_y_scroll()
-                                        .p_2()
-                                        .rounded_md()
-                                        .bg(cx.theme().warning.opacity(0.1))
-                                        .child(
-                                            v_flex()
-                                                .gap_1()
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .font_semibold()
-                                                        .child("兼容性警告"),
-                                                )
-                                                .children(warnings.into_iter().map(|warning| {
-                                                    div().text_xs().child(warning.message)
-                                                })),
-                                        ),
-                                )
-                            })
-                            .children(error.map(|message| {
-                                v_flex()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "error-{}",
-                                                kind.as_str()
-                                            )))
-                                            .w_full()
-                                            .min_w(px(0.))
-                                            .max_h(px(96.))
-                                            .overflow_y_scroll()
-                                            .text_xs()
-                                            .text_color(cx.theme().sidebar_foreground.opacity(0.72))
-                                            .child(message),
-                                    )
-                                    .child(
-                                        Button::new(SharedString::from(format!(
-                                            "retry-{}",
-                                            kind.as_str()
-                                        )))
-                                        .label("重试")
-                                        .on_click(
-                                            cx.listener(move |shell, _, _, cx| {
-                                                shell.retry_agent(kind, cx)
-                                            }),
-                                        ),
-                                    )
-                            }))
-                    },
-                )),
+                .child(
+                    Button::new("show-machines")
+                        .ghost()
+                        .small()
+                        .selected(matches!(shell.stage, Stage::Machines))
+                        .icon(Icon::empty().path(crate::SERVER_ICON))
+                        .tooltip(machines_tooltip)
+                        .when(failed > 0, |button| button.text_color(cx.theme().danger))
+                        .on_click(
+                            cx.listener(|shell, _, window, cx| shell.show_machines(window, cx)),
+                        ),
+                ),
         )
 }
 
@@ -400,27 +289,37 @@ fn section_label(text: &str, cx: &Context<Shell>) -> impl IntoElement {
         .px_2()
         .text_sm()
         .font_semibold()
-        .text_color(cx.theme().sidebar_foreground.opacity(0.72))
+        .text_color(cx.theme().muted_foreground)
         .child(text.to_string())
 }
 
-/// 会话行：id 用 threadId，点击后读取该会话的真实记录。
+/// 会话行：id 用机器 + threadId，点击后读取该会话的真实记录；远端会话带主机标签。
 fn session_row(
-    item: &HistoryListItem,
+    session: &Session,
+    time: SharedString,
     selected: bool,
     keyboard_cursor: bool,
     window: &Window,
     cx: &mut Context<Shell>,
 ) -> impl IntoElement + use<> {
-    let id: SharedString = item.thread_id.0.clone().into();
-    let payload = item.clone();
+    let item = &session.item;
+    let machine = machine_label(&session.host);
+    let id: SharedString = format!("{machine}-{}", item.thread_id.0).into();
+    let payload = session.clone();
     let title: SharedString = session_title(item).into();
     let folder: SharedString = project_name(item).into();
-    let path: SharedString = item.cwd.display().to_string().into();
-    // Button 的内部 label 容器不会收缩，扣除 padding、边框、图标与 gap_2。
-    let title_width = px(WIDTH - 3. - AGENT_ICON_SIZE) - window.rem_size() * 4.;
+    let path: SharedString = format!("{machine} · {}", item.cwd.display()).into();
+    let host_badge = session.host.clone();
+    let time_width = if time.len() > 5 { 72. } else { TIME_WIDTH };
+    // Button 的内部 label 容器不会收缩，扣除 padding、边框、图标、时间列与两个 gap_2；
+    // 远端行再扣主机标签和它的 gap_2。
+    let mut title_width = px(WIDTH - 3. - AGENT_ICON_SIZE - time_width) - window.rem_size() * 4.5;
+    if host_badge.is_some() {
+        title_width -= px(HOST_WIDTH) + window.rem_size() * 0.5;
+    }
 
     let mut button = Button::new(id)
+        .group("session-row")
         .ghost()
         .selected(selected)
         .tab_stop(false)
@@ -429,7 +328,21 @@ fn session_row(
         })
         .w_full()
         .justify_start()
-        .child(agent_icon(item.agent_kind))
+        .child(
+            div()
+                .relative()
+                .size(px(AGENT_ICON_SIZE))
+                .flex_shrink_0()
+                .child(agent_icon(item.agent_kind, true))
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .opacity(if keyboard_cursor { 1. } else { 0. })
+                        .group_hover("session-row", |style| style.opacity(1.))
+                        .child(agent_icon(item.agent_kind, false)),
+                ),
+        )
         .child(
             div()
                 .w(title_width)
@@ -438,6 +351,29 @@ fn session_row(
                 .line_clamp(1)
                 .text_ellipsis()
                 .child(title.clone()),
+        )
+        .when_some(host_badge, |button, host| {
+            button.child(
+                div()
+                    .w(px(HOST_WIDTH))
+                    .flex_shrink_0()
+                    .whitespace_normal()
+                    .line_clamp(1)
+                    .text_ellipsis()
+                    .text_right()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(host),
+            )
+        })
+        .child(
+            div()
+                .w(px(time_width))
+                .flex_shrink_0()
+                .text_right()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(time),
         )
         .on_click(cx.listener(move |shell, _, window, cx| {
             shell.sidebar_focus.focus(window);

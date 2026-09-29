@@ -1,0 +1,50 @@
+name: Release agentdeckd
+
+# 推送 v* tag 时构建 Linux 静态 agentdeckd 并附到同名 GitHub Release；
+# 桌面端机器页的「安装 agentdeckd」按与自身同版本的 tag 下载这些资产。
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.96.0
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build agentdeckd
+        run: cargo build --release --locked -p agentdeckd --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          tar -czf agentdeckd-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release agentdeckd
+          ./target/${{ matrix.target }}/release/agentdeckd --version
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "agentdeckd $GITHUB_REF_NAME" \
+            || true
+          gh release upload "$GITHUB_REF_NAME" agentdeckd-${{ matrix.target }}.tar.gz --clobber

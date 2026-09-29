@@ -15,7 +15,7 @@ AgentDeck.app
 ├─ agentdeck-desktop（Rust / GPUI / gpui-component）
 │  ├─ Application + Window
 │  ├─ Root + 外壳组件树
-│  ├─ daemon.rs（typed local client：按请求 spawn agentdeckd，JSONL round-trip）
+│  ├─ daemon.rs（typed local client：每机一个常驻 agentdeckd 连接，按 requestId 多路复用）
 │  └─ --selfcheck（不连 daemon）
 └─ agentdeckd（bundle 内自带，供上面的 client spawn）
 
@@ -29,7 +29,12 @@ AgentDeckMobileCore + ios/
 唯一允许的本机桌面通路是
 `agentdeck-desktop → typed local client → agentdeckd`。该通路已落地，但当前只覆盖
 只读历史（agent list / history list / history read）；session 生命周期、turn、streaming
-和审批仍未接入，selfcheck 也不走这条通路。
+和审批仍未接入，selfcheck 也不走这条通路。每台机器一条常驻连接，history 按 requestId
+多路复用，进程退出后下次请求重连。每个机器实例持有独立 client，异步请求在调度时
+捕获该实例；显式断开取消其请求并回收子进程，旧实例不能自动重连或借用后来重新添加的
+同名机器连接。已完成请求及时移除等待条目。对用户在界面上添加的远端机器，typed
+local client 把子进程换成 `ssh <host> bash -lc 'exec agentdeckd'`，协议和依赖方向不变，
+daemon 仍不监听网络。
 
 Codex 本地 transport 已决定为 `agentdeckd` 直接持有 session-scoped
 `codex app-server --listen stdio://` 子进程；不依赖用户全局 managed daemon/proxy。
@@ -44,9 +49,9 @@ poison 并退出 daemon。protocol v4 增加累计消息的 item identity/state/
 
 ## 分层边界
 
-- `agentdeck-desktop/`：macOS GPUI executable。负责窗口、组件根节点、外壳布局（侧栏 / 空态 / 会话态 / composer）和桌面 selfcheck。`daemon.rs` 是唯一的数据入口：只发 `AgentList` 和 `History` 命令，只消费中立类型；侧栏与空态卡片都按 daemon 返回的 `AgentKind` 迭代生成，不按 vendor 分支查询或路由，也不解析 vendor JSON。侧栏按 `AgentKind` 选择来源像素图标，仅用于标识。阻塞 IPC 一律走 GPUI background executor，UI 线程不等 daemon。
+- `agentdeck-desktop/`：macOS GPUI executable。负责窗口、组件根节点、外壳布局（侧栏 / 空态 / 会话态 / 机器管理页）和桌面 selfcheck。`daemon.rs` 是唯一的数据入口：只发 `AgentList`、`AgentCapabilities`（机器页显示 CLI 版本）、`AgentUpdate`（机器页一键更新 CLI，更新命令由各 adapter 提供）、`Selfcheck`（读 daemon 版本）、`ProtocolVersion`（更新前确认协议）和 `History` 命令，只消费中立类型；侧栏与空态卡片都按 daemon 返回的 `AgentKind` 迭代生成，不按 vendor 分支查询或路由，也不解析 vendor JSON。侧栏按 `AgentKind` 选择来源像素图标，仅用于标识。阻塞 IPC 一律走 GPUI background executor，UI 线程不等 daemon。机器页另在本机 `curl` 查 npm registry 的 CLI 最新版本（`versions.rs`），并能把与桌面端同版本的预编译 agentdeckd 从 GitHub Release 经 ssh 装到远端 `~/.local/bin`（`remotes.rs`）。
 - `Sources/AgentDeckMobileCore/`：iOS 使用的平台无关 Swift 模型，禁止 import AppKit/UIKit。
-- `agentdeck-protocol/`：本地 IPC 协议事实源 crate。分 trunk / capabilities / vendor 三个模块，`PROTOCOL_VERSION` = 5，`protocol_schema()` 聚合本地 v5 类型。
+- `agentdeck-protocol/`：本地 IPC 协议事实源 crate。分 trunk / capabilities / vendor 三个模块，`PROTOCOL_VERSION` = 6，`protocol_schema()` 聚合本地 v6 类型。
 - `agentdeckd/src/ipc.rs`：re-export `agentdeck-protocol::*` 壳，保持 daemon 内 `crate::ipc::X` 引用不变。
 - `agentdeckd/src/agent.rs`：`Agent` trait + `AgentKind` 枚举。两个 adapter 共享的逻辑在此，不得让 adapter 相互引用。
 - `agentdeckd/src/runtime/`：`RuntimeHub`（stdin loop + stdout writer）+ `AgentRouter`（sessionId → agentKind → adapter）。
@@ -75,7 +80,7 @@ poison 并退出 daemon。protocol v4 增加累计消息的 item identity/state/
 - **K2**：`RuntimeHub` 必须按 `sessionId` 阻止同一 runtime 并发 turn；session 创建时 `agentKind` 不可变，整个生命周期固定到一个 adapter。
 - **K3**：每个 turn 的成功、失败或取消 terminal 发出前，worker 必须先释放 turn-local 占用；连接仍健康时 session 回到 Ready 并保留 session-scoped child。只有 `SessionClosed` 表示 session 已结束，且必须在 direct child wait、Unix 进程组消失确认、pump 停止和路由清理后发送。
 - **K4**（加强）：所有事件主干消息必须带 `agentKind` 字段。
-- **K5**：run record 与 diagnostic log 写入 `~/Library/Application Support/AgentDeck/`（stable）或 `AgentDeck-Dev/`（dev），不得写入用户项目 git。
+- **K5**：run record 与 diagnostic log 写入 `~/Library/Application Support/AgentDeck/`（stable）或 `AgentDeck-Dev/`（dev），Linux 上根目录为 `~/.local/share/`，不得写入用户项目 git。
 - **K6**：`AGENTDECK_DATA_DIR` / `--profile` / `AGENTDECK_PROFILE` 控制数据目录隔离，不影响 vendor 登录状态或 vendor 历史。
 - **K7**：写入前做 best-effort 密钥脱敏；写失败不能静默，必须在可诊断位置暴露。
 - **K8**：vendor schema 不手写，Codex 协议来自官方 `codex app-server generate-json-schema`。
@@ -124,14 +129,17 @@ agentdeck-cli（参考客户端 / E2E 驱动，与 GUI 互相独立）
 
 `agentdeck-protocol` crate 是 IPC 协议的唯一事实源：
 
-- `PROTOCOL_VERSION`：当前为 5。v5 增加 `HistoryReply` / `HistoryWarning`，历史成功回复
+- `PROTOCOL_VERSION`：当前为 6。v6 增加 `AgentUpdate { agentKind }`，通过 admin 回复返回
+  更新输出或错误；`Selfcheck` 回复携带 daemon 版本。桌面端确认 `protocolVersion` 与当前版本一致（v6）
+  后才开放 CLI 更新，旧 daemon 的只读历史继续可用，Swift Core 同步命令编解码。
+  v5 增加 `HistoryReply` / `HistoryWarning`，历史成功回复
   保留顶层 `response` 并可携带同层 `warnings`；`HistoryReply` 只表示成功内容，忽略
   `reply` / `requestId` 等 envelope 字段，关联校验和错误识别仍由 client 负责。
   Swift Core 同步对应 Codable 类型。失败仍走 `error`。v4 的 `AgentItem` 必须携带 `turnId`、`itemId` 与
   `state`（streaming/completed），同 item 的文本是累计快照。v3 引入 caller-owned `sessionId` / `turnId`、显式
   `TurnStart` / `TurnCancel` / `SessionClose` 和两级 terminal；`TurnComplete` 暂只保留给
   尚未迁移的 Claude Code 路径。
-- `protocol_schema()`：schemars 从 Rust 类型派生的 JSON Schema，聚合所有 v5 公共类型。
+- `protocol_schema()`：schemars 从 Rust 类型派生的 JSON Schema，聚合所有 v6 公共类型。
 - 快照：`protocol/agentdeck/agentdeck-protocol.schema.json`（`UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot` 重生成）。
 - 漂移测试随 `cargo test` 运行。
 - 中立性测试（`neutrality_tests.rs`）守护 N1/N4。

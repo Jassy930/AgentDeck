@@ -428,7 +428,8 @@ pub struct HistoryListItem {
     pub agent_kind: AgentKind,
     pub title: Option<String>,
     pub cwd: PathBuf,
-    /// epoch milliseconds; for sorting only
+    /// epoch milliseconds supplied by the adapter as a recency key. Used for
+    /// ordering and local date grouping; zero means the adapter has no value.
     pub last_active_ms: u64,
     pub archived: bool,
 }
@@ -499,7 +500,7 @@ impl From<HistoryResponse> for HistoryReply {
     }
 }
 
-// ── ClientCommand — all v5 client-to-server commands ────────────────────────
+// ── ClientCommand — all v6 client-to-server commands ────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "command", rename_all = "camelCase", deny_unknown_fields)]
@@ -539,6 +540,11 @@ pub enum ClientCommand {
     ProtocolVersion,
     AgentList,
     AgentCapabilities {
+        #[serde(rename = "agentKind")]
+        agent_kind: AgentKind,
+    },
+    /// 用 agent CLI 自带的更新命令升级 daemon 所在机器上的 CLI。
+    AgentUpdate {
         #[serde(rename = "agentKind")]
         agent_kind: AgentKind,
     },

@@ -48,15 +48,17 @@ vendor。标准 Cargo 测试因此可作为默认离线门禁，但其中提前�
 check 名称是 `Offline CI / offline`，使用 `macos-15`，按顺序执行：
 
 1. `cargo fmt --all -- --check`。
-2. `scripts/verify-offline-tests.sh`，且入口显式 unset `AGENTDECK_E2E`。
-3. 构建当前 checkout 的 `agentdeckd` 与 `agentdeck`。
-4. 显式 unset `AGENTDECK_E2E`，以
+2. `node designs/agentdeck-design-system/tools/build.mjs --check-desktop`，只读比对
+   SSOT 应生成的 Rust 颜色与 `agentdeck-desktop/src/theme_tokens.rs`，漂移时失败。
+3. `scripts/verify-offline-tests.sh`，且入口显式 unset `AGENTDECK_E2E`。
+4. 构建当前 checkout 的 `agentdeckd` 与 `agentdeck`。
+5. 显式 unset `AGENTDECK_E2E`，以
    `AGENTDECK_DAEMON_BIN=$GITHUB_WORKSPACE/target/debug/agentdeckd` 和临时 data dir 运行
    CLI selfcheck，禁止命中旧 sibling 或系统安装；显式路径无效时必须 fail fast，不得
    fallback。
-5. 再次显式 unset gate，通过同一对当前 checkout 二进制输出 AgentDeck protocol schema
+6. 再次显式 unset gate，通过同一对当前 checkout 二进制输出 AgentDeck protocol schema
    并与快照比较。
-6. `swift test` 和 `scripts/verify-agent-docs.sh`。
+7. `swift test` 和 `scripts/verify-agent-docs.sh`。
 
 该 workflow 不设置 `AGENTDECK_E2E=1`，不运行真实 Codex / Claude Code，也不运行 iOS
 Simulator。`swift test` 只覆盖平台无关的 `AgentDeckMobileCore`；UIKit Simulator 仍按
@@ -73,6 +75,11 @@ cargo run -p agentdeck-desktop -- --selfcheck
 bash -n script/build_and_run.sh
 ./script/build_and_run.sh --verify
 ```
+
+颜色来自 `designs/agentdeck-design-system/tokens/tokens.json`。修改源 token 或生成器后，
+在设计系统目录运行 `bun run check` 生成并验证 Web / iOS / GPUI 产物；Rust 漂移检查
+使用上面的只读命令。配色实窗验收覆盖正文、行内与 fenced code、警告展开、侧栏选中
+和输入选区；共享 token 改动涉及 iOS 生成物时，同时执行 Swift 与 iOS Simulator 测试。
 
 selfcheck 的成功输出必须是单行 JSON，并明确包含：
 
@@ -102,27 +109,36 @@ selfcheck 的成功输出必须是单行 JSON，并明确包含：
 每个可交互桌面切片完成前至少确认：
 
 - [ ] `AgentDeck.app` 打开真实窗口并成为前台应用。
-- [ ] 侧栏渲染出品牌行、快捷入口、最近会话和本机 Agent 状态四段结构。
+- [ ] 侧栏渲染出品牌行、新建会话与搜索框、按日期分组的会话列表和左下角机器管理图标四段结构；
+      有机器连接或来源历史读取失败时图标标红，悬停提示显示失败台数；会话页同样可见。
+- [ ] 旧协议 daemon 的 CLI 更新按钮禁用并提示先更新／重装；当前协议更新仍需二次确认。
+      更新遇到传输失败不自动重放；断开连接与超时后 updater 及其子进程不能继续写入。
+      App 内置 Codex 显示通过对应 App 更新的指引，不启动更新命令。
+      远端 agentdeckd 安装期间“断开”禁用，安装结束后恢复并保留结果。
 - [ ] 侧栏的会话来自 daemon：按来源与 `agentdeck history list --agent <kind> --limit 50`
       对比条目标题、数量（CLI 不指定 limit 时默认总上限为 500）；
       加载中显示“正在读取会话…”，失败显示 daemon 返回的错误，无结果显示“没有可显示的会话”。
-- [ ] 部分来源失败时，成功来源仍可打开；失败来源在侧栏显示“读取失败”与错误原因，
+- [ ] 部分来源失败时，成功来源仍可打开；失败来源在机器页显示“读取失败”与错误原因，
       空态卡片同样显示失败，不把它当作 0 条。A→B→A 切换时旧读取结果不覆盖新结果。
+- [ ] 机器页：每台机器一张卡片，连接错误、兼容性警告和读取错误完整展开；页面可滚动，
+      连接输入框在顶部常驻，内容列在宽窗口中居中不溢出。
+      在连接或历史加载期间断开机器后，旧请求不重连，加载提示能结束；重新添加同名机器可正常读取。
 - [ ] 快速切换 A→B→C 时最多一个历史读取在执行，等待中的 B 被 C 替换；切回空态
       不再启动待查会话。所有来源完成且列表为空时，显示“没有可显示的会话”。
-- [ ] 空态渲染居中标题、composer 和按已注册 agent 生成的卡片；激活侧栏条目切到会话态并
-      加载该会话记录，激活“新建会话”切回空态；焦点移入 composer 后，当前条目仍显示选中态。
-- [ ] composer 可直接键入、粘贴中文多行文本；切换形态保留草稿，并显示当前会话的项目
-      与 agent（空态显示“未选择”）。
-- [ ] composer 空输入时只占两行（输入行 + 状态行）；发送和搜索禁用；空态卡片与侧栏 agent 区计数一致。
+- [ ] 空态渲染居中标题、按已注册 agent 生成的卡片和一行只读提示；激活侧栏条目切到会话态并
+      加载该会话记录，激活“新建会话”切回空态；焦点移入搜索框后，当前条目仍显示选中态。
+- [ ] 搜索框可键入中文，按标题或项目名实时过滤；点击 agent 卡片或机器页 agent 行只看该 agent，
+      再点取消，选中边框在悬停时仍可辨认；无结果显示“没有匹配的会话”。空态卡片与机器页 agent 行状态一致。
+- [ ] 过滤后键盘导航只在可见会话间移动并跳过日期分组标题；“加载更多”在有 agent 过滤时
+      只扩展该来源，按钮固定在列表下方；跨年日期带年份且行尾完整显示，未知时间留空。
 - [ ] 空态与会话态顶部双击均遵循系统设置；窗口拖动单独验收。
 - [ ] 会话记录中连续两个以上的过程块默认折叠成一行“过程”组摘要，点击展开后各块仍单独折叠；
       千项过程组折叠时仅占一个列表项，展开时成员保持虚拟化；收起再展开保留单块状态，
       切换多个组不串位。收起组后滚动位置与滚动条不跳动。会话记录右侧常驻滚动条，拖动可定位。
 - [ ] 最小窗口中的长会话标题省略显示，右侧 agent / 项目信息仍可见。
 - [ ] Tab 聚焦虚拟会话列表后，上下键能越过可见区并滚到目标，Return 打开该会话；
-      Tab / Shift-Tab 能离开列表，composer 中的方向键不触发会话导航。
-- [ ] composer 输入框聚焦时，`Command+Q` 能退出整个桌面进程；AgentDeck 菜单中的
+      组首会话与其日期标题同时可见；Tab / Shift-Tab 能离开列表，搜索框中的方向键不触发会话导航。
+- [ ] 搜索框聚焦时，`Command+Q` 能退出整个桌面进程；AgentDeck 菜单中的
       “退出 AgentDeck”同样生效。
 - [ ] 重新运行统一脚本能停止旧 bundle 实例并启动最新二进制。
 - [ ] 未实现的会话启动、turn、streaming 和审批能力没有伪 UI 或成功提示；桌面显示的

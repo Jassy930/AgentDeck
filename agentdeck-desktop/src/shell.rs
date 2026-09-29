@@ -1,7 +1,7 @@
-//! 桌面端外壳：全高侧栏 + 主区，主区在空态与会话态之间切换。
+//! 桌面端外壳：全高侧栏 + 主区，主区在空态、会话态和机器管理页之间切换。
 //!
-//! 会话列表和会话记录都来自本机 `agentdeckd`，通过 `daemon` 模块按 agent 拉取；
-//! 本期只读历史，不启动 session、不发 turn。
+//! 会话列表和会话记录来自本机与经 ssh 连接的远端 `agentdeckd`，通过 `daemon`
+//! 模块按机器、按 agent 拉取；本期只读历史，不启动 session、不发 turn。
 
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -18,30 +18,69 @@ use gpui_component::{
     ActiveTheme, InteractiveElementExt, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
-    input::InputState,
+    input::{InputEvent, InputState},
     v_flex,
 };
 
-use crate::composer;
 use crate::daemon;
+use crate::machines;
+use crate::remotes;
 use crate::sidebar;
 use crate::transcript;
+use crate::versions;
 
 /// 首屏和每次扩展的显示条数；多读一条用于判断是否还有会话。
 const SIDEBAR_LIMIT: usize = 50;
 
+/// 会话来源机器：`None` 是本机，`Some(host)` 是经 ssh 连接的远端。
+pub type Host = Option<SharedString>;
+
+/// 会话身份：不同机器上的 thread id 不保证唯一。
+pub type SessionKey = (Host, AgentKind, ThreadId);
+
+fn host_str(host: &Host) -> Option<&str> {
+    host.as_ref().map(AsRef::as_ref)
+}
+
+pub fn machine_label(host: &Host) -> SharedString {
+    host.clone().unwrap_or_else(|| "本机".into())
+}
+
+/// 侧栏里的一条会话：来源机器 + daemon 返回的历史条目。
+#[derive(Clone)]
+pub struct Session {
+    pub host: Host,
+    pub item: HistoryListItem,
+}
+
+impl Session {
+    pub fn key(&self) -> SessionKey {
+        (
+            self.host.clone(),
+            self.item.agent_kind,
+            self.item.thread_id.clone(),
+        )
+    }
+
+    pub fn is(&self, key: &SessionKey) -> bool {
+        self.host == key.0 && self.item.agent_kind == key.1 && self.item.thread_id == key.2
+    }
+}
+
 /// 主区当前展示的形态。
 pub enum Stage {
-    /// 空态：居中大标题、composer 和本机 agent 卡片。
+    /// 空态：居中大标题、只读提示和本机 agent 过滤卡片。
     Empty,
-    /// 会话态：thread header、会话记录和底部悬浮 composer。
+    /// 会话态：thread header、会话记录和底部只读提示。
     Session {
-        item: HistoryListItem,
+        session: Session,
         transcript: Transcript,
         /// 会话记录的虚拟列表状态（滚动位置、已测量的块高）；每次读取完成时重置。
         list: ListState,
         read_id: u64,
     },
+    /// 机器管理页：添加远端、查看每台机器与各 agent 的连接状态。
+    Machines,
 }
 
 /// 虚拟列表在可见区上下额外排版的高度，避免快速滚动时出现空白。
@@ -90,24 +129,17 @@ impl Stage {
         false
     }
 
-    /// 会话态的项目名；空态没有会话上下文。
-    pub fn project_name(&self) -> Option<String> {
+    pub fn key(&self) -> Option<SessionKey> {
         match self {
-            Stage::Empty => None,
-            Stage::Session { item, .. } => Some(project_name(item)),
-        }
-    }
-
-    pub fn thread_id(&self) -> Option<&ThreadId> {
-        match self {
-            Stage::Empty => None,
-            Stage::Session { item, .. } => Some(&item.thread_id),
+            Stage::Empty | Stage::Machines => None,
+            Stage::Session { session, .. } => Some(session.key()),
         }
     }
 }
 
 struct ReadRequest {
     id: u64,
+    client: daemon::Client,
     kind: AgentKind,
     thread_id: ThreadId,
 }
@@ -182,6 +214,11 @@ pub(crate) struct AgentHistory {
     limit: usize,
     has_more: bool,
     pub warnings: Vec<HistoryWarning>,
+    /// CLI 实际安装版本；None 表示仍在查询，查询失败记为 "unknown"。
+    pub version: Option<String>,
+    pub updating: bool,
+    /// 最近一次一键更新的结果：成功为命令输出，失败为错误。
+    pub update_result: Option<Result<String, String>>,
 }
 
 impl AgentHistory {
@@ -193,6 +230,9 @@ impl AgentHistory {
             limit: SIDEBAR_LIMIT,
             has_more: false,
             warnings: Vec::new(),
+            version: None,
+            updating: false,
+            update_result: None,
         }
     }
 
@@ -264,26 +304,82 @@ impl AgentHistory {
     }
 }
 
-fn empty_hint(agents: &[AgentHistory], pending: usize, error: Option<&str>) -> String {
-    if let Some(error) = error {
-        return error.to_string();
-    }
-    if agents.is_empty() {
-        return if pending > 0 {
-            "正在连接本机 agentdeckd…"
-        } else {
-            "本机 agentdeckd 没有注册任何 agent"
+/// 一台机器上的 daemon：AgentList 结果和各 agent 的历史读取状态。
+pub(crate) struct Machine {
+    /// 每次连接新分配；移除后再添加同名主机，也不会接受旧请求的迟到回复。
+    pub id: u64,
+    pub host: Host,
+    client: daemon::Client,
+    pub agents: Vec<AgentHistory>,
+    pub connecting: bool,
+    /// AgentList 的失败原因；各来源历史的错误由 AgentHistory 保留。
+    pub error: Option<String>,
+    /// agentdeckd 自身版本；None 表示仍在查询或未连上，查询失败记为 "unknown"。
+    pub daemon_version: Option<String>,
+    pub daemon_protocol: Option<u64>,
+    pub installing: bool,
+    /// 最近一次安装 agentdeckd 的结果：成功为新 daemon 的 `--version`，失败为错误。
+    pub install_result: Option<Result<String, String>>,
+}
+
+impl Machine {
+    fn new(id: u64, host: Host) -> Self {
+        let client = daemon::Client::new(host_str(&host));
+        Self {
+            id,
+            host,
+            client,
+            agents: Vec::new(),
+            connecting: false,
+            error: None,
+            daemon_version: None,
+            daemon_protocol: None,
+            installing: false,
+            install_result: None,
         }
-        .to_string();
     }
-    if agents.iter().any(|agent| agent.loaded > 0) {
-        "选择左侧会话查看记录，或试着输入任务"
-    } else if pending > 0 {
-        "正在读取会话…"
+
+    pub fn has_error(&self) -> bool {
+        self.error.is_some() || self.agents.iter().any(|agent| agent.error().is_some())
+    }
+
+    pub fn can_update_agents(&self) -> bool {
+        !self.connecting
+            && !self.installing
+            && self.daemon_protocol == Some(u64::from(agentdeck_protocol::PROTOCOL_VERSION))
+    }
+
+    /// 远端 login PATH 与 `~/.local/bin` 里都找不到 agentdeckd。
+    pub fn daemon_missing(&self) -> bool {
+        self.error
+            .as_deref()
+            .is_some_and(|error| error.contains(daemon::DAEMON_MISSING))
+    }
+}
+
+fn empty_hint(machines: &[Machine], pending: usize, filtered_empty: bool) -> String {
+    if filtered_empty {
+        return "没有匹配的会话".to_string();
+    }
+    let agents = || machines.iter().flat_map(|machine| &machine.agents);
+    if agents().any(|agent| agent.loaded > 0) {
+        return "选择左侧会话查看记录".to_string();
+    }
+    if pending > 0 {
+        return "正在读取会话…".to_string();
+    }
+    if let Some(machine) = machines.iter().find(|machine| machine.error.is_some()) {
+        return format!(
+            "{}：{}",
+            machine_label(&machine.host),
+            machine.error.as_deref().unwrap_or_default()
+        );
+    }
+    if agents().next().is_none() {
+        "agentdeckd 没有注册任何 agent".to_string()
     } else {
-        "没有可显示的会话"
+        "没有可显示的会话".to_string()
     }
-    .to_string()
 }
 
 /// 开发者模式的帧统计：只记录真实发生的绘制，GPUI 按需重绘，空闲时帧率本来就低。
@@ -309,17 +405,101 @@ impl FrameStats {
     }
 }
 
+/// 侧栏列表的一行：日期分组标题，或指向 `Shell::sessions` 的会话。
+pub(crate) enum SidebarRow {
+    Header(&'static str),
+    Session { index: usize, time: SharedString },
+}
+
+/// 毫秒时间戳的本地日序号、年、月、日、时、分。零表示 adapter 没有可显示的时间。
+/// 偏移取该时刻自己的，夏令时切换当天不会错位。
+#[cfg(unix)]
+fn local_time(ms: u64) -> Option<(i64, i32, i32, i32, i32, i32)> {
+    if ms == 0 {
+        return None;
+    }
+    let secs = (ms / 1000) as libc::time_t;
+    // SAFETY: localtime_r 只写入传入的 tm。
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&secs, &mut tm) };
+    Some((
+        (secs as i64 + tm.tm_gmtoff as i64).div_euclid(86_400),
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+    ))
+}
+
+/// 相对今天的分组；未来时间（时钟偏差）归入今天。
+fn day_group(day: i64, today: i64) -> &'static str {
+    match today - day {
+        ..=0 => "今天",
+        1 => "昨天",
+        2..=6 => "近 7 天",
+        _ => "更早",
+    }
+}
+
+/// 按标题或项目名（不区分大小写）和来源（机器 + agent）过滤。
+fn session_matches(session: &Session, query: &str, source: Option<&(Host, AgentKind)>) -> bool {
+    let item = &session.item;
+    source.is_none_or(|(host, kind)| session.host == *host && item.agent_kind == *kind)
+        && (query.is_empty()
+            || session_title(item).to_lowercase().contains(query)
+            || project_name(item).to_lowercase().contains(query))
+}
+
+/// 已过滤的会话（按最近活动倒序，带本地时间）插入分组标题。
+fn sidebar_rows(
+    visible: impl IntoIterator<Item = (usize, Option<(i64, i32, i32, i32, i32, i32)>)>,
+    today: i64,
+    current_year: i32,
+) -> Vec<SidebarRow> {
+    let mut rows = Vec::new();
+    let mut current = None;
+    for (index, time) in visible {
+        let group = time
+            .map(|(day, ..)| day_group(day, today))
+            .unwrap_or("更早");
+        if current != Some(group) {
+            current = Some(group);
+            rows.push(SidebarRow::Header(group));
+        }
+        let time = time
+            .map(|(day, year, month, mday, hour, minute)| {
+                if today - day <= 1 {
+                    format!("{hour:02}:{minute:02}")
+                } else if year != current_year {
+                    format!("{year}/{month}/{mday}")
+                } else {
+                    format!("{month}/{mday}")
+                }
+            })
+            .unwrap_or_default();
+        rows.push(SidebarRow::Session {
+            index,
+            time: time.into(),
+        });
+    }
+    rows
+}
+
+fn scroll_sidebar_to(rows: &[SidebarRow], scroll: &UniformListScrollHandle, row: usize) {
+    let offset = usize::from(row > 0 && matches!(rows[row - 1], SidebarRow::Header(_)));
+    scroll.scroll_to_item_with_offset(row, ScrollStrategy::Top, offset);
+}
+
 fn sidebar_target(
-    sessions: &[HistoryListItem],
-    cursor: Option<&(AgentKind, ThreadId)>,
+    sessions: &[&Session],
+    cursor: Option<&SessionKey>,
     step: isize,
 ) -> Option<usize> {
     let last = sessions.len().checked_sub(1)?;
-    // 两个来源异步加载会重排列表，游标始终按会话身份定位。
+    // 多个来源异步加载会重排列表，游标始终按会话身份定位。
     let current = match cursor {
-        Some((kind, id)) => sessions
-            .iter()
-            .position(|item| item.agent_kind == *kind && item.thread_id == *id),
+        Some(key) => sessions.iter().position(|session| session.is(key)),
         None => Some(0),
     };
     match current {
@@ -331,23 +511,39 @@ fn sidebar_target(
 }
 
 pub struct Shell {
-    stage: Stage,
+    pub(crate) stage: Stage,
     /// Some 表示开启开发者模式，右上角显示 FPS。
     frame_stats: Option<FrameStats>,
     next_read_id: u64,
     reads: ReadQueue,
-    composer: Entity<InputState>,
-    /// daemon 已注册的 agent，决定侧栏按哪些来源拉历史。
-    pub(crate) agents: Vec<AgentHistory>,
-    /// 所有来源合并后的会话，按最近活动倒序。
-    pub(crate) sessions: Vec<HistoryListItem>,
+    /// 侧栏搜索框：按标题或项目名过滤会话。
+    pub(crate) search: Entity<InputState>,
+    /// 只看某台机器上某个 agent 的会话；主页卡片和机器页 agent 行切换。
+    pub(crate) agent_filter: Option<(Host, AgentKind)>,
+    /// 本机固定在首位，其后是已连接的远端；每台机器各自决定按哪些 agent 拉历史。
+    pub(crate) machines: Vec<Machine>,
+    next_machine_id: u64,
+    /// 所有机器、所有来源合并后的会话，按最近活动倒序。
+    pub(crate) sessions: Vec<Session>,
+    /// 过滤并分组后的侧栏行；只在会话、搜索词或过滤变化时重建。
+    pub(crate) rows: Vec<SidebarRow>,
     pub(crate) sidebar_focus: FocusHandle,
     pub(crate) sidebar_scroll: UniformListScrollHandle,
-    sidebar_cursor: Option<(AgentKind, ThreadId)>,
+    sidebar_cursor: Option<SessionKey>,
     /// 尚未返回的 daemon 请求数；用于区分"还在加载"和"确实没有会话"。
     pub(crate) pending: usize,
-    /// AgentList 的失败原因；各来源历史的错误由 AgentHistory 保留。
-    pub(crate) error: Option<String>,
+    /// 机器页"连接远端"表单：输入框和校验或保存失败的提示。
+    pub(crate) remote_input: Entity<InputState>,
+    pub(crate) remote_error: Option<String>,
+    /// ssh config 里的 Host 别名，进入机器页时重读。
+    pub(crate) ssh_hosts: Vec<String>,
+    /// npm 上各 agent CLI 的最新版本，按返回顺序追加。
+    latest: Vec<(AgentKind, Result<String, String>)>,
+    latest_requested: bool,
+    /// ssh config 快速添加区默认折叠，免得占掉机器列表的位置。
+    pub(crate) quick_add_open: bool,
+    /// 已点过一次、等待确认的更新按钮；鼠标移开即取消。
+    pub(crate) update_armed: Option<(u64, AgentKind)>,
 }
 
 impl Shell {
@@ -359,32 +555,54 @@ impl Shell {
         dev_mode: bool,
         cx: &mut Context<Self>,
     ) -> Self {
-        let composer = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("描述任务，预览输入效果…")
-                .multi_line(true)
-                .auto_grow(1, 8)
-        });
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索会话"));
+        cx.subscribe(&search, |shell, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                shell.rebuild_rows(cx);
+                cx.notify();
+            }
+        })
+        .detach();
+        // 打开窗口即可直接搜索。
+        search.update(cx, |input, cx| input.focus(window, cx));
 
-        // 打开窗口即可直接输入。切换形态时的聚焦留到接入真实会话时一并处理。
-        composer.update(cx, |input, cx| input.focus(window, cx));
+        let remote_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("ssh 主机，如 dt 或 user@host"));
+        cx.subscribe(&remote_input, |shell, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                shell.connect_remote(cx);
+            }
+        })
+        .detach();
 
         let mut shell = Self {
             stage: Stage::Empty,
             frame_stats: dev_mode.then(FrameStats::default),
             next_read_id: 0,
             reads: ReadQueue::default(),
-            composer,
-            agents: Vec::new(),
+            search,
+            agent_filter: None,
+            machines: Vec::new(),
+            next_machine_id: 0,
             sessions: Vec::new(),
+            rows: Vec::new(),
             sidebar_focus: cx.focus_handle(),
             sidebar_scroll: UniformListScrollHandle::new(),
             sidebar_cursor: None,
             pending: 0,
-            error: None,
+            remote_input,
+            remote_error: None,
+            ssh_hosts: Vec::new(),
+            latest: Vec::new(),
+            latest_requested: false,
+            quick_add_open: false,
+            update_armed: None,
         };
         if connect_daemon {
-            shell.load_sessions(cx);
+            shell.add_machine(None, cx);
+            for host in remotes::load() {
+                shell.add_machine(Some(host.into()), cx);
+            }
         }
         if dev_mode {
             // 空闲时每秒补一帧，让 FPS 数字回落到真实值而不是停在最后一次交互。
@@ -401,25 +619,144 @@ impl Shell {
         shell
     }
 
+    fn machine(&self, id: u64) -> Option<&Machine> {
+        self.machines.iter().find(|machine| machine.id == id)
+    }
+
+    fn machine_mut(&mut self, id: u64) -> Option<&mut Machine> {
+        self.machines.iter_mut().find(|machine| machine.id == id)
+    }
+
+    fn add_machine(&mut self, host: Host, cx: &mut Context<Self>) {
+        self.next_machine_id += 1;
+        let id = self.next_machine_id;
+        self.machines.push(Machine::new(id, host));
+        self.load_machine(id, cx);
+    }
+
     /// 先问 daemon 注册了哪些 agent，再按 agent 分别拉历史：谁先返回谁先进侧栏，
-    /// 慢的来源不挡住快的。
-    fn load_sessions(&mut self, cx: &mut Context<Self>) {
+    /// 慢的来源不挡住快的；每台机器互不阻塞。
+    fn load_machine(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(machine) = self.machine_mut(id) else {
+            return;
+        };
+        machine.connecting = true;
+        let client = machine.client.clone();
         self.pending += 1;
         cx.spawn(async move |this, cx| {
             let agents = cx
                 .background_executor()
-                .spawn(async { daemon::agent_list() })
+                .spawn(async move { client.agent_list() })
                 .await;
             this.update(cx, |shell, cx| {
                 shell.pending -= 1;
+                cx.notify();
+                // 机器已被移除：丢弃迟到的回复。
+                let Some(machine) = shell.machine_mut(id) else {
+                    return;
+                };
+                machine.connecting = false;
                 match agents {
                     Ok(kinds) => {
-                        shell.agents = kinds.iter().copied().map(AgentHistory::new).collect();
+                        machine.agents = kinds.iter().copied().map(AgentHistory::new).collect();
                         for kind in kinds {
-                            shell.load_agent_sessions(kind, cx);
+                            shell.load_agent_sessions(id, kind, cx);
+                            shell.load_agent_version(id, kind, cx);
                         }
+                        shell.load_daemon_version(id, cx);
                     }
-                    Err(message) => shell.error = Some(message),
+                    Err(message) => machine.error = Some(message),
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 机器页展示用；失败只影响版本显示，不影响会话读取。
+    fn load_agent_version(&mut self, id: u64, kind: AgentKind, cx: &mut Context<Self>) {
+        let Some(machine) = self.machine(id) else {
+            return;
+        };
+        let client = machine.client.clone();
+        cx.spawn(async move |this, cx| {
+            let version = cx
+                .background_executor()
+                .spawn(async move { client.agent_version(kind) })
+                .await;
+            this.update(cx, |shell, cx| {
+                let agent = shell
+                    .machine_mut(id)
+                    .and_then(|machine| machine.agents.iter_mut().find(|a| a.kind == kind));
+                if let Some(agent) = agent {
+                    // 查询失败也要明示拿不到，不能留空或显示默认版本。
+                    agent.version = Some(version.unwrap_or_else(|_| "unknown".into()));
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn load_daemon_version(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(machine) = self.machine(id) else {
+            return;
+        };
+        let client = machine.client.clone();
+        cx.spawn(async move |this, cx| {
+            let version = cx
+                .background_executor()
+                .spawn(async move { client.daemon_info() })
+                .await;
+            this.update(cx, |shell, cx| {
+                if let Some(machine) = shell.machine_mut(id) {
+                    let (version, protocol) = match version {
+                        Ok((version, protocol)) => (version, Some(protocol)),
+                        Err(_) => ("unknown".into(), None),
+                    };
+                    machine.daemon_version = Some(version);
+                    machine.daemon_protocol = protocol;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 装上与桌面端同版本的预编译 agentdeckd，成功后断开旧连接重新读取。
+    pub fn install_daemon(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(machine) = self.machine_mut(id) else {
+            return;
+        };
+        let Some(host) = machine.host.clone() else {
+            return;
+        };
+        if machine.installing || machine.agents.iter().any(|agent| agent.updating) {
+            return;
+        }
+        machine.installing = true;
+        machine.install_result = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { remotes::install_daemon(&host) })
+                .await;
+            this.update(cx, |shell, cx| {
+                let Some(machine) = shell.machine_mut(id) else {
+                    return;
+                };
+                machine.installing = false;
+                let ok = result.is_ok();
+                machine.install_result = Some(result);
+                if ok {
+                    machine.client.reset();
+                    machine.error = None;
+                    machine.daemon_version = None;
+                    machine.daemon_protocol = None;
+                    shell.load_machine(id, cx);
                 }
                 cx.notify();
             })
@@ -428,107 +765,358 @@ impl Shell {
         .detach();
     }
 
-    fn load_agent_sessions(&mut self, kind: AgentKind, cx: &mut Context<Self>) {
-        let Some(agent) = self.agents.iter().find(|agent| agent.kind == kind) else {
+    pub fn toggle_quick_add(&mut self, cx: &mut Context<Self>) {
+        self.quick_add_open = !self.quick_add_open;
+        cx.notify();
+    }
+
+    /// 更新按钮两段式确认：第一次点击只进入待确认，再点一次才真正更新。
+    pub fn click_update(&mut self, id: u64, kind: AgentKind, cx: &mut Context<Self>) {
+        if self.update_armed.take() == Some((id, kind)) {
+            self.update_agent(id, kind, cx);
+        } else {
+            self.update_armed = Some((id, kind));
+        }
+        cx.notify();
+    }
+
+    pub fn disarm_update(&mut self, id: u64, kind: AgentKind, cx: &mut Context<Self>) {
+        if self.update_armed == Some((id, kind)) {
+            self.update_armed = None;
+            cx.notify();
+        }
+    }
+
+    /// 一键更新：跑 CLI 自带的更新命令，完成后重查版本。
+    pub fn update_agent(&mut self, id: u64, kind: AgentKind, cx: &mut Context<Self>) {
+        let Some(machine) = self.machine_mut(id) else {
+            return;
+        };
+        if !machine.can_update_agents() {
+            return;
+        }
+        let client = machine.client.clone();
+        let Some(agent) = machine.agents.iter_mut().find(|a| a.kind == kind) else {
+            return;
+        };
+        if agent.updating {
+            return;
+        }
+        agent.updating = true;
+        agent.update_result = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.agent_update(kind) })
+                .await;
+            this.update(cx, |shell, cx| {
+                let agent = shell
+                    .machine_mut(id)
+                    .and_then(|machine| machine.agents.iter_mut().find(|a| a.kind == kind));
+                if let Some(agent) = agent {
+                    agent.updating = false;
+                    agent.update_result = Some(result);
+                    agent.version = None;
+                    shell.load_agent_version(id, kind, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn load_agent_sessions(&mut self, id: u64, kind: AgentKind, cx: &mut Context<Self>) {
+        let Some(machine) = self.machine(id) else {
+            return;
+        };
+        let Some(agent) = machine.agents.iter().find(|agent| agent.kind == kind) else {
             return;
         };
         let limit = agent.request_limit();
+        let host = machine.host.clone();
+        let client = machine.client.clone();
         self.pending += 1;
         cx.spawn(async move |this, cx| {
             let mut listed = cx
                 .background_executor()
-                .spawn(async move { daemon::history_list(kind, limit) })
+                .spawn(async move { client.history_list(kind, limit) })
                 .await;
             this.update(cx, |shell, cx| {
                 shell.pending -= 1;
-                if let Some(agent) = shell.agents.iter_mut().find(|agent| agent.kind == kind) {
+                cx.notify();
+                let Some(machine) = shell.machine_mut(id) else {
+                    return;
+                };
+                if let Some(agent) = machine.agents.iter_mut().find(|agent| agent.kind == kind) {
                     agent.complete(&mut listed);
                 }
-                if let Ok((mut items, _)) = listed {
-                    shell.sessions.retain(|item| item.agent_kind != kind);
-                    shell.sessions.append(&mut items);
+                if let Ok((items, _)) = listed {
                     shell
                         .sessions
-                        .sort_by(|a, b| b.last_active_ms.cmp(&a.last_active_ms));
+                        .retain(|session| session.host != host || session.item.agent_kind != kind);
+                    shell.sessions.extend(items.into_iter().map(|item| Session {
+                        host: host.clone(),
+                        item,
+                    }));
+                    shell
+                        .sessions
+                        .sort_by_key(|s| std::cmp::Reverse(s.item.last_active_ms));
+                    shell.rebuild_rows(cx);
                 }
-                cx.notify();
             })
             .ok();
         })
         .detach();
     }
 
-    pub fn retry_connection(&mut self, cx: &mut Context<Self>) {
-        if self.error.take().is_some() {
-            self.load_sessions(cx);
+    pub fn retry_machine(&mut self, id: u64, cx: &mut Context<Self>) {
+        if self
+            .machine_mut(id)
+            .is_some_and(|machine| machine.error.take().is_some())
+        {
+            self.load_machine(id, cx);
             cx.notify();
         }
     }
 
-    pub fn retry_agent(&mut self, kind: AgentKind, cx: &mut Context<Self>) {
+    pub fn retry_agent(&mut self, id: u64, kind: AgentKind, cx: &mut Context<Self>) {
         if self
-            .agents
-            .iter_mut()
-            .find(|agent| agent.kind == kind)
+            .machine_mut(id)
+            .and_then(|machine| machine.agents.iter_mut().find(|agent| agent.kind == kind))
             .is_some_and(AgentHistory::retry)
         {
-            self.load_agent_sessions(kind, cx);
+            self.load_agent_sessions(id, kind, cx);
             cx.notify();
         }
     }
 
-    pub fn load_more_agent(&mut self, kind: AgentKind, cx: &mut Context<Self>) {
-        if self
-            .agents
-            .iter_mut()
-            .find(|agent| agent.kind == kind)
-            .is_some_and(AgentHistory::load_more)
-        {
-            self.load_agent_sessions(kind, cx);
-            cx.notify();
+    pub fn show_machines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.stage = Stage::Machines;
+        self.reads.clear_pending();
+        self.remote_error = None;
+        self.ssh_hosts = remotes::ssh_config_hosts();
+        self.load_latest_versions(cx);
+        self.remote_input
+            .update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    /// 各 agent CLI 在 npm 上的最新版本；首次打开机器页时查一次，selfcheck 路径不联网。
+    fn load_latest_versions(&mut self, cx: &mut Context<Self>) {
+        if std::mem::replace(&mut self.latest_requested, true) {
+            return;
         }
+        for kind in [AgentKind::Codex, AgentKind::ClaudeCode] {
+            cx.spawn(async move |this, cx| {
+                let latest = cx
+                    .background_executor()
+                    .spawn(async move { versions::fetch_latest(kind) })
+                    .await;
+                this.update(cx, |shell, cx| {
+                    shell.latest.push((kind, latest));
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
+    pub fn latest_version(&self, kind: AgentKind) -> Option<&Result<String, String>> {
+        self.latest
+            .iter()
+            .find(|(k, _)| *k == kind)
+            .map(|(_, latest)| latest)
+    }
+
+    fn save_remotes(&mut self) {
+        let hosts: Vec<&str> = self
+            .machines
+            .iter()
+            .filter_map(|machine| host_str(&machine.host))
+            .collect();
+        self.remote_error = remotes::save(&hosts).err();
+    }
+
+    /// 连接输入框里的主机：校验、去重、持久化，然后像本机一样拉取历史。
+    pub fn connect_remote(&mut self, cx: &mut Context<Self>) {
+        let host = self.remote_input.read(cx).value().trim().to_string();
+        self.connect_host(host, cx);
+    }
+
+    pub fn is_connected(&self, host: &str) -> bool {
+        self.machines
+            .iter()
+            .any(|machine| host_str(&machine.host) == Some(host))
+    }
+
+    pub fn connect_host(&mut self, host: String, cx: &mut Context<Self>) {
+        if let Err(message) = daemon::validate_host(&host) {
+            self.remote_error = Some(message);
+        } else if self.is_connected(&host) {
+            self.remote_error = Some(format!("{host} 已连接"));
+        } else {
+            self.add_machine(Some(host.into()), cx);
+            self.save_remotes();
+        }
+        cx.notify();
+    }
+
+    /// 断开远端：移除其会话与状态；正在查看它的会话时回到空态。
+    pub fn remove_machine(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(index) = self.machines.iter().position(|machine| machine.id == id) else {
+            return;
+        };
+        if self.machines[index].installing {
+            return;
+        }
+        let machine = self.machines.remove(index);
+        machine.client.disconnect();
+        let host = machine.host;
+        self.sessions.retain(|session| session.host != host);
+        if self
+            .agent_filter
+            .as_ref()
+            .is_some_and(|(filtered, _)| *filtered == host)
+        {
+            self.agent_filter = None;
+        }
+        if self.stage.key().is_some_and(|key| key.0 == host) {
+            self.show_empty(cx);
+        }
+        self.save_remotes();
+        self.rebuild_rows(cx);
+        cx.notify();
+    }
+
+    /// 还能加载更多的来源；有来源过滤时只算该来源。
+    pub fn load_more_targets(&self) -> Vec<(u64, AgentKind)> {
+        self.machines
+            .iter()
+            .flat_map(|machine| {
+                machine
+                    .agents
+                    .iter()
+                    .filter(|agent| {
+                        agent.can_load_more()
+                            && self.agent_filter.as_ref().is_none_or(|(host, kind)| {
+                                *host == machine.host && *kind == agent.kind
+                            })
+                    })
+                    .map(|agent| (machine.id, agent.kind))
+            })
+            .collect()
+    }
+
+    pub fn load_more(&mut self, cx: &mut Context<Self>) {
+        for (id, kind) in self.load_more_targets() {
+            if self
+                .machine_mut(id)
+                .and_then(|machine| machine.agents.iter_mut().find(|agent| agent.kind == kind))
+                .is_some_and(AgentHistory::load_more)
+            {
+                self.load_agent_sessions(id, kind, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_agent_filter(&mut self, host: Host, kind: AgentKind, cx: &mut Context<Self>) {
+        let source = (host, kind);
+        self.agent_filter = (self.agent_filter.as_ref() != Some(&source)).then_some(source);
+        self.rebuild_rows(cx);
+        cx.notify();
+    }
+
+    // ponytail: 分组相对重建时刻的“今天”，窗口跨午夜不动时不刷新；需要时加定时重建。
+    fn rebuild_rows(&mut self, cx: &App) {
+        let query = self.search.read(cx).value().trim().to_lowercase();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as u64);
+        let (today, current_year, ..) = local_time(now).unwrap_or_default();
+        self.rows = sidebar_rows(
+            self.sessions
+                .iter()
+                .enumerate()
+                .filter(|(_, session)| session_matches(session, &query, self.agent_filter.as_ref()))
+                .map(|(index, session)| (index, local_time(session.item.last_active_ms))),
+            today,
+            current_year,
+        );
+        let cursor = self.sidebar_cursor.clone();
+        if cursor.is_some_and(|cursor| {
+            !self.rows.iter().any(|row| {
+                matches!(row, SidebarRow::Session { index, .. } if self.sessions[*index].is(&cursor))
+            })
+        }) {
+            self.sidebar_cursor = None;
+        }
+    }
+
+    /// 可见会话的行号与条目，键盘导航只在这些行之间移动。
+    fn visible_rows(&self) -> (Vec<usize>, Vec<&Session>) {
+        self.rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row, entry)| match entry {
+                SidebarRow::Session { index, .. } => Some((row, &self.sessions[*index])),
+                SidebarRow::Header(_) => None,
+            })
+            .unzip()
     }
 
     fn retry_transcript(&mut self, cx: &mut Context<Self>) {
         if let Stage::Session {
-            item,
+            session,
             transcript: Transcript::Failed(_),
             ..
         } = &self.stage
         {
-            self.open_session(item.clone(), cx);
+            self.open_session(session.clone(), cx);
         }
     }
 
-    pub fn sidebar_cursor_index(&self) -> Option<usize> {
-        sidebar_target(&self.sessions, self.sidebar_cursor.as_ref(), 0)
+    /// 键盘光标所在的侧栏行号。
+    pub fn sidebar_cursor_row(&self) -> Option<usize> {
+        let (rows, items) = self.visible_rows();
+        sidebar_target(&items, self.sidebar_cursor.as_ref(), 0).map(|index| rows[index])
     }
 
     pub fn navigate_sidebar(&mut self, step: isize, cx: &mut Context<Self>) {
-        if let Some(index) = sidebar_target(&self.sessions, self.sidebar_cursor.as_ref(), step) {
-            let item = &self.sessions[index];
-            self.sidebar_cursor = Some((item.agent_kind, item.thread_id.clone()));
-            self.sidebar_scroll
-                .scroll_to_item(index, ScrollStrategy::Top);
+        let (rows, items) = self.visible_rows();
+        let target = sidebar_target(&items, self.sidebar_cursor.as_ref(), step)
+            .map(|index| (rows[index], items[index].key()));
+        if let Some((row, key)) = target {
+            self.sidebar_cursor = Some(key);
+            scroll_sidebar_to(&self.rows, &self.sidebar_scroll, row);
             cx.notify();
         }
     }
 
     pub fn open_sidebar_cursor(&mut self, cx: &mut Context<Self>) {
-        if let Some(index) = self.sidebar_cursor_index() {
-            self.sidebar_scroll
-                .scroll_to_item(index, ScrollStrategy::Top);
+        let Some(row) = self.sidebar_cursor_row() else {
+            return;
+        };
+        if let SidebarRow::Session { index, .. } = self.rows[row] {
+            scroll_sidebar_to(&self.rows, &self.sidebar_scroll, row);
             self.open_session(self.sessions[index].clone(), cx);
         }
     }
 
-    pub fn open_session(&mut self, item: HistoryListItem, cx: &mut Context<Self>) {
-        let (kind, thread_id) = (item.agent_kind, item.thread_id.clone());
-        self.sidebar_cursor = Some((kind, thread_id.clone()));
+    pub fn open_session(&mut self, session: Session, cx: &mut Context<Self>) {
+        let (host, kind, thread_id) = session.key();
+        let Some(machine) = self.machines.iter().find(|machine| machine.host == host) else {
+            return;
+        };
+        let client = machine.client.clone();
+        self.sidebar_cursor = Some(session.key());
         self.next_read_id += 1;
         let read_id = self.next_read_id;
         self.stage = Stage::Session {
-            item,
+            session,
             transcript: Transcript::Loading,
             list: transcript_list(),
             read_id,
@@ -537,6 +1125,7 @@ impl Shell {
 
         if let Some(request) = self.reads.push(ReadRequest {
             id: read_id,
+            client,
             kind,
             thread_id,
         }) {
@@ -550,7 +1139,9 @@ impl Shell {
             let read = cx
                 .background_executor()
                 .spawn(async move {
-                    daemon::history_read(request.kind, request.thread_id)
+                    request
+                        .client
+                        .history_read(request.kind, request.thread_id)
                         .map(|(turns, warnings)| (transcript::prepare(turns), warnings))
                 })
                 .await;
@@ -574,14 +1165,30 @@ impl Shell {
         cx.notify();
     }
 
-    fn render_empty(&self, cx: &App) -> impl IntoElement + use<> {
+    fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let multi_machine = self.machines.len() > 1;
         let cards: Vec<_> = self
-            .agents
+            .machines
             .iter()
-            .map(|agent| connector_card(&agent_label(agent.kind), &agent.status(), cx))
+            .flat_map(|machine| {
+                machine.agents.iter().map(|agent| {
+                    let source = (machine.host.clone(), agent.kind);
+                    let selected = self.agent_filter.as_ref() == Some(&source);
+                    (source, agent.status(), selected)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|(source, status, selected)| {
+                connector_card(source, multi_machine, &status, selected, cx)
+            })
             .collect();
 
-        let hint = empty_hint(&self.agents, self.pending, self.error.as_deref());
+        let hint = empty_hint(
+            &self.machines,
+            self.pending,
+            !self.sessions.is_empty() && self.rows.is_empty(),
+        );
 
         v_flex()
             .flex_1()
@@ -607,20 +1214,27 @@ impl Shell {
                                     .child(hint),
                             ),
                     )
-                    .child(composer::render(&self.composer, None, None, cx))
-                    .child(h_flex().gap_3().children(cards)),
+                    .child(
+                        h_flex()
+                            .flex_wrap()
+                            .justify_center()
+                            .gap_3()
+                            .children(cards),
+                    )
+                    .child(read_only_notice(cx)),
             )
     }
 
     fn render_session(
         &self,
-        item: &HistoryListItem,
+        session: &Session,
         transcript: &Transcript,
         list: &ListState,
         read_id: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
+        let item = &session.item;
         let body = match transcript {
             Transcript::Loading => placeholder("正在读取会话记录…", cx).into_any_element(),
             Transcript::Failed(message) => v_flex()
@@ -661,7 +1275,7 @@ impl Shell {
         v_flex()
             .flex_1()
             .h_full()
-            // 裁剪在这一层：长会话记录不能顶穿底部 composer。
+            // 裁剪在这一层：长会话记录不能顶穿底部只读提示。
             .overflow_hidden()
             .child(
                 // thread header：左标题，右上环境信息。高度同时吃掉红绿灯占位。
@@ -694,9 +1308,10 @@ impl Shell {
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
                             .child(format!(
-                                "{} · {}",
+                                "{} · {} · {}",
                                 agent_label(item.agent_kind),
-                                project_name(item)
+                                project_name(item),
+                                machine_label(&session.host)
                             )),
                     ),
             )
@@ -718,7 +1333,7 @@ impl Shell {
                             .flex_shrink_0()
                             .px_5()
                             .py_1()
-                            .bg(cx.theme().warning.opacity(0.1))
+                            .bg(crate::theme_tokens::WARN_WEAK)
                             .child(
                                 Button::new(("transcript-warning-toggle", read_id))
                                     .ghost()
@@ -758,19 +1373,15 @@ impl Shell {
             )
             .child(body)
             .child(
-                // 底部悬浮 composer：固定高度，不被上方记录挤压或盖住。
+                // 发送接入前只留一行只读提示；固定高度，不被上方记录挤压。
                 h_flex()
                     .w_full()
                     .flex_shrink_0()
                     .justify_center()
-                    .px_6()
-                    .pb_6()
-                    .child(composer::render(
-                        &self.composer,
-                        self.stage.project_name().as_deref(),
-                        Some(&agent_label(item.agent_kind)),
-                        cx,
-                    )),
+                    .py_3()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .child(read_only_notice(cx)),
             )
     }
 }
@@ -784,21 +1395,73 @@ fn placeholder(text: &str, cx: &App) -> impl IntoElement + use<> {
     )
 }
 
-fn connector_card(name: &str, status: &str, cx: &App) -> impl IntoElement + use<> {
+fn read_only_notice(cx: &App) -> impl IntoElement + use<> {
+    div()
+        .text_sm()
+        .text_color(cx.theme().muted_foreground)
+        .child("只读历史预览，暂不能发送任务")
+}
+
+/// 主页 agent 卡片：点击只看该机器上该 agent 的会话，再点取消。
+/// 多台机器时标题带机器名，否则与单机时一致。
+fn connector_card(
+    (host, kind): (Host, AgentKind),
+    show_machine: bool,
+    status: &str,
+    selected: bool,
+    cx: &mut Context<Shell>,
+) -> impl IntoElement + use<> {
+    let title = if show_machine {
+        format!("{} · {}", agent_label(kind), machine_label(&host))
+    } else {
+        agent_label(kind)
+    };
     v_flex()
+        .id(SharedString::from(format!(
+            "agent-card-{}-{}",
+            machine_label(&host),
+            kind.as_str()
+        )))
         .w(px(220.))
         .gap_1()
         .p_4()
         .rounded_lg()
-        .bg(cx.theme().secondary)
+        .bg(cx.theme().muted)
         .border_1()
-        .border_color(cx.theme().border)
-        .child(div().text_sm().font_semibold().child(name.to_string()))
+        .border_color(if selected {
+            cx.theme().ring
+        } else {
+            cx.theme().border
+        })
+        .cursor_pointer()
+        .hover(|style| style.bg(cx.theme().secondary_hover))
+        .on_click(
+            cx.listener(move |shell, _, _, cx| shell.toggle_agent_filter(host.clone(), kind, cx)),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(sidebar::agent_icon(kind, false))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .whitespace_normal()
+                        .text_sm()
+                        .font_semibold()
+                        .child(title),
+                ),
+        )
         .child(
             div()
                 .text_sm()
-                .text_color(cx.theme().secondary_foreground)
-                .child(status.to_string()),
+                .text_color(cx.theme().muted_foreground)
+                .child(if selected {
+                    format!("{status} · 已筛选")
+                } else {
+                    status.to_string()
+                }),
         )
 }
 
@@ -806,19 +1469,17 @@ impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let main = match &self.stage {
             Stage::Empty => self.render_empty(cx).into_any_element(),
+            Stage::Machines => machines::render(self, cx).into_any_element(),
             Stage::Session {
-                item,
+                session,
                 transcript,
                 list,
                 read_id,
             } => self
-                .render_session(item, transcript, list, *read_id, window, cx)
+                .render_session(session, transcript, list, *read_id, window, cx)
                 .into_any_element(),
         };
-        let selected: Option<SharedString> = self
-            .stage
-            .thread_id()
-            .map(|thread_id| thread_id.0.clone().into());
+        let selected = self.stage.key();
 
         let fps = self.frame_stats.as_mut().map(|stats| {
             let (fps, interval) = stats.record(Instant::now());
@@ -851,10 +1512,13 @@ impl Render for Shell {
 mod tests {
     use super::sidebar_target;
     use super::{
-        AgentHistory, FrameStats, ReadQueue, ReadRequest, Stage, Transcript, agent_label,
-        empty_hint, project_name, session_title, transcript_list,
+        AgentHistory, FrameStats, Machine, ReadQueue, ReadRequest, Session, SidebarRow, Stage,
+        Transcript, agent_label, day_group, empty_hint, local_time, project_name,
+        scroll_sidebar_to, session_matches, session_title, sidebar_rows, transcript_list,
     };
+    use crate::daemon;
     use agentdeck_protocol::{AgentKind, HistoryListItem, HistoryWarning, ThreadId};
+    use gpui::{ScrollStrategy, UniformListScrollHandle};
 
     fn warning() -> HistoryWarning {
         HistoryWarning {
@@ -875,33 +1539,48 @@ mod tests {
         }
     }
 
+    fn local(item: HistoryListItem) -> Session {
+        Session { host: None, item }
+    }
+
+    fn remote(item: HistoryListItem) -> Session {
+        Session {
+            host: Some("dt".into()),
+            item,
+        }
+    }
+
     #[test]
-    fn navigation_keeps_the_selected_thread_and_project_together() {
+    fn navigation_keeps_the_selected_thread() {
         let mut stage = Stage::Empty;
-        assert_eq!((stage.thread_id(), stage.project_name()), (None, None));
+        assert_eq!(stage.key(), None);
 
         stage = Stage::Session {
-            item: item(Some("修复记录收尾")),
+            session: remote(item(Some("修复记录收尾"))),
             transcript: Transcript::Loading,
             list: transcript_list(),
             read_id: 1,
         };
-        assert_eq!(stage.thread_id().map(|id| id.0.as_str()), Some("7330efa6"));
-        assert_eq!(stage.project_name(), Some("AgentDeck".to_string()));
+        let key = stage.key().unwrap();
+        assert_eq!(key.0.as_deref().map(AsRef::as_ref), Some("dt"));
+        assert_eq!(key.2.0, "7330efa6");
+        // 同一 thread id 在另一台机器上是另一个会话。
+        assert!(!local(item(None)).is(&key));
+        assert!(remote(item(None)).is(&key));
 
         stage = Stage::Empty;
-        assert_eq!((stage.thread_id(), stage.project_name()), (None, None));
+        assert_eq!(stage.key(), None);
     }
 
     #[test]
     fn sidebar_navigation_tracks_identity_across_reordering_and_clamps_at_the_ends() {
-        let first = item(Some("A"));
-        let mut second = item(Some("B"));
-        second.thread_id = ThreadId("second-thread".into());
-        let mut other_agent = second.clone();
-        other_agent.agent_kind = AgentKind::Codex;
-        let cursor = (second.agent_kind, second.thread_id.clone());
-        let mut sessions = vec![first, second, other_agent];
+        let first = local(item(Some("A")));
+        let mut second = local(item(Some("B")));
+        second.item.thread_id = ThreadId("second-thread".into());
+        let mut other_machine = second.clone();
+        other_machine.host = Some("dt".into());
+        let cursor = second.key();
+        let mut sessions = vec![&first, &second, &other_machine];
 
         assert_eq!(sidebar_target(&[], None, 1), None);
         assert_eq!(sidebar_target(&sessions, None, 0), Some(0));
@@ -923,12 +1602,129 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_rows_group_by_local_day_and_keep_session_indices() {
+        let today = 20_000;
+        let rows = sidebar_rows(
+            [
+                (0, Some((today, 2026, 9, 26, 14, 5))),
+                (2, Some((today - 1, 2026, 9, 25, 9, 0))),
+                (3, Some((today - 3, 2026, 9, 23, 8, 0))),
+                (5, Some((today - 4, 2026, 9, 22, 8, 0))),
+                (7, Some((today - 30, 2026, 8, 27, 8, 0))),
+            ],
+            today,
+            2026,
+        );
+        let flat: Vec<_> = rows
+            .iter()
+            .map(|row| match row {
+                SidebarRow::Header(label) => label.to_string(),
+                SidebarRow::Session { index, time } => format!("{index}@{time}"),
+            })
+            .collect();
+        assert_eq!(
+            flat,
+            [
+                "今天",
+                "0@14:05",
+                "昨天",
+                "2@09:00",
+                "近 7 天",
+                "3@9/23",
+                "5@9/22",
+                "更早",
+                "7@8/27"
+            ]
+        );
+        assert_eq!(day_group(today + 1, today), "今天");
+        assert_eq!(day_group(today - 6, today), "近 7 天");
+        assert_eq!(day_group(today - 7, today), "更早");
+    }
+
+    #[test]
+    fn sidebar_rows_do_not_render_epoch_for_unknown_time() {
+        assert_eq!(local_time(0), None);
+        let rows = sidebar_rows([(0, local_time(0))], 20_000, 2026);
+        assert!(matches!(
+            rows.as_slice(),
+            [SidebarRow::Header("更早"), SidebarRow::Session { time, .. }] if time.is_empty()
+        ));
+    }
+
+    #[test]
+    fn sidebar_rows_show_the_year_except_for_yesterday() {
+        let today = 20_000;
+        let rows = sidebar_rows(
+            [
+                (0, Some((today - 1, 2025, 12, 31, 23, 59))),
+                (1, Some((today - 2, 2025, 12, 30, 8, 0))),
+            ],
+            today,
+            2026,
+        );
+        let times: Vec<_> = rows
+            .iter()
+            .filter_map(|row| match row {
+                SidebarRow::Session { time, .. } => Some(time.as_ref()),
+                SidebarRow::Header(_) => None,
+            })
+            .collect();
+        assert_eq!(times, ["23:59", "2025/12/30"]);
+    }
+
+    #[test]
+    fn sidebar_scroll_keeps_the_group_header_above_its_first_session() {
+        let rows = [
+            SidebarRow::Header("今天"),
+            SidebarRow::Session {
+                index: 0,
+                time: "12:00".into(),
+            },
+            SidebarRow::Session {
+                index: 1,
+                time: "11:00".into(),
+            },
+        ];
+        let scroll = UniformListScrollHandle::default();
+        for (row, offset) in [(1, 1), (2, 0)] {
+            scroll_sidebar_to(&rows, &scroll, row);
+            let target = scroll.0.borrow().deferred_scroll_to_item.unwrap();
+            assert_eq!(target.item_index, row);
+            assert_eq!(target.strategy, ScrollStrategy::Top);
+            assert_eq!(target.offset, offset);
+        }
+    }
+
+    #[test]
+    fn session_filter_matches_title_or_project_and_agent() {
+        let claude = local(item(Some("Review AgentDeck PR")));
+        assert!(session_matches(&claude, "", None));
+        assert!(session_matches(&claude, "review", None));
+        assert!(session_matches(
+            &claude,
+            "agentdeck",
+            Some(&(None, AgentKind::ClaudeCode))
+        ));
+        assert!(!session_matches(
+            &claude,
+            "review",
+            Some(&(None, AgentKind::Codex))
+        ));
+        assert!(!session_matches(
+            &claude,
+            "review",
+            Some(&(Some("dt".into()), AgentKind::ClaudeCode))
+        ));
+        assert!(!session_matches(&claude, "robodojo", None));
+    }
+
+    #[test]
     fn reopening_a_thread_rejects_results_from_its_previous_read() {
         let first = item(Some("A"));
         let mut other = item(Some("B"));
         other.thread_id = ThreadId("other-thread".into());
         let mut stage = Stage::Session {
-            item: other,
+            session: local(other),
             transcript: Transcript::Loading,
             list: transcript_list(),
             read_id: 2,
@@ -936,7 +1732,7 @@ mod tests {
         assert!(!stage.finish_read(1, Ok((vec![], vec![warning()]))));
 
         stage = Stage::Session {
-            item: first,
+            session: local(first),
             transcript: Transcript::Loading,
             list: transcript_list(),
             read_id: 3,
@@ -978,6 +1774,7 @@ mod tests {
     fn read_request(id: u64, thread: &str) -> ReadRequest {
         ReadRequest {
             id,
+            client: daemon::Client::new(None),
             kind: AgentKind::Codex,
             thread_id: ThreadId(thread.into()),
         }
@@ -1096,6 +1893,36 @@ mod tests {
     }
 
     #[test]
+    fn machine_error_includes_source_read_failures() {
+        let mut machine = Machine::new(1, None);
+        machine.agents.push(AgentHistory::new(AgentKind::Codex));
+        assert!(!machine.has_error());
+
+        machine.agents[0].complete(&mut Err("历史读取超时".into()));
+        assert!(machine.has_error());
+        machine.agents[0].complete(&mut Ok((vec![], vec![])));
+        assert!(!machine.has_error());
+
+        machine.error = Some("连接失败".into());
+        assert!(machine.has_error());
+    }
+
+    #[test]
+    fn cli_updates_require_a_ready_daemon_with_the_current_protocol() {
+        let mut machine = Machine::new(1, None);
+        assert!(!machine.can_update_agents());
+        machine.daemon_protocol = Some(5);
+        assert!(!machine.can_update_agents());
+        machine.daemon_protocol = Some(u64::from(agentdeck_protocol::PROTOCOL_VERSION));
+        assert!(machine.can_update_agents());
+        machine.connecting = true;
+        assert!(!machine.can_update_agents());
+        machine.connecting = false;
+        machine.installing = true;
+        assert!(!machine.can_update_agents());
+    }
+
+    #[test]
     fn each_agent_keeps_its_loading_failure_and_empty_result_distinct() {
         let mut fast = AgentHistory::new(AgentKind::ClaudeCode);
         let mut slow = AgentHistory::new(AgentKind::Codex);
@@ -1116,21 +1943,30 @@ mod tests {
 
     #[test]
     fn empty_hint_does_not_offer_selection_after_failure_and_zero_results() {
-        let mut agents = [
-            AgentHistory::new(AgentKind::Codex),
-            AgentHistory::new(AgentKind::ClaudeCode),
-        ];
+        let mut machines = vec![Machine {
+            agents: vec![
+                AgentHistory::new(AgentKind::Codex),
+                AgentHistory::new(AgentKind::ClaudeCode),
+            ],
+            ..Machine::new(1, None)
+        }];
+        let agents = &mut machines[0].agents;
         agents[0].complete(&mut Err("历史读取超时".into()));
-        assert_eq!(empty_hint(&agents, 1, None), "正在读取会话…");
+        assert_eq!(empty_hint(&machines, 1, false), "正在读取会话…");
 
-        agents[1].complete(&mut Ok((vec![], vec![])));
-        assert_eq!(empty_hint(&agents, 0, None), "没有可显示的会话");
+        machines[0].agents[1].complete(&mut Ok((vec![], vec![])));
+        assert_eq!(empty_hint(&machines, 0, false), "没有可显示的会话");
 
-        agents[1].complete(&mut Ok((vec![item(None)], vec![])));
-        assert_eq!(
-            empty_hint(&agents, 0, None),
-            "选择左侧会话查看记录，或试着输入任务"
-        );
+        // 远端连不上时说明是哪台机器；本机有会话后照常提示选择。
+        machines.push(Machine {
+            error: Some("Permission denied".into()),
+            ..Machine::new(2, Some("dt".into()))
+        });
+        assert_eq!(empty_hint(&machines, 0, false), "dt：Permission denied");
+
+        machines[0].agents[1].complete(&mut Ok((vec![item(None)], vec![])));
+        assert_eq!(empty_hint(&machines, 0, false), "选择左侧会话查看记录");
+        assert_eq!(empty_hint(&machines, 0, true), "没有匹配的会话");
     }
 
     #[test]

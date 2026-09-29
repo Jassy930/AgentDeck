@@ -4,28 +4,27 @@
 
 ## Goal
 
-把 GPUI 桌面端的示例会话换成本机 `agentdeckd` 返回的真实历史：侧栏显示真实会话
+把 GPUI 桌面端的示例会话换成本机及 SSH 远端 `agentdeckd` 返回的真实历史：侧栏显示真实会话
 列表，点击后在主区渲染该会话的真实记录。本切片只读，不启动 session、不发 turn。
 
 ## Architecture
 
-- `agentdeck-desktop/src/daemon.rs`：桌面自己的 typed local client。每次请求
-  spawn 一个 `agentdeckd` 子进程，写一行 `ClientCommand`，关闭 stdin，读到匹配的
-  admin reply 后最多等待 2 秒让 daemon 正常退出，超时则终止并回收进程。
+- `agentdeck-desktop/src/daemon.rs`：桌面自己的 typed local client。每个机器实例
+  持有一个 client，首次请求启动 `agentdeckd`（远端经 SSH stdio），后续复用连接。
+  异步任务在调度时捕获 client；显式断开取消在途请求、回收子进程，并阻止旧任务重连。
   - 不复用 `agentdeck-cli`：CLI 是 bin-only、依赖 clap/tokio，且架构上与 GUI 互相独立。
-  - 不维护长连接：history 在 daemon 内部本来就是短生命周期调用（Codex 每次另起
-    app-server，CC 每次扫描本地 JSONL），一个连接只发一条命令。每次历史请求仍按
-    K11 生成唯一 `requestId`，成功与错误回复都必须严格匹配。session streaming
-    需要长连接时再单独引入。
+  - 同一连接并发处理 history，每次请求按 K11 生成唯一 `requestId`，成功与错误回复
+    都必须严格匹配，完成后移除等待条目。daemon 内部 history 仍是短生命周期调用
+    （Codex 每次另起 app-server，CC 每次扫描本地 JSONL）；桌面尚未接入 session streaming。
   - daemon 定位：`AGENTDECK_DAEMON_BIN`（必须是绝对可执行路径，不回退）→
     可执行文件同目录（`.app` bundle 内）→ `target/debug` / `target/release`。
   - macOS 在 child `pre_exec` 中用 `sigemptyset` / `sigprocmask` 恢复空 signal mask，
     让 daemon 的 Tokio child wait 能接收 `SIGCHLD`，不改变父 GCD worker 的 mask。
   - 自动重试仅覆盖尚未取得回复的可恢复传输失败，等待 1 秒后再试一次；daemon 的明确
     错误回复（包括超时）、定位/配置错误与响应解析错误直接返回，不重复历史查询。
-- `agentdeck-desktop/src/shell.rs`：`Shell` 保存合并后的会话与各 agent 的加载结果；
+- `agentdeck-desktop/src/shell.rs`：`Shell` 保存各机器、合并后的会话与各 agent 的加载结果；
   加载中、成功计数和失败原因分别保留，侧栏与空态共用状态文案。
-  `Stage::Session` 持有 `HistoryListItem`、`Transcript`（Loading / Ready / Failed）与
+  `Stage::Session` 持有来源机器和 `HistoryListItem`、`Transcript`（Loading / Ready / Failed）与
   本次读取序号，切走后重开同一会话也只接受最新读取结果。加载顺序是先 `AgentList`，
   再按 agent 各发一次 `History::List`，谁先返回谁先进侧栏，慢的来源不挡快的。
   各来源首批显示 50 条，查询时多取 1 条判断是否还有更多；“加载更多”将该来源的
@@ -40,7 +39,9 @@
   会话读取最多执行一个，等待期间只保留最新待查会话；切回空态清空待查项，正在
   执行的读取仍由 daemon 按自身时限完成并清理。
   侧栏虚拟列表作为一个 Tab 停靠点，上下键移动键盘游标并滚入视野，Return 读取
-  目标会话；游标按来源与 threadId 定位，列表扩展或重新排序不会改变目标身份。
+  目标会话；游标按机器、agent 与 threadId 定位，列表扩展或重新排序不会改变目标身份。
+  机器区限制高度并独立滚动，连接表单位于滚动区外；移除机器后的迟到回复仍会刷新
+  全局加载状态。`desktop-remotes` 按 stable/dev profile 隔离，显式数据目录覆盖优先。
 - `agentdeck-desktop/src/transcript.rs`：把中立 `AgentItem` 映射成消息或可展开过程块，
   单段原文上限 2000 字符；后台读取完成时转换一次，渲染复用最终文本。助手和过程块
   正文使用 Markdown，代码块提供高亮与复制；用户消息保持纯文本。命令状态独立于
@@ -67,7 +68,7 @@
   Python 父线程屏蔽 `SIGCHLD` 后，同一 daemon 在 5.02 秒返回版本探测超时。
   修复放在桌面启动子进程的边界；自动重试用于失败后的恢复，不能消除继承的 signal mask。
 - **flex 滚动要 `min_h(0)`**。GPUI 用 taffy，flex item 默认按内容撑高，`overflow_y_scroll`
-  单独用不会限制高度，长记录会顶穿底部 composer。transcript 和侧栏列表都加了
+  单独用不会限制高度，长记录会顶穿底部只读提示。transcript 和侧栏列表都加了
   `min_h(px(0.))`，会话区外层再加 `overflow_hidden` 兜底。
 - 会话标题允许收缩并以省略号截断，右侧 agent / 项目不收缩，长标题不会挤出环境信息。
 - **`cargo` 不把 `MACOSX_DEPLOYMENT_TARGET` 计入 fingerprint**。普通 `cargo build` /
@@ -155,7 +156,7 @@ PR 评论修复后的验证：
   completed 两条都会渲染。
 - 没有客户端侧超时，依赖 daemon 自己的历史硬超时（见 `daemon.rs` 的 `ponytail:` 注释）。
 - 仍属后续独立切片：启动/继续会话、turn 与 streaming、审批、图片加载、
-  会话搜索、按项目分组（CC 的 `cwd` 是从目录名还原的，带 `-` 的路径会还原错，不能
+  正文全文搜索、按项目分组（CC 的 `cwd` 是从目录名还原的，带 `-` 的路径会还原错，不能
   直接拿来分组）。
 
 ## 2026-09-22：Codex 分页正文与版本升级
@@ -375,3 +376,177 @@ macOS 进程组存在性查询在组仅剩僵尸进程时可能返回 `EPERM`；
   来源 warning。Tab / Shift-Tab 可聚焦正文警告按钮，Enter / Space 可展开或收起。
   fake 回复附带额外 `durationMs`，客户端仍可读取。
 - 真实验收仅覆盖只读历史，未发送模型 prompt。
+
+## 2026-09-26：主页与侧栏布局整理
+
+- 侧栏底部“本机 Agent”压成每个 agent 一行（图标、名称、计数，警告显示 ⚠），完整状态、
+  兼容性警告和错误原因移入悬停详情；读取失败时行尾保留重试。“加载更多”合并为列表
+  下方固定显示的一个按钮。原先常驻的警告卡片和两组按钮占去约 40% 侧栏高度，现已让给会话列表。
+- 会话列表按本地日期分组（今天 / 昨天 / 近 7 天 / 更早），行尾显示时间；来源图标静止时为
+  灰色，悬停或键盘光标所在行显示彩色。分组标题与会话行同高，继续使用 `uniform_list`；过滤和分组结果只在会话、搜索词
+  或 agent 过滤变化时重建，不在每帧计算。本地日期用 `libc::localtime_r`，未引入新依赖。
+  窗口跨午夜不操作时分组不刷新，已用 `ponytail:` 注释标出。
+- “搜索（未开放）”换成侧栏搜索框，按标题或项目名过滤；空态 agent 卡片和侧栏 agent 行
+  改为 agent 过滤开关。只读阶段删除 composer 输入框与禁用的发送按钮，两种形态都只留
+  一行只读提示。
+- 验证：desktop 36 项测试、selfcheck、真实 bundle verify 通过；窗口截图确认分组行高、
+  行尾时间、底部 agent 行右对齐，以及临时把初始过滤设为 Codex 时的列表与卡片选中态
+  （截图后已还原）。悬停详情与会话态底部提示未单独截图。
+
+## 2026-09-27：滚动时的来源图标绘制开销
+
+- Goal：消除会话滚动重绘侧栏时的逐像素绘制。`sidebar.rs` 使用 GPUI 现有 `Image` /
+  `img` 缓存，四张灰色和彩色 PNG 编译期嵌入 `assets/agents/`，不增加依赖。
+  32px 资源显示为 16px；静止、悬停和键盘光标的颜色规则保持不变。README 同步说明。
+- A/B 环境：Apple M5 Pro、macOS 27.0、Rust 1.96.0，基线 `a3ba185`；双方均为
+  默认未优化 dev 构建、1536×864 pt Retina 窗口、同一真实只读历史会话。
+  用 `open -n <bundle> --env ZED_MEASUREMENTS=1 --stderr <log>` 记录帧耗时；
+  预热上下各一页后，交替上下滚动 12 次，仅统计滚动区间。
+
+  | 构建 | 帧样本 | CPU 帧耗时中位数 | P95 |
+  | --- | ---: | ---: | ---: |
+  | 修复前，默认 dev | 43 | 80.91 ms | 84.61 ms |
+  | 修复后，默认 dev | 49 | 24.78 ms | 28.30 ms |
+
+- GPUI 的 `frame duration` 包含 CPU 绘制、present 提交和 arena 清理，不是 GPU
+  完成耗时；低频自动滚轮不能证明持续 60 FPS。此对照只支持默认 dev 构建的收益结论。
+  右上角 FPS 统计 Shell render 调用频率，静止时的低数值不代表渲染能力。
+- 验证：`cargo fmt --check -p agentdeck-desktop`、
+  `env -u AGENTDECK_E2E cargo test --locked -p agentdeck-desktop`（39 项）、
+  `cargo run --locked -p agentdeck-desktop -- --selfcheck`、
+  `bash -n script/build_and_run.sh`、`./script/build_and_run.sh --verify`、
+  `swift test`、`scripts/verify-agent-docs.sh` 通过。PNG 的像素网格、彩色与透明区域和旧矩阵
+  一致，灰色保留原 HSL 去饱和亮度，只有 8 位量化误差；
+  实窗确认正文实际滚动、静止图标灰色、悬停及键盘光标图标彩色。
+  本轮只验证历史 UI，未运行真实 vendor lifecycle E2E。
+
+## 2026-09-28：SSH 多机连接生命周期与侧栏验收
+
+- 每个机器实例独立持有 client；显式断开取消在途和排队请求，旧实例的重试不能
+  重连，也不能影响重新添加的同名机器。完成的 history 请求移除等待条目。
+  远端配置按 stable/dev 隔离，`AGENTDECK_DATA_DIR` 优先。
+- 机器区独立滚动并保留会话列表和连接表单空间；首页卡片的长机器名在卡片内换行。
+  已移除机器的迟到回调仍通知界面更新加载状态。
+- 验证通过：desktop 46 项测试、desktop selfcheck、真实 bundle verify、
+  `scripts/verify-offline-tests.sh`、绑定当前 checkout daemon 的 CLI selfcheck 和
+  diagnostics report、文档门禁。bundle 启动注入隔离数据目录和 fake daemon/ssh。
+- 真实窗口使用离线 fixture 验收：7 台机器下会话可打开、机器区可滚至末台、连接表单
+  始终可见；连接中断开后子进程回收且没有重连，重新添加同名机器恢复列表。
+  禁用 `debug_assertions` 的桌面产物未启用 FPS 定时刷新，断开后加载提示仍自行结束；
+  长机器名换行正确。未运行真实 SSH 主机或 vendor E2E。
+
+## 2026-09-28：机器管理改为独立页面
+
+- 侧栏底部的机器列表与连接表单移到独立的机器管理页（`Stage::Machines`，
+  `agentdeck-desktop/src/machines.rs`），侧栏左下角只留一个服务器图标按钮（SVG 经 `AssetSource` 编译期嵌入，随文字颜色着色），
+  悬停提示显示连接中或失败台数，失败时图标标红。
+  后续设置、信息等页面沿用同一做法：`Stage` 加一个变体，侧栏底部加一个入口。
+- 机器页每台机器一张卡片，连接错误、兼容性警告、读取错误与列表提示全部内联展开，
+  不再依赖悬停提示；agent 行点击仍切换来源过滤，重试放在可点击行之外。
+- 空态卡片仍按机器 × agent 展开，多机时数量随之增长，本轮未改。
+- 验证：`cargo fmt --check`、`cargo clippy`（仅有既有警告）、desktop 45 项测试（删除随侧栏计数一并移除的 `count_label` 用例）、
+  desktop selfcheck、`./script/build_and_run.sh --verify` 通过；
+  实窗临时以机器页为初始状态并追加一台不可达主机截图，确认失败卡片、重试 / 断开、
+  兼容性警告换行、侧栏失败摘要与输入框宽度正常，截图后已还原临时改动。
+
+## 2026-09-28：机器页显示 CLI 版本
+
+- 机器页 agent 名称旁显示该机器上 CLI 的实际安装版本（如 `v2.1.283`、`v0.156.1`），探测或查询失败时
+  明示「拿不到版本号」，不显示任何默认版本。
+- daemon：`AgentCapabilities` 的 `agentVersion` 改为实际探测值。Codex 之前返回固定的已验证版本，
+  现在走 `Agent::detected_version`，用只读历史同一套 `CodexBinary::resolve_for_history` 探测；
+  Claude Code 仍沿用 `claude --version`（进程内缓存）。版本探测会起子进程，hub 改为 spawn 回复，不阻塞 stdin。
+- 桌面端：`agentCapabilities` 回复按 `agentKind` 分发给等待者（daemon 可能乱序返回）；
+  每个 agent 的版本查询独立于会话读取，失败不影响会话列表。
+- 远端机器需要重装新版 agentdeckd 后，Codex 才会显示实际版本；旧 daemon 仍返回固定版本号。
+  dt 已按 README 流程重装，实测返回 `codex-cli 0.155.0-alpha.16` 与 `2.1.160 (Claude Code)`。
+- 验证：`cargo test -p agentdeckd`、desktop 47 项测试（新增版本乱序分发与版本号缩写用例）、
+  desktop selfcheck、`./script/build_and_run.sh --verify` 通过；本机 daemon 实测返回
+  `codex-cli 0.156.1` 和 `2.1.283 (Claude Code)`。截图时屏幕处于锁定状态，窗口不重绘，未完成实窗目视确认。
+
+## 2026-09-28：ssh config 快速添加与一键更新 CLI
+
+- 远端列表来源：已添加的远端写在数据目录的 `desktop-remotes`（每行一个 ssh 目标），启动时读取；不是写死，也不是自动发现。
+- 快速添加：进入机器页时读取 `~/.ssh/config`，跟随 `Include`（仅具体路径，不展开 glob），
+  列出不含通配符、尚未连接的 Host 别名，点击即连接并保存。flex_wrap 在该布局下只按一行计算高度、
+  会压到下方卡片，改用 6 列 grid。
+- 一键更新：协议新增 `ClientCommand::AgentUpdate { agentKind }`，回复 `agentUpdate`（`output` 或 `error`），
+  schema 快照已重新生成。更新命令由 adapter 提供（`Agent::update_command`）：Codex 为历史读取所用 codex 的 `update`，
+  Claude Code 为 `claude update`。daemon spawn 执行，stdin 置空，上限 600s；非零退出时把输出带进错误。
+  桌面端对该请求放宽等待到 620s，完成后重查版本。Claude Code 的 `detected_version` 改为现探，
+  不再用进程内缓存，否则更新后版本不变。
+- 风险：Codex live session 要求精确的已验证版本（`protocol/CODEX_VERSION.txt`），一键更新后可能偏离，
+  只读历史仍可用但会出现兼容性警告。
+- 验证：router `update_agent` 成功 / 失败用例，ssh config 解析用例，desktop 48 项测试；
+  用假 `claude` 脚本走 daemon JSONL 端到端验证更新成功（输出与新版本）和失败（带 stderr）；
+  实窗截图确认快速添加 grid、各 agent 版本与更新按钮布局，截图后已还原临时改动。未在真实机器上点击更新。
+
+## 2026-09-28：快速添加样式、最新版本提示与 agentdeckd 安装
+
+- 快速添加：主机改为虚线边框芯片（`+` 图标、主机名省略、hover 高亮、tooltip「连接 {host}」），4 列 grid。
+  主机名文字节点必须 `flex_1` + `truncate()`（含 nowrap）：只有 flex_1 会被压到零宽，缺 nowrap 会按错误宽度折行只剩前几个字符。
+- 最新版本：首次打开机器页时在本机 `curl` 查 npm registry（`@openai/codex`、`@anthropic-ai/claude-code`）
+  的 `latest`，与各机器安装版本比较，显示「已是最新」或「可更新到 vX」；安装版本更新（预览通道）时不下结论，
+  查询失败显示「无法获取最新版本」。selfcheck 路径不联网。版本比较手写（数字核心 + 预发布更旧），
+  预发布之间只按字符串比。
+- agentdeckd 版本：selfcheck 回复新增 `version`（`CARGO_PKG_VERSION`），机器卡片头部显示；
+  旧 daemon 没有该字段时显示「拿不到版本号」，并提供「重装 agentdeckd」。
+- 缺失检测：远端启动命令补 `~/.local/bin` 到 PATH，找不到时自己往 stderr 写 `agentdeckd-missing` 并退出 127，
+  不依赖 shell 的本地化报错。
+- 安装：`uname -sm` → musl 目标三元组，本机 `curl -fsSL` 下载
+  `releases/download/v<桌面端版本>/agentdeckd-<target>.tar.gz`（钉桌面端版本，保证协议一致，也免 GitHub API 限流），
+  经 ssh stdin 解到远端临时文件，试运行 `--version` 成功才 `mv -f` 替换（避开 ETXTBSY、拦住架构不对），
+  trap 清理临时文件；成功后 `Client::reset` 关掉旧连接（允许重连）并重新读取。
+  发布流程 `.github/workflows/release.yml`：推 `v*` tag 时构建 x86_64 / aarch64 linux musl 并上传到同名 Release。
+- 验证：desktop 50 项测试（新增版本比较、uname 映射用例）、agentdeckd 177 项、selfcheck、`--verify`；
+  dt 上 `rustup target add x86_64-unknown-linux-musl` 后直接构建出 static-pie 二进制（无需 musl-tools）；
+  临时 ignored 测试走真实代码：移走 dt 的 daemon → 连接报 `agentdeckd-missing` → 用
+  `AGENTDECK_RELEASE_URL=file://` 安装 → 重连成功、版本 0.1.0；不设覆盖时得到 404 的明确报错且原二进制完好。
+  实窗截图确认芯片、版本提示、agentdeckd 版本与「未安装」状态，截图后已还原临时改动。
+- 未完成：仓库还没有任何 GitHub Release，真实下载路径未验证；需要推送 workflow 并打 `v0.1.0` tag 后才能用。
+
+## 2026-09-28：机器页收紧：快速添加折叠、兼容性徽标、更新二次确认
+
+- 快速添加默认折叠成一行「› 从 ssh config 快速添加（N 台）」，点击展开 4 列芯片（`Shell::quick_add_open`）。
+- 兼容性警告不再整段铺开：版本行尾只留「⚠ 兼容性」徽标，悬停显示完整警告（`Tooltip::element`，最宽 420px 自动换行）。
+- 更新按钮两段式确认：第一次点击变成绿色「✓」（tooltip「再点一次确认更新」），再点才发 `AgentUpdate`；
+  鼠标移开（`Button::on_hover` 为 false）即恢复「更新」。状态为 `Shell::update_armed`，同一时间只有一个按钮待确认。
+- 验证：desktop 测试、`--verify`；实窗截图确认折叠行、徽标与「✓」态（临时初始状态，已还原）。
+  悬停提示换行与鼠标移开恢复「更新」已由用户在实窗手动确认。
+
+## 2026-09-29：机器页更新与安装生命周期
+
+- IPC 升至 v6，Rust/schema 与 Swift mirror 同步 `AgentUpdate` 和 selfcheck 版本字段。
+  桌面只向协议匹配的 daemon 发送更新，并在发送所用连接上重新核对；旧 daemon 仍可读取历史，
+  更新按钮禁用并提示先重装。更新请求不经传输重试，避免丢失回复后重复执行。
+- daemon 在 stdin EOF、stdout 写失败或更新超时后取消更新任务，终止 updater 的独立进程组并等待回收。
+  App 内置 Codex 返回通过对应 App 更新的指引；独立 CLI 保持自身更新命令。
+- 远端连接优先使用 `~/.local/bin` 中安装的 daemon；CLI 更新与 daemon 重装互斥。
+  安装期间禁止断开机器，结束后恢复按钮并保留结果。侧栏失败摘要包含来源历史读取失败。
+- 验证通过：完整 `scripts/verify-offline-tests.sh`（desktop 55 项、daemon lib 180 项及集成测试）、
+  Swift 测试（XCTest 75 项、Swift Testing 31 项）、iPhone 17 Simulator 21 项测试；
+  desktop selfcheck、真实 bundle verify、绑定当前 checkout daemon 的 CLI selfcheck（protocolVersion 6）
+  与 diagnostics report、格式和文档门禁。
+- 真实窗口使用隔离数据目录及 fake daemon/ssh：协议 5 的更新按钮禁用且不发送更新请求；
+  安装期间“断开”禁用且机器卡片保留，安装成功后显示版本与结果、自动重连并恢复按钮；
+  来源失败使入口标红，当前协议更新按钮可进入二次确认状态。
+  本轮未执行真实 vendor 更新、真实远端安装、GitHub Release 下载或 aarch64 实机验收。
+
+## 2026-09-29：macOS 更新进程组回收
+
+- 更新清理的零信号探测遇到 `EPERM` 时继续等待进程组消失，覆盖 Darwin 仅剩僵尸进程的状态；
+  发送终止信号时的权限错误仍返回清理失败。
+- 新增 macOS 实际进程回归：保留未回收子进程，验证零信号探测继续等待、终止信号的权限错误仍上报，
+  回收后确认进程组消失。断开与超时清理回归同时通过。
+- 完整离线门禁通过（daemon lib 181 项），绑定当前 checkout 的 CLI selfcheck 与 diagnostics report、
+  格式和文档检查通过；未执行真实 vendor 更新。
+
+## 2026-09-29：过程分组与会话滚动条
+
+- 连续两个以上的过程块默认折叠成一行摘要，折叠组仅占一个列表项；展开时按可见区域渲染成员，
+  收起再展开保留单块状态。摘要在读取完成时计算，切换组时同步调整可见行与滚动锚点。
+- 会话记录右侧常驻滚动条，支持拖动定位；总高按已测量条目估算，滑块长度会随滚动微调。
+- desktop 57 项测试、selfcheck、真实 bundle verify、格式与文档门禁通过。
+  实窗连接隔离 fake daemon/ssh，验证千项组展开收起、单块状态保留、多组切换、滚动条拖动、
+  搜索后正文保留、机器页切换至远端小会话及重新打开长会话时默认折叠。
+  未运行真实 vendor E2E，也未量化帧耗时。

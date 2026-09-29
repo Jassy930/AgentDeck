@@ -15,13 +15,14 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
 
 - 创建真实 GPUI macOS 窗口，使用透明标题栏。
 - 初始化 `gpui-component` 并挂载 `Root`。
-- 渲染外壳布局：全高左侧栏（品牌行 / 快捷入口 / 最近会话 / 本机 Agent 状态）、
-  空态（居中标题、圆角 composer、按已注册 agent 生成的接入卡片），以及会话态
-  （thread header、会话记录、底部悬浮 composer）。
-- **接入本机 `agentdeckd` 的只读历史**：启动时先问 daemon 注册了哪些 agent，再按
-  agent 分别拉取会话列表（首批各显示 50 条），谁先返回谁先进侧栏；各来源可点击
-  “加载更多”，每次扩展 50 条，数量显示为“已加载”。读完或达到每来源 2,000 条上限时
-  明确提示；继续加载或失败时保留已有会话与计数。点击条目按
+- 界面固定使用深色，配色来自设计系统 SSOT 生成的 codex 颜色；警告使用与品牌橙区分的琥珀色。
+- 渲染外壳布局：全高左侧栏（品牌行 / 新建会话与搜索框 / 按日期分组的会话列表 /
+  底部页面入口图标）、空态（居中标题、按已注册 agent 生成的过滤卡片、一行只读提示），
+  会话态（thread header、会话记录、底部一行只读提示），以及机器管理页。
+- **接入本机及 SSH 远端 `agentdeckd` 的只读历史**：启动时先问各机器的 daemon 注册了哪些 agent，再按
+  agent 分别拉取会话列表（首批各显示 50 条），谁先返回谁先进侧栏；固定在列表下方的
+  “加载更多”为仍有更多的来源（有 agent 过滤时只为该来源）各扩展 50 条。读完或达到
+  每来源 2,000 条上限时在机器页的 agent 行中提示；继续加载或失败时保留已有会话与计数。点击条目按
   `threadId` + `agentKind` 读取该会话的真实记录。助手消息按 Markdown 渲染，代码块带
   语法高亮与复制按钮；用户消息暂保持纯文本，避免注入标签被当作 HTML 吞掉。命令、思考、
   工具、变更默认折叠为一行摘要，单行命令、思考和图片路径也可展开；命令的状态、退出码
@@ -31,22 +32,34 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
   虚拟列表只按已测量条目估算总高，滑块长度会随滚动微调。Markdown 图片暂显示说明与目标链接／路径，不加载图片。
   工具参数和结果只折叠明确标记的 base64 data URI，普通字符串保留文本展示；单段原文
   仍有 2000 字符上限。加载中、失败和空结果都有明确文案；某个来源失败时保留其他来源
-  的会话，并在侧栏显示该来源的错误。
+  的会话，机器页 agent 行显示“读取失败”、错误原因与重试按钮。
   只读请求中可恢复的传输失败在后台等待 1 秒自动重试一次；daemon 明确返回的错误（含超时）
   直接显示，定位、配置和响应解析错误也不自动重试。失败时提供连接、来源列表或正文的
   重试按钮，加载期间不重复发起同一请求；加载更多失败后重试相同目标数量。
   快速切换时最多执行一个历史读取，只保留最新待查会话；记录文本在后台读取完成时
   转换一次，滚动时复用。会话记录（变高 `list`）和侧栏会话列表（等高
   `uniform_list`）都只渲染可见区域附近的条目，长会话滚动不再逐帧排版全部内容。
-  侧栏每条会话带 16px 来源像素图标：Codex 为蓝色宠物
-  [Codey](https://learn.chatgpt.com/docs/pets) 的简化版，Claude Code 为暖橙色小螃蟹；
+  侧栏会话按本地日期分为“今天 / 昨天 / 近 7 天 / 更早”，行尾显示时间（今天与昨天为
+  时:分，其余本年为月/日、跨年为年/月/日，未知时间留空）。每条会话带 16px 来源像素图标，静止时为灰色，悬停或键盘光标所在行显示彩色。
+  Codex 为蓝色宠物 [Codey](https://learn.chatgpt.com/docs/pets) 的简化版，
+  Claude Code 为暖橙色小螃蟹。来源图标从 `assets/agents/` 编译期嵌入并共享缓存，
+  使用 32px PNG 显示为 16px，保持 Retina 下的像素边界，避免滚动时逐像素提交绘制。
   悬停显示信息卡：标题最多三行，底部显示文件夹名和弱化的完整路径。
   列表中的长标题以省略号显示；Tab 聚焦会话列表后，用上下键移动并自动滚动到目标条目，
-  Return 打开会话，Tab / Shift-Tab 离开列表。
-- composer 为两行紧凑布局：输入行下方一行显示当前会话的项目、agent 和只读状态，
-  两种形态共用草稿；发送和搜索仍禁用。
+  导航到组首会话时保留其日期标题；Return 打开会话，Tab / Shift-Tab 离开列表。
+- 侧栏搜索框按会话标题或项目名（不区分大小写）实时过滤列表；点击空态的 agent 卡片
+  或机器页的 agent 行只看该 agent 的会话，选中时以边框标识，再点取消。两种过滤可叠加，无结果时显示
+  “没有匹配的会话”。
+- 侧栏左下角的服务器图标进入独立的机器管理页，每个 agent 行显示该机器上 Claude Code / Codex 的实际安装版本，并可一键运行 CLI 自带的更新命令（`claude update` / `codex update`）；连接框下方列出 `~/.ssh/config`（含 `Include`）里尚未连接的主机，点击即添加；已添加的远端保存在数据目录的 `desktop-remotes` 文件；悬停提示显示连接中或失败台数，连接或任一来源历史读取失败时图标标红。
+  CLI 更新要求 daemon 与桌面端协议一致（当前 v6）；旧 daemon 仍可读取历史，更新按钮禁用并提示先更新／重装 daemon。
+  更新请求不自动重试；断开或超时会终止更新进程及其子进程。CLI 更新期间不能同时重装该机器的 daemon。
+  App 内置的 Codex 不运行 CLI 自更新，点击更新会提示通过对应 App 更新；独立安装的 Codex 仍使用自身更新命令。
+  远端 agentdeckd 安装期间暂不能断开该机器，安装结束后恢复，结果保留在机器卡片中。
+  机器页每台机器一张卡片：状态圆点、名称、重试 / 断开、完整连接错误，以及各 agent 的
+  完整状态、兼容性警告和读取错误；顶部是常驻的远端连接输入框。
+- 发送接入前不渲染输入框，空态与会话态只显示“只读历史预览，暂不能发送任务”。
 - 透明标题栏下为红绿灯留出顶部空间，空态与会话态顶部均按系统偏好处理双击；
-  打开窗口后 composer 默认聚焦。
+  打开窗口后搜索框默认聚焦。
 - 支持通过 `Command+Q` 或 AgentDeck 菜单中的“退出 AgentDeck”退出应用。
 - 提供 `--selfcheck`，验证 GPUI、Metal renderer、隐藏窗口和组件树初始化；该路径
   不连接 daemon，也不触碰本机 vendor 历史。
@@ -57,9 +70,9 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
 
 当前明确不包含：
 
-- 启动会话、发送 turn、streaming、审批和 vendor 控制；composer 不发送任何内容。
-- 用户消息中注入上下文块（如 `<system-reminder>`）的识别与折叠、会话搜索与按项目分组。
-- 远程机器、网络数据源和配对流程。
+- 启动会话、发送 turn、streaming、审批和 vendor 控制；也没有 composer 输入框。
+- 用户消息中注入上下文块（如 `<system-reminder>`）的识别与折叠、会话正文全文搜索与按项目分组。
+- daemon 网络监听和配对流程。
 - 对旧 AppKit 界面或行为的兼容层。
 
 这些能力只按新的纵向切片逐步加入；当前仓库先收敛本地最小闭环。
@@ -88,11 +101,47 @@ docs/                    架构、诊断、质量规则与计划
 ```
 
 `agentdeck-desktop` 依赖 `agentdeck-protocol`，并通过自带的 typed local client
-（`agentdeck-desktop/src/daemon.rs`）按请求 spawn 一个 `agentdeckd` 子进程走 JSONL
+（`agentdeck-desktop/src/daemon.rs`）为每台机器维持一个 `agentdeckd` 子进程连接，走 JSONL
 stdin/stdout。依赖方向固定为 `desktop → typed local client → agentdeckd`；UI 不直接
 解析 vendor JSON，也不把 daemon 嵌入 GUI 进程，更不依赖 `agentdeck-cli`。
 macOS 启动 daemon 前会在子进程恢复信号接收，避免继承 GPUI 后台线程屏蔽的
 `SIGCHLD`，导致已退出的版本探测进程仍被判为超时。
+
+### 连接局域网内的远端 daemon（SSH）
+
+点侧栏左下角的服务器图标进入机器页，在顶部输入 ssh 目标（如 `dt` 或 `user@10.0.0.2`）回车，
+桌面端即对该机器执行 `ssh <host> bash -lc 'exec agentdeckd'`，其余 JSONL 通路不变；
+鉴权与加密由 SSH 密钥负责，daemon 本身不监听网络。本机与所有远端的会话合并在同一列表，
+远端行带主机标签；机器页按机器分卡片显示 agent 与错误详情，侧栏不再占用高度。可逐台「重试」或「断开」；断开会取消该机器的在途请求并回收连接，
+旧请求不能重新连接已移除的机器。已连接的主机保存在数据目录的 `desktop-remotes`
+（一行一个），下次启动自动连接；遵循 `AGENTDECK_PROFILE` 的 stable/dev 隔离，
+`AGENTDECK_DATA_DIR` 优先覆盖目录。要求：
+
+- 本机能免密 `ssh <host>`（使用 `BatchMode=yes`，不会弹密码提示）；
+- 远端 `bash -lc` 的 PATH 中有 `codex`、`claude`；`agentdeckd` 在 PATH 或 `~/.local/bin` 中均可；
+- 每台机器一条常驻连接（本机一个 `agentdeckd` 子进程，远端一条 ssh 会话），所有请求复用，
+  history 按 requestId 并发；`ServerAliveInterval=15` 让对端休眠/断网后约 45 秒内断开，
+  下次请求自动重连（`ControlMaster` `~/.ssh/agentdeck-%C` 让重连免去完整握手）。
+
+一键安装：远端找不到 `agentdeckd` 时，机器页卡片显示「未安装 agentdeckd」和「安装」按钮；
+版本旧于桌面端时显示「更新 agentdeckd」。桌面端先 `ssh <host> uname -sm` 选目标（Linux x86_64 /
+aarch64），在本机 `curl` 下载与桌面端同版本的 GitHub Release 资产
+`agentdeckd-<target>.tar.gz`（`v<版本>` tag，由 `.github/workflows/release.yml` 构建 musl 静态二进制），
+经 ssh stdin 写入远端 `~/.local/bin/agentdeckd`，试运行成功后才替换并重连；启动时优先使用该目录，避免继续命中 PATH 中的旧安装。
+`AGENTDECK_RELEASE_URL` 可把下载前缀改成别的地址（如 `file:///tmp/agentdeck-release`）用于测试。
+还没发布对应 Release 时，安装会报「GitHub 上可能还没有发布 … 二进制」。
+
+手动从源码安装（以 Linux 工作站 `dt` 为例）：
+
+```bash
+rsync -az --exclude target --exclude .git ./ dt:AgentDeck/
+ssh dt 'cd ~/AgentDeck && ~/.cargo/bin/cargo build --release --locked -p agentdeckd \
+  && mkdir -p ~/.local/bin \
+  && install -m755 target/release/agentdeckd ~/.local/bin/ \
+  && bash -lc "agentdeckd --selfcheck"'
+```
+
+Linux 上 daemon 的数据目录为 `~/.local/share/AgentDeck/`（`AGENTDECK_DATA_DIR` 可覆盖）。
 
 ## 依赖版本
 
@@ -114,7 +163,7 @@ Codex schema 已验证基线为 `codex-cli 0.155.0-alpha.16`，完整版本写�
 两类操作可能选择不同运行时：历史优先当前桌面端，避免旧 CLI 无法读取新版保存的记录；
 live session 涉及发送任务，仍使用经过验证的版本。
 执行失败、非法输出、超时或清理失败立即报错。版本探测与 app-server 启动使用
-同一个规范化绝对路径。AgentDeck 自身 IPC 为 v5，历史成功回复可携带中立的 warnings。
+同一个规范化绝对路径。AgentDeck 自身 IPC 为 v6，支持 `AgentUpdate`；历史成功回复可携带中立的 warnings。
 
 需要指定某一份运行时时，可设置 `AGENTDECK_CODEX_BIN` 为 Codex 可执行文件的绝对
 路径；设置后只使用该路径，错误时不自动回退。离线测试也通过这个入口绑定假程序。
@@ -148,7 +197,7 @@ cargo run -p agentdeck-desktop -- --selfcheck
 
 `script/build_and_run.sh` 是唯一桌面 build/run 入口。它构建
 `agentdeck-desktop` 与 `agentdeckd`、装配 `dist/AgentDeck.app`、写入 macOS 15 最低版本并
-启动最新产物。桌面按请求启动 bundle 内自带的 `agentdeckd` 读取历史。
+启动最新产物。桌面维持到 bundle 内自带 `agentdeckd` 的本机连接，复用它读取历史。
 
 macOS 应用图标和侧栏品牌行使用统一的 04C 图标；iOS companion 使用同款满版
 AppIcon。正式资源和重新生成 `.icns` 的方式见 [图标资源](assets/brand/README.md)。
@@ -216,7 +265,7 @@ desktop 已经通过 typed local client 接入 daemon 的只读历史，下一�
 2. 持久 CLI 四轮曾在 0.145.0 的临时配置覆盖环境通过，包含累计 streaming、同 PID/threadId
    复用、取消后继续、回收与记录读回；升级后的 lifecycle E2E 尚未重跑，
    证据见 [M0 CLI 实施记录](docs/plans/2026-09-21-backend-m0-cli-implementation.md)。
-3. 在此之上给 desktop 接入会话启动与 turn 流（需要把 one-shot round-trip 换成长连接），
+3. 在此之上给 desktop 接入会话启动与 turn 流（每机常驻连接已就绪，需再接事件流），
    再增加审批、Markdown 和多 agent 能力。
 
 `agentdeck session live` 的 stdin 接受现有 `ClientCommand` JSONL，stdout 连续输出协议
