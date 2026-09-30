@@ -22,7 +22,7 @@ dependencies = [
 
 [[package]]
 name = "agentdeck-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "agentdeck-protocol",
  "clap",
@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "agentdeck-desktop"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "agentdeck-protocol",
  "gpui",
@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "agentdeck-protocol"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "schemars 0.8.22",
  "serde",
@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "agentdeckd"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "agentdeck-protocol",
  "async-trait",
