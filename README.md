@@ -51,8 +51,12 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
   或机器页的 agent 行只看该 agent 的会话，选中时以边框标识，再点取消。两种过滤可叠加，无结果时显示
   “没有匹配的会话”。
 - 侧栏左下角的服务器图标进入独立的机器管理页，每个 agent 行显示该机器上 Claude Code / Codex 的实际安装版本，并可一键运行 CLI 自带的更新命令（`claude update` / `codex update`）；连接框下方列出 `~/.ssh/config`（含 `Include`）里尚未连接的主机，点击即添加；已添加的远端保存在数据目录的 `desktop-remotes` 文件；悬停提示显示连接中或失败台数，连接或任一来源历史读取失败时图标标红。
-  CLI 更新要求 daemon 与桌面端协议一致（当前 v6）；旧 daemon 仍可读取历史，更新按钮禁用并提示先更新／重装 daemon。
-  更新请求不自动重试；断开或超时会终止更新进程及其子进程。CLI 更新期间不能同时重装该机器的 daemon。
+  版本查询完成但拿不到版本号时显示「安装」，取得版本号时显示「更新」；拿不到版本号也可能是探测失败，不直接判定未安装。
+  安装使用官方推荐的原生脚本，在对应机器上执行：Codex 为 `curl -fsSL https://chatgpt.com/codex/install.sh | sh`，Claude Code 为 `curl -fsSL https://claude.ai/install.sh | bash`，均不依赖 npm。
+  Codex 使用官方 `CODEX_NON_INTERACTIVE=1` 跳过安装器询问，不自动启动登录或卸载其他渠道的安装。
+  安装／更新均需二次确认，且要求 daemon 与桌面端协议一致（当前 v7）；旧 daemon 仍可读取历史，操作按钮禁用并提示先更新／重装 daemon。
+  请求不自动重试；断开或超时会终止安装／更新进程及其子进程。CLI 操作期间不能同时重装该机器的 daemon。
+  安装结束后重新探测版本并刷新历史；首次登录须在目标机器运行官方 CLI 完成，AgentDeck 不处理登录凭据。
   App 内置的 Codex 不运行 CLI 自更新，点击更新会提示通过对应 App 更新；独立安装的 Codex 仍使用自身更新命令。
   远端 agentdeckd 安装期间暂不能断开该机器，安装结束后恢复，结果保留在机器卡片中。
   机器页每台机器一张卡片：状态圆点、名称、重试 / 断开、完整连接错误，以及各 agent 的
@@ -106,6 +110,9 @@ stdin/stdout。依赖方向固定为 `desktop → typed local client → agentde
 解析 vendor JSON，也不把 daemon 嵌入 GUI 进程，更不依赖 `agentdeck-cli`。
 macOS 启动 daemon 前会在子进程恢复信号接收，避免继承 GPUI 后台线程屏蔽的
 `SIGCHLD`，导致已退出的版本探测进程仍被判为超时。
+本机和远端 daemon 的 `PATH` 均包含 `~/.local/bin`，可直接发现官方原生安装器生成的 CLI。
+
+官方安装说明：[Codex CLI](https://developers.openai.com/codex/cli)、[Claude Code](https://code.claude.com/docs/en/setup#install-claude-code)。
 
 ### 连接局域网内的远端 daemon（SSH）
 
@@ -163,7 +170,7 @@ Codex schema 已验证基线为 `codex-cli 0.155.0-alpha.16`，完整版本写�
 两类操作可能选择不同运行时：历史优先当前桌面端，避免旧 CLI 无法读取新版保存的记录；
 live session 涉及发送任务，仍使用经过验证的版本。
 执行失败、非法输出、超时或清理失败立即报错。版本探测与 app-server 启动使用
-同一个规范化绝对路径。AgentDeck 自身 IPC 为 v6，支持 `AgentUpdate`；历史成功回复可携带中立的 warnings。
+同一个规范化绝对路径。AgentDeck 自身 IPC 为 v7，支持 `AgentInstall` / `AgentUpdate`；历史成功回复可携带中立的 warnings。
 
 需要指定某一份运行时时，可设置 `AGENTDECK_CODEX_BIN` 为 Codex 可执行文件的绝对
 路径；设置后只使用该路径，错误时不自动回退。离线测试也通过这个入口绑定假程序。

@@ -150,6 +150,19 @@ impl Agent for CodexAdapter {
         }
     }
 
+    async fn install_command(&self) -> Result<tokio::process::Command, ProtocolError> {
+        let mut command = tokio::process::Command::new("bash");
+        // 官方脚本会直接读 /dev/tty，并询问是否启动 Codex；后台安装必须跳过交互。
+        command.env("CODEX_NON_INTERACTIVE", "1");
+        command.args([
+            "-o",
+            "pipefail",
+            "-c",
+            "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
+        ]);
+        Ok(command)
+    }
+
     /// 更新的是历史读取实际会用的那个 codex，与版本显示一致。
     async fn update_command(&self) -> Result<tokio::process::Command, ProtocolError> {
         let (_cancel_tx, mut cancel) = tokio::sync::watch::channel(false);

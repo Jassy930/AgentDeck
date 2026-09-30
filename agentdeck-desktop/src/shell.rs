@@ -206,6 +206,21 @@ pub fn agent_label(kind: AgentKind) -> String {
         .join(" ")
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AgentOperation {
+    Install,
+    Update,
+}
+
+impl AgentOperation {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Install => "安装",
+            Self::Update => "更新",
+        }
+    }
+}
+
 pub(crate) struct AgentHistory {
     pub kind: AgentKind,
     /// None 表示仍在读取；成功与失败都必须保留来源，不能把失败显示成零条。
@@ -216,9 +231,9 @@ pub(crate) struct AgentHistory {
     pub warnings: Vec<HistoryWarning>,
     /// CLI 实际安装版本；None 表示仍在查询，查询失败记为 "unknown"。
     pub version: Option<String>,
-    pub updating: bool,
-    /// 最近一次一键更新的结果：成功为命令输出，失败为错误。
-    pub update_result: Option<Result<String, String>>,
+    pub operation: Option<AgentOperation>,
+    /// 保留执行的操作，重查版本后仍能正确显示安装或更新结果。
+    pub operation_result: Option<(AgentOperation, Result<String, String>)>,
 }
 
 impl AgentHistory {
@@ -231,9 +246,19 @@ impl AgentHistory {
             has_more: false,
             warnings: Vec::new(),
             version: None,
-            updating: false,
-            update_result: None,
+            operation: None,
+            operation_result: None,
         }
+    }
+
+    pub fn next_operation(&self) -> Option<AgentOperation> {
+        self.version.as_deref().map(|version| {
+            if versions::extract(version).is_some() {
+                AgentOperation::Update
+            } else {
+                AgentOperation::Install
+            }
+        })
     }
 
     fn request_limit(&self) -> usize {
@@ -542,8 +567,8 @@ pub struct Shell {
     latest_requested: bool,
     /// ssh config 快速添加区默认折叠，免得占掉机器列表的位置。
     pub(crate) quick_add_open: bool,
-    /// 已点过一次、等待确认的更新按钮；鼠标移开即取消。
-    pub(crate) update_armed: Option<(u64, AgentKind)>,
+    /// 已点过一次、等待确认的安装或更新按钮；鼠标移开即取消。
+    pub(crate) update_armed: Option<(u64, AgentKind, AgentOperation)>,
 }
 
 impl Shell {
@@ -733,7 +758,7 @@ impl Shell {
         let Some(host) = machine.host.clone() else {
             return;
         };
-        if machine.installing || machine.agents.iter().any(|agent| agent.updating) {
+        if machine.installing || machine.agents.iter().any(|agent| agent.operation.is_some()) {
             return;
         }
         machine.installing = true;
@@ -770,25 +795,40 @@ impl Shell {
         cx.notify();
     }
 
-    /// 更新按钮两段式确认：第一次点击只进入待确认，再点一次才真正更新。
+    /// 安装与更新共用两段式确认；版本探测改变操作时必须重新确认。
     pub fn click_update(&mut self, id: u64, kind: AgentKind, cx: &mut Context<Self>) {
-        if self.update_armed.take() == Some((id, kind)) {
-            self.update_agent(id, kind, cx);
+        let Some(operation) = self
+            .machine(id)
+            .and_then(|machine| machine.agents.iter().find(|agent| agent.kind == kind))
+            .and_then(AgentHistory::next_operation)
+        else {
+            return;
+        };
+        if self.update_armed.take() == Some((id, kind, operation)) {
+            self.modify_agent(id, kind, operation, cx);
         } else {
-            self.update_armed = Some((id, kind));
+            self.update_armed = Some((id, kind, operation));
         }
         cx.notify();
     }
 
     pub fn disarm_update(&mut self, id: u64, kind: AgentKind, cx: &mut Context<Self>) {
-        if self.update_armed == Some((id, kind)) {
+        if self
+            .update_armed
+            .is_some_and(|(armed_id, armed_kind, _)| (armed_id, armed_kind) == (id, kind))
+        {
             self.update_armed = None;
             cx.notify();
         }
     }
 
-    /// 一键更新：跑 CLI 自带的更新命令，完成后重查版本。
-    pub fn update_agent(&mut self, id: u64, kind: AgentKind, cx: &mut Context<Self>) {
+    fn modify_agent(
+        &mut self,
+        id: u64,
+        kind: AgentKind,
+        operation: AgentOperation,
+        cx: &mut Context<Self>,
+    ) {
         let Some(machine) = self.machine_mut(id) else {
             return;
         };
@@ -799,26 +839,32 @@ impl Shell {
         let Some(agent) = machine.agents.iter_mut().find(|a| a.kind == kind) else {
             return;
         };
-        if agent.updating {
+        if agent.operation.is_some() {
             return;
         }
-        agent.updating = true;
-        agent.update_result = None;
+        agent.operation = Some(operation);
+        agent.operation_result = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { client.agent_update(kind) })
+                .spawn(async move {
+                    match operation {
+                        AgentOperation::Install => client.agent_install(kind),
+                        AgentOperation::Update => client.agent_update(kind),
+                    }
+                })
                 .await;
             this.update(cx, |shell, cx| {
                 let agent = shell
                     .machine_mut(id)
                     .and_then(|machine| machine.agents.iter_mut().find(|a| a.kind == kind));
                 if let Some(agent) = agent {
-                    agent.updating = false;
-                    agent.update_result = Some(result);
+                    agent.operation = None;
+                    agent.operation_result = Some((operation, result));
                     agent.version = None;
                     shell.load_agent_version(id, kind, cx);
+                    shell.load_agent_sessions(id, kind, cx);
                 }
                 cx.notify();
             })
@@ -1905,6 +1951,20 @@ mod tests {
 
         machine.error = Some("连接失败".into());
         assert!(machine.has_error());
+    }
+
+    #[test]
+    fn cli_operation_waits_for_version_then_selects_install_or_update() {
+        let mut agent = AgentHistory::new(AgentKind::Codex);
+        assert_eq!(agent.next_operation(), None);
+        for version in ["unknown", "codex unknown", "claude-code unknown"] {
+            agent.version = Some(version.into());
+            assert_eq!(agent.next_operation(), Some(super::AgentOperation::Install));
+        }
+        for version in ["codex-cli 0.158.0", "2.1.285 (Claude Code)"] {
+            agent.version = Some(version.into());
+            assert_eq!(agent.next_operation(), Some(super::AgentOperation::Update));
+        }
     }
 
     #[test]

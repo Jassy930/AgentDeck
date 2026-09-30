@@ -109,8 +109,8 @@ pub struct RuntimeHub {
     /// always requested through the adapter; RuntimeHub never aborts the
     /// handle as a substitute for owner cleanup.
     sessions: Arc<Mutex<HashMap<SessionId, AgentSessionHandle>>>,
-    update_cancel: watch::Sender<bool>,
-    updates: Mutex<JoinSet<()>>,
+    setup_cancel: watch::Sender<bool>,
+    setup_tasks: Mutex<JoinSet<()>>,
 }
 
 impl RuntimeHub {
@@ -118,8 +118,8 @@ impl RuntimeHub {
         Self {
             router,
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            update_cancel: watch::channel(false).0,
-            updates: Mutex::new(JoinSet::new()),
+            setup_cancel: watch::channel(false).0,
+            setup_tasks: Mutex::new(JoinSet::new()),
         }
     }
 
@@ -221,8 +221,8 @@ impl RuntimeHub {
             }
         }
 
-        self.update_cancel.send_replace(true);
-        while self.updates.lock().await.join_next().await.is_some() {}
+        self.setup_cancel.send_replace(true);
+        while self.setup_tasks.lock().await.join_next().await.is_some() {}
 
         // Closing the ordered queue first lets the worker drain every command
         // already read from stdin, then close/reap all retained sessions. If a
@@ -394,18 +394,25 @@ impl RuntimeHub {
                     let _ = events_tx.send(err).await;
                 }
             }
-            ClientCommand::AgentUpdate { agent_kind } => {
+            ClientCommand::AgentInstall { agent_kind }
+            | ClientCommand::AgentUpdate { agent_kind } => {
+                let install = matches!(cmd, ClientCommand::AgentInstall { .. });
                 let router = Arc::clone(&self.router);
                 let admin_tx = admin_tx.clone();
-                let cancel = self.update_cancel.subscribe();
-                let mut updates = self.updates.lock().await;
-                while updates.try_join_next().is_some() {}
-                updates.spawn(async move {
+                let cancel = self.setup_cancel.subscribe();
+                let mut tasks = self.setup_tasks.lock().await;
+                while tasks.try_join_next().is_some() {}
+                tasks.spawn(async move {
                     let mut reply = serde_json::json!({
-                        "reply": "agentUpdate",
+                        "reply": if install { "agentInstall" } else { "agentUpdate" },
                         "agentKind": agent_kind.as_str(),
                     });
-                    match router.update_agent(agent_kind, cancel).await {
+                    let result = if install {
+                        router.install_agent(agent_kind, cancel).await
+                    } else {
+                        router.update_agent(agent_kind, cancel).await
+                    };
+                    match result {
                         Ok(output) => reply["output"] = output.into(),
                         Err(error) => reply["error"] = serde_json::json!(error),
                     }
@@ -1040,6 +1047,10 @@ mod tests {
             AgentKind::Codex
         }
 
+        async fn install_command(&self) -> Result<tokio::process::Command, ProtocolError> {
+            self.update_command().await
+        }
+
         async fn update_command(&self) -> Result<tokio::process::Command, ProtocolError> {
             let mut command = tokio::process::Command::new("/bin/sh");
             command.args([
@@ -1464,8 +1475,8 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn connection_close_reaps_updater_and_its_children() {
-        for fail_writer in [false, true] {
+    async fn connection_close_reaps_setup_command_and_its_children() {
+        for (install, fail_writer) in [(false, false), (false, true), (true, false), (true, true)] {
             let dir = std::env::temp_dir().join(format!("update-close-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir(&dir).unwrap();
             let mut router = AgentRouter::new();
@@ -1488,8 +1499,14 @@ mod tests {
             };
             write_command(
                 &mut client,
-                &ClientCommand::AgentUpdate {
-                    agent_kind: AgentKind::Codex,
+                &if install {
+                    ClientCommand::AgentInstall {
+                        agent_kind: AgentKind::Codex,
+                    }
+                } else {
+                    ClientCommand::AgentUpdate {
+                        agent_kind: AgentKind::Codex,
+                    }
                 },
             )
             .await;
@@ -1518,6 +1535,23 @@ mod tests {
                     .await
                     .unwrap();
                 assert!(reply.contains("已终止"), "{reply}");
+                let reply: serde_json::Value = serde_json::from_str(reply.trim()).unwrap();
+                assert_eq!(
+                    reply["reply"],
+                    if install {
+                        "agentInstall"
+                    } else {
+                        "agentUpdate"
+                    }
+                );
+                assert_eq!(
+                    reply["error"]["code"],
+                    if install {
+                        "agent-install-failed"
+                    } else {
+                        "agent-update-failed"
+                    }
+                );
             }
             tokio::time::sleep(Duration::from_millis(350)).await;
             assert!(

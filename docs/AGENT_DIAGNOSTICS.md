@@ -70,6 +70,8 @@ backend 数据目录规则；这些变量不改变 vendor 历史来源。
 | `adapter_unhandled_method` | app-server 协议出现未识别事件 | 查看 raw record 和 schema |
 | `ipc_malformed_jsonl` | client/daemon IPC 收到坏 JSONL | 查看上一条 IPC line |
 | `daemon_spawn_failed` | backend client 无法启动 daemon | 检查 `agentdeckd` 路径 |
+| `agent-install-failed` | 官方 CLI 安装命令启动、下载、执行或取消清理失败 | 检查界面返回的退出状态与安装输出；在 daemon 所在机器确认官方安装域名可达、curl/bash 可用及用户目录可写 |
+| `agent-install-unsupported` | adapter 不支持一键安装 | 按对应 CLI 官方说明安装 |
 | `app_server_handshake_failed` | app-server 握手失败 | 检查 agent 登录、版本和 GUI 启动环境里的 `PATH` / `node` |
 | `turn_failed` | turn 执行失败 | 按 runId 查看 run record |
 | `daemon-shutdown-failed` | CLI 已收到成功 terminal，但 daemon 随后非零退出、超时或未能确认回收 | 将本次命令视为失败；检查 daemon exit status、cleanup failure 与残留进程，不要只采信先到的 turn terminal |
@@ -205,8 +207,8 @@ CLI harness 验证，不能把桌面壳当成可用审批客户端。
 
 | code | 含义 | 下一步 |
 | --- | --- | --- |
-| `cc-not-installed` | `claude` 二进制不存在 | 运行 `npm install -g @anthropic-ai/claude-code` 安装 Claude Code CLI |
-| `cc-version-too-old` | `claude` 版本过老，不支持 `--output-format stream-json` | 运行 `npm update -g @anthropic-ai/claude-code` 升级到最低支持版本 |
+| `cc-not-installed` | `claude` 二进制不存在 | 在机器页安装，或在目标机运行官方原生安装命令 `curl -fsSL https://claude.ai/install.sh \| bash` |
+| `cc-version-too-old` | `claude` 版本过老，不支持 `--output-format stream-json` | 在机器页更新，或运行 `claude update` |
 | `cc-not-authenticated` | 用户未 `claude auth login` | 运行 `claude auth login` 完成登录 |
 | `cc-spawn-failed` | `claude` CLI 进程 spawn 失败（权限或路径问题） | 检查 `PATH` 和 `claude` 可执行权限；确认 GUI 启动环境里 `node` 可找到 |
 | `cc-history-not-found` | 指定 session_id 在 `~/.claude/projects/` 下找不到对应 `.jsonl` | 确认 session_id 正确；历史可能已被 `claude rm` 彻底删除 |

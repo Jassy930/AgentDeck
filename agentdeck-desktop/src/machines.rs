@@ -13,7 +13,7 @@ use gpui_component::{
 };
 
 use crate::remotes;
-use crate::shell::{AgentHistory, Machine, Shell, agent_label, machine_label};
+use crate::shell::{AgentHistory, AgentOperation, Machine, Shell, agent_label, machine_label};
 use crate::sidebar;
 use crate::versions;
 use std::cmp::Ordering;
@@ -220,7 +220,8 @@ fn machine_card(
                         label_text
                     })
                     .disabled(
-                        machine.installing || machine.agents.iter().any(|agent| agent.updating),
+                        machine.installing
+                            || machine.agents.iter().any(|agent| agent.operation.is_some()),
                     )
                     .tooltip(format!(
                         "下载与桌面端同版本的预编译 agentdeckd v{}，装到该机器的 ~/.local/bin",
@@ -259,7 +260,9 @@ fn machine_card(
             let filtered =
                 filter.is_some_and(|(host, kind)| *host == machine.host && *kind == agent.kind);
             let hint = version_hint(agent, shell.latest_version(agent.kind), cx);
-            let armed = shell.update_armed == Some((machine.id, agent.kind));
+            let armed = agent.next_operation().is_some_and(|operation| {
+                shell.update_armed == Some((machine.id, agent.kind, operation))
+            });
             agent_row(machine, agent, filtered, hint, armed, cx)
         })
         .collect();
@@ -402,22 +405,28 @@ fn agent_row(
                             status
                         }),
                 )
-                .when_some(agent.update_result.clone(), |details, result| {
-                    let (text, color) = match result {
-                        Ok(output) => (
-                            format!("更新完成：{}", last_line(&output)),
-                            cx.theme().muted_foreground,
-                        ),
-                        Err(error) => (format!("更新失败：{error}"), cx.theme().danger),
-                    };
-                    details.child(
-                        div()
-                            .text_xs()
-                            .whitespace_normal()
-                            .text_color(color)
-                            .child(text),
-                    )
-                })
+                .when_some(
+                    agent.operation_result.clone(),
+                    |details, (operation, result)| {
+                        let (text, color) = match result {
+                            Ok(output) => (
+                                operation_success(operation, &output),
+                                cx.theme().muted_foreground,
+                            ),
+                            Err(error) => (
+                                format!("{}失败：{error}", operation.label()),
+                                cx.theme().danger,
+                            ),
+                        };
+                        details.child(
+                            div()
+                                .text_xs()
+                                .whitespace_normal()
+                                .text_color(color)
+                                .child(text),
+                        )
+                    },
+                )
                 .when_some(error, |details, error| {
                     details.child(
                         div()
@@ -429,7 +438,9 @@ fn agent_row(
                 }),
         );
 
-    let updating = agent.updating;
+    let operation = agent.operation.or_else(|| agent.next_operation());
+    let busy = agent.operation.is_some();
+    let label = operation.map(AgentOperation::label).unwrap_or("查询中…");
     h_flex()
         .gap_1()
         .items_center()
@@ -438,23 +449,30 @@ fn agent_row(
             Button::new(SharedString::from(format!("update-{key}")))
                 .ghost()
                 .xsmall()
-                .label(if updating {
-                    "更新中…"
+                .label(if busy {
+                    format!("{label}中…")
                 } else if armed {
-                    "✓"
+                    format!("确认{label}")
                 } else {
-                    "更新"
+                    label.to_string()
                 })
-                .disabled(updating || !machine.can_update_agents())
+                .disabled(busy || operation.is_none() || !machine.can_update_agents())
                 .when(armed, |button| button.text_color(cx.theme().success))
                 .tooltip(if !machine.can_update_agents() {
                     if machine.daemon_version.is_none() {
                         "正在确认 daemon 协议".to_string()
                     } else {
-                        "请先更新或重装 agentdeckd，再更新 CLI".to_string()
+                        "请先更新或重装 agentdeckd，再安装或更新 CLI".to_string()
                     }
+                } else if operation.is_none() {
+                    "正在查询 CLI 版本".to_string()
                 } else if armed {
-                    "再点一次确认更新".to_string()
+                    format!("再点一次确认{label}")
+                } else if operation == Some(AgentOperation::Install) {
+                    format!(
+                        "尚未探测到可用版本，按官方推荐方式安装 {}；已有安装将由官方安装器处理",
+                        agent_label(kind)
+                    )
                 } else {
                     format!("在该机器上运行 {} 自带的更新命令", agent_label(kind))
                 })
@@ -534,7 +552,18 @@ fn version_hint(
     }
 }
 
-/// 更新命令的输出可能多行，只取最后一行非空内容作摘要。
+fn operation_success(operation: AgentOperation, output: &str) -> String {
+    if operation == AgentOperation::Install {
+        format!(
+            "安装命令已完成：{}；如未登录，请在该机器的官方 CLI 中完成登录",
+            last_line(output)
+        )
+    } else {
+        format!("更新完成：{}", last_line(output))
+    }
+}
+
+/// 命令的输出可能多行，只取最后一行非空内容作摘要。
 fn last_line(output: &str) -> &str {
     output
         .lines()
@@ -546,6 +575,19 @@ fn last_line(output: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn install_result_preserves_action_and_explains_login() {
+        let output = "downloading\n  installed v1.0\n\n";
+        assert_eq!(
+            super::operation_success(super::AgentOperation::Install, output),
+            "安装命令已完成：installed v1.0；如未登录，请在该机器的官方 CLI 中完成登录"
+        );
+        assert_eq!(
+            super::operation_success(super::AgentOperation::Update, output),
+            "更新完成：installed v1.0"
+        );
+    }
+
     #[test]
     fn short_version_drops_product_suffix() {
         assert_eq!(super::short_version("2.1.191 (Claude Code)"), "v2.1.191");

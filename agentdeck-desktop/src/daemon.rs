@@ -166,7 +166,18 @@ fn build_command(host: Option<&str>) -> Result<Command> {
             command.args(remote_args(host));
             Ok(command)
         }
-        None => Ok(daemon_command(locate_daemon()?)),
+        None => {
+            let mut command = daemon_command(locate_daemon()?);
+            if let Some(home) = std::env::var_os("HOME") {
+                let old_path = std::env::var_os("PATH").unwrap_or_default();
+                let paths = std::iter::once(PathBuf::from(home).join(".local/bin"))
+                    .chain(std::env::split_paths(&old_path));
+                let path = std::env::join_paths(paths)
+                    .map_err(|error| format!("准备 CLI 安装目录失败：{error}"))?;
+                command.env("PATH", path);
+            }
+            Ok(command)
+        }
     }
 }
 
@@ -196,12 +207,12 @@ fn daemon_command(program: impl AsRef<OsStr>) -> Command {
     command
 }
 
-/// 回复对应的等待者：history 按 requestId、agentCapabilities / agentUpdate 按 agentKind
+/// 回复对应的等待者：history 按 requestId、agentCapabilities / agentInstall / agentUpdate 按 agentKind
 /// （daemon 并发处理、可能乱序返回）；其余 admin reply 按 reply 名先进先出。
 fn reply_key(value: &serde_json::Value) -> Option<String> {
     match value.get("reply")?.as_str()? {
         "history" => Some(format!("history:{}", value.get("requestId")?.as_str()?)),
-        reply @ ("agentCapabilities" | "agentUpdate") => {
+        reply @ ("agentCapabilities" | "agentInstall" | "agentUpdate") => {
             Some(format!("{reply}:{}", value.get("agentKind")?.as_str()?))
         }
         reply => Some(reply.to_string()),
@@ -226,7 +237,7 @@ fn reply_result(value: serde_json::Value) -> Result<serde_json::Value> {
 
 /// 客户端兜底：daemon 自己的历史超时是 32 秒，超过这里说明管道已不通。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(40);
-/// CLI 自更新要下载安装包；比 daemon 侧 600s 上限略长，让 daemon 先报超时。
+/// CLI 安装和更新要下载安装包；比 daemon 侧 600s 上限略长，让 daemon 先报超时。
 const UPDATE_TIMEOUT: Duration = Duration::from_secs(620);
 
 type Reply = io::Result<Result<serde_json::Value>>;
@@ -320,6 +331,7 @@ impl Connection {
                 )
             }
             ClientCommand::AgentCapabilities { agent_kind }
+            | ClientCommand::AgentInstall { agent_kind }
             | ClientCommand::AgentUpdate { agent_kind } => (
                 command.clone(),
                 format!("{expected_reply}:{}", agent_kind.as_str()),
@@ -355,7 +367,9 @@ impl Connection {
             ));
         }
         let timeout = match command {
-            ClientCommand::AgentUpdate { .. } => UPDATE_TIMEOUT,
+            ClientCommand::AgentInstall { .. } | ClientCommand::AgentUpdate { .. } => {
+                UPDATE_TIMEOUT
+            }
             _ => REQUEST_TIMEOUT,
         };
         match rx.recv_timeout(timeout) {
@@ -585,7 +599,15 @@ impl Client {
 
     /// 用 CLI 自带的更新命令升级该机器上的 agent，返回命令输出。
     pub fn agent_update(&self, agent_kind: AgentKind) -> Result<String> {
-        // 重连可能换成旧 daemon；必须在执行更新的同一连接上确认协议，且写操作不重放。
+        self.agent_modify(&ClientCommand::AgentUpdate { agent_kind }, "agentUpdate")
+    }
+
+    pub fn agent_install(&self, agent_kind: AgentKind) -> Result<String> {
+        self.agent_modify(&ClientCommand::AgentInstall { agent_kind }, "agentInstall")
+    }
+
+    fn agent_modify(&self, command: &ClientCommand, expected_reply: &str) -> Result<String> {
+        // 重连可能换成旧 daemon；必须在执行写操作的同一连接上确认协议，且写操作不重放。
         let connection = self.connection().map_err(|error| error.to_string())?;
         let protocol = self
             .request_once(
@@ -597,14 +619,10 @@ impl Client {
         if protocol["protocolVersion"].as_u64()
             != Some(u64::from(agentdeck_protocol::PROTOCOL_VERSION))
         {
-            return Err("daemon 协议不支持 CLI 更新，请先更新或重装 agentdeckd".into());
+            return Err("daemon 协议不支持 CLI 安装或更新，请先更新或重装 agentdeckd".into());
         }
         let reply = self
-            .request_once(
-                &connection,
-                &ClientCommand::AgentUpdate { agent_kind },
-                "agentUpdate",
-            )
+            .request_once(&connection, command, expected_reply)
             .map_err(|error| error.to_string())??;
         Ok(reply["output"].as_str().unwrap_or_default().to_string())
     }
@@ -837,6 +855,43 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "installed");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn local_daemon_inherits_local_bin_and_existing_path() {
+        const CHILD: &str = "AGENTDECK_TEST_LOCAL_PATH";
+        if std::env::var_os(CHILD).is_some() {
+            let output = super::build_command(None)
+                .unwrap()
+                .args(["-c", "printf '%s' \"$PATH\""])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                "/tmp/agentdeck-gui-home/.local/bin:/original/bin:/usr/bin"
+            );
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "daemon::tests::local_daemon_inherits_local_bin_and_existing_path",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", "/tmp/agentdeck-gui-home")
+            .env("PATH", "/original/bin:/usr/bin")
+            .env(super::DAEMON_BIN_ENV, "/bin/sh")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn hosts_that_could_be_parsed_as_options_are_rejected() {
         for bad in ["", "-oProxyCommand=x", "dt extra", "a\tb"] {
@@ -1021,42 +1076,47 @@ mod tests {
     }
 
     #[test]
-    fn agent_update_rejects_old_protocol_without_sending_the_update() {
+    fn agent_install_and_update_reject_old_protocol_without_sending_writes() {
         let connection = fake_daemon(
-            r#"while read -r line; do
+            r#"agents='[]'
+            while read -r line; do
               case "$line" in
-                *protocolVersion*) echo '{"reply":"protocolVersion","protocolVersion":5}' ;;
-                *agentUpdate*) echo '{"reply":"agentUpdate","agentKind":"codex","output":"unexpected update"}' ;;
-                *agentList*) echo '{"reply":"agentList","agents":[]}' ;;
+                *protocolVersion*) echo '{"reply":"protocolVersion","protocolVersion":6}' ;;
+                *agentUpdate*) agents='["codex"]'; echo '{"reply":"agentUpdate","agentKind":"codex","output":"unexpected update"}' ;;
+                *agentInstall*) agents='["codex"]'; echo '{"reply":"agentInstall","agentKind":"codex","output":"unexpected install"}' ;;
+                *agentList*) printf '{"reply":"agentList","agents":%s}\n' "$agents" ;;
               esac
             done"#,
         );
         let client = fake_client(&connection);
-        assert!(
-            client
-                .agent_update(super::AgentKind::Codex)
-                .unwrap_err()
-                .contains("请先更新或重装")
-        );
+        for action in [super::Client::agent_install, super::Client::agent_update] {
+            assert!(
+                action(&client, super::AgentKind::Codex)
+                    .unwrap_err()
+                    .contains("请先更新或重装")
+            );
+        }
         assert!(client.agent_list().unwrap().is_empty());
     }
 
     #[test]
-    fn agent_update_does_not_retry_a_lost_reply() {
-        let connection = fake_daemon(&format!(
-            r#"while read -r line; do
+    fn agent_install_and_update_do_not_retry_a_lost_reply() {
+        for action in [super::Client::agent_install, super::Client::agent_update] {
+            let connection = fake_daemon(&format!(
+                r#"while read -r line; do
               case "$line" in
                 *protocolVersion*) echo '{{"reply":"protocolVersion","protocolVersion":{}}}' ;;
-                *agentUpdate*) echo update-connection-lost >&2; exit 1 ;;
+                *agentUpdate*|*agentInstall*) echo operation-connection-lost >&2; exit 1 ;;
               esac
             done"#,
-            agentdeck_protocol::PROTOCOL_VERSION,
-        ));
-        let client = fake_client(&connection);
-        let error = client.agent_update(super::AgentKind::Codex).unwrap_err();
-        // fake_client 的重连地址无效；若重试，这里会变成主机校验错误。
-        assert!(error.contains("update-connection-lost"), "{error}");
-        assert!(!connection.is_alive());
+                agentdeck_protocol::PROTOCOL_VERSION,
+            ));
+            let client = fake_client(&connection);
+            let error = action(&client, super::AgentKind::Codex).unwrap_err();
+            // fake_client 的重连地址无效；若重试，这里会变成主机校验错误。
+            assert!(error.contains("operation-connection-lost"), "{error}");
+            assert!(!connection.is_alive());
+        }
     }
 
     #[test]
@@ -1085,6 +1145,14 @@ mod tests {
                 .as_deref(),
             Some("agentCapabilities:codex")
         );
+        for reply in ["agentInstall", "agentUpdate"] {
+            assert_eq!(
+                key(&format!(
+                    r#"{{"reply":"{reply}","agentKind":"codex","output":"ok"}}"#
+                )),
+                Some(format!("{reply}:codex"))
+            );
+        }
         assert_eq!(
             key(
                 r#"{"reply":"history","requestId":"current","response":{"kind":"list","value":[]}}"#
