@@ -20,26 +20,47 @@ use tokio::process::Command;
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinSet;
 
-/// CLI 自更新要下载安装包，给足时间；桌面端等待上限需大于它。
-pub(crate) const AGENT_UPDATE_TIMEOUT: Duration = Duration::from_secs(600);
+/// CLI 安装和更新要下载安装包，给足时间；桌面端等待上限需大于它。
+const AGENT_SETUP_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Leave two seconds below the hub's 32-second request deadline so a hung
 /// source cannot discard items already returned by another source.
 const HISTORY_SOURCE_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn update_failed(message: impl Into<String>) -> ProtocolError {
-    ProtocolError {
-        code: "agent-update-failed".into(),
-        message: message.into(),
-        diagnostic_ref: None,
+#[derive(Clone, Copy)]
+enum AgentSetupAction {
+    Install,
+    Update,
+}
+
+impl AgentSetupAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Install => "安装",
+            Self::Update => "更新",
+        }
+    }
+
+    fn failed(self, message: impl Into<String>) -> ProtocolError {
+        ProtocolError {
+            code: match self {
+                Self::Install => "agent-install-failed",
+                Self::Update => "agent-update-failed",
+            }
+            .into(),
+            message: message.into(),
+            diagnostic_ref: None,
+        }
     }
 }
 
-async fn run_agent_update(
+async fn run_agent_setup(
     mut command: Command,
     mut cancel: watch::Receiver<bool>,
     timeout: Duration,
+    action: AgentSetupAction,
 ) -> Result<String, ProtocolError> {
+    let label = action.label();
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -49,18 +70,18 @@ async fn run_agent_update(
     command.process_group(0);
     let mut child = command
         .spawn()
-        .map_err(|error| update_failed(format!("无法启动更新命令：{error}")))?;
+        .map_err(|error| action.failed(format!("无法启动{label}命令：{error}")))?;
     let pid = child.id().expect("newly spawned updater has a pid");
     let mut stdout = child.stdout.take().expect("updater stdout is piped");
     let mut stderr = child.stderr.take().expect("updater stderr is piped");
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let result = tokio::select! {
         biased;
-        _ = cancel.wait_for(|cancelled| *cancelled) => Err("更新已取消".to_string()),
-        _ = tokio::time::sleep(timeout) => Err(format!("更新超过 {}s 未完成", timeout.as_secs())),
+        _ = cancel.wait_for(|cancelled| *cancelled) => Err(format!("{label}已取消")),
+        _ = tokio::time::sleep(timeout) => Err(format!("{label}超过 {}s 未完成", timeout.as_secs())),
         result = async {
             tokio::try_join!(child.wait(), stdout.read_to_end(&mut out), stderr.read_to_end(&mut err))
-        } => result.map(|(status, _, _)| status).map_err(|error| format!("读取更新结果失败：{error}")),
+        } => result.map(|(status, _, _)| status).map_err(|error| format!("读取{label}结果失败：{error}")),
     };
     let status = match result {
         Ok(status) => status,
@@ -77,11 +98,11 @@ async fn run_agent_update(
                 }
                 Ok::<_, io::Error>(())
             };
-            return Err(update_failed(
+            return Err(action.failed(
                 match tokio::time::timeout(Duration::from_secs(1), cleanup).await {
                     Ok(Ok(())) => format!("{message}，已终止"),
-                    Ok(Err(error)) => format!("{message}；更新进程清理失败：{error}"),
-                    Err(_) => format!("{message}；更新进程清理超时"),
+                    Ok(Err(error)) => format!("{message}；{label}进程清理失败：{error}"),
+                    Err(_) => format!("{message}；{label}进程清理超时"),
                 },
             ));
         }
@@ -96,7 +117,7 @@ async fn run_agent_update(
     if status.success() {
         Ok(text)
     } else {
-        Err(update_failed(format!("更新失败（{status}）：{text}")))
+        Err(action.failed(format!("{label}失败（{status}）：{text}")))
     }
 }
 
@@ -158,7 +179,26 @@ impl AgentRouter {
     pub async fn update_agent(
         &self,
         kind: AgentKind,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<String, ProtocolError> {
+        self.setup_agent(kind, cancel, AgentSetupAction::Update)
+            .await
+    }
+
+    pub async fn install_agent(
+        &self,
+        kind: AgentKind,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<String, ProtocolError> {
+        self.setup_agent(kind, cancel, AgentSetupAction::Install)
+            .await
+    }
+
+    async fn setup_agent(
+        &self,
+        kind: AgentKind,
         mut cancel: watch::Receiver<bool>,
+        action: AgentSetupAction,
     ) -> Result<String, ProtocolError> {
         let agent = self.agents.get(&kind).ok_or_else(|| ProtocolError {
             code: "agent-not-registered".into(),
@@ -167,10 +207,15 @@ impl AgentRouter {
         })?;
         let command = tokio::select! {
             biased;
-            _ = cancel.wait_for(|cancelled| *cancelled) => return Err(update_failed("更新已取消")),
-            command = agent.update_command() => command?,
+            _ = cancel.wait_for(|cancelled| *cancelled) => return Err(action.failed(format!("{}已取消", action.label()))),
+            command = async {
+                match action {
+                    AgentSetupAction::Install => agent.install_command().await,
+                    AgentSetupAction::Update => agent.update_command().await,
+                }
+            } => command?,
         };
-        run_agent_update(command, cancel, AGENT_UPDATE_TIMEOUT).await
+        run_agent_setup(command, cancel, AGENT_SETUP_TIMEOUT, action).await
     }
 
     /// `AgentCapabilities` 查询：agent_version 换成实际安装版本。
@@ -687,6 +732,16 @@ mod tests {
             Ok(())
         }
 
+        async fn install_command(&self) -> Result<tokio::process::Command, ProtocolError> {
+            let script = match self.kind {
+                AgentKind::Codex => "echo installed",
+                AgentKind::ClaudeCode => "echo install-boom >&2; exit 4",
+            };
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.args(["-c", script]);
+            Ok(command)
+        }
+
         async fn update_command(&self) -> Result<tokio::process::Command, ProtocolError> {
             let script = match self.kind {
                 AgentKind::Codex => "echo updated",
@@ -750,6 +805,91 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "agent-update-failed");
         assert!(error.message.contains("boom"), "{}", error.message);
+
+        let (_cancel_tx, cancel) = watch::channel(false);
+        assert_eq!(
+            router
+                .install_agent(AgentKind::Codex, cancel.clone())
+                .await
+                .unwrap(),
+            "installed"
+        );
+        let error = router
+            .install_agent(AgentKind::ClaudeCode, cancel)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "agent-install-failed");
+        assert!(error.message.contains("install-boom"), "{}", error.message);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn official_install_commands_report_installer_and_download_failures() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("agent-install-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let curl = dir.join("curl");
+        std::fs::write(
+            &curl,
+            r#"#!/bin/sh
+[ "$1" = '-fsSL' ] && [ "$2" = "$EXPECTED_INSTALL_URL" ] || exit 9
+if [ "$2" = 'https://chatgpt.com/codex/install.sh' ]; then
+  [ "$CODEX_NON_INTERACTIVE" = 1 ] || exit 11
+fi
+case "$INSTALL_RESULT" in
+  success) printf 'echo installed\n' ;;
+  installer-failed) printf 'echo installer-failed >&2; exit 17\n' ;;
+  download-failed) echo download-failed >&2; exit 22 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let adapters: [(DynAgent, &str); 2] = [
+            (
+                Arc::new(crate::codex::adapter::CodexAdapter::new_for_test()),
+                "https://chatgpt.com/codex/install.sh",
+            ),
+            (
+                Arc::new(crate::claude_code::adapter::ClaudeCodeAdapter::new_for_test()),
+                "https://claude.ai/install.sh",
+            ),
+        ];
+        for (adapter, url) in adapters {
+            for result in ["success", "installer-failed", "download-failed"] {
+                let mut command = adapter.install_command().await.unwrap();
+                if adapter.kind() == AgentKind::ClaudeCode {
+                    assert!(
+                        !command
+                            .as_std()
+                            .get_envs()
+                            .any(|(key, _)| key == "CODEX_NON_INTERACTIVE")
+                    );
+                }
+                command
+                    .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
+                    .env("EXPECTED_INSTALL_URL", url)
+                    .env("INSTALL_RESULT", result);
+                let (_cancel_tx, cancel) = watch::channel(false);
+                let output = run_agent_setup(
+                    command,
+                    cancel,
+                    Duration::from_secs(2),
+                    AgentSetupAction::Install,
+                )
+                .await;
+                if result == "success" {
+                    assert_eq!(output.unwrap(), "installed");
+                } else {
+                    let error = output.unwrap_err();
+                    assert_eq!(error.code, "agent-install-failed");
+                    assert!(error.message.contains(result), "{}", error.message);
+                }
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(target_os = "macos")]
@@ -790,9 +930,14 @@ mod tests {
         ]);
         command.arg(&marker);
         let (_cancel_tx, cancel) = watch::channel(false);
-        let error = run_agent_update(command, cancel, Duration::from_millis(50))
-            .await
-            .unwrap_err();
+        let error = run_agent_setup(
+            command,
+            cancel,
+            Duration::from_millis(50),
+            AgentSetupAction::Update,
+        )
+        .await
+        .unwrap_err();
         assert!(error.message.ends_with("已终止"), "{}", error.message);
         tokio::time::sleep(Duration::from_millis(350)).await;
         assert!(!marker.exists(), "an updater child survived its timeout");

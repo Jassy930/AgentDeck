@@ -474,6 +474,17 @@ impl Agent for ClaudeCodeAdapter {
             .unwrap_or_else(|_| "claude unknown".to_string())
     }
 
+    async fn install_command(&self) -> Result<tokio::process::Command, ProtocolError> {
+        let mut command = tokio::process::Command::new("bash");
+        command.args([
+            "-o",
+            "pipefail",
+            "-c",
+            "curl -fsSL https://claude.ai/install.sh | bash",
+        ]);
+        Ok(command)
+    }
+
     async fn update_command(&self) -> Result<tokio::process::Command, ProtocolError> {
         let mut command = tokio::process::Command::new("claude");
         command.arg("update");

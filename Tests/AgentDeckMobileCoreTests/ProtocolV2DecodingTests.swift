@@ -279,6 +279,22 @@ final class ProtocolV2DecodingTests: XCTestCase {
         }
     }
 
+    func testAgentInstallWireEncodingAndDecoding() throws {
+        for kind in [AgentKind.codex, .claudeCode] {
+            let expected = ["command": "agentInstall", "agentKind": kind.rawValue]
+            let encoded = try JSONEncoder().encode(ClientCommand.agentInstall(agentKind: kind))
+            let object = try JSONSerialization.jsonObject(with: encoded) as? [String: String]
+            XCTAssertEqual(object, expected)
+
+            let wire = try JSONSerialization.data(withJSONObject: expected)
+            let decoded = try JSONDecoder().decode(ClientCommand.self, from: wire)
+            guard case let .agentInstall(decodedKind) = decoded else {
+                return XCTFail("expected agentInstall, got \(decoded)")
+            }
+            XCTAssertEqual(decodedKind, kind)
+        }
+    }
+
     func testEncodeClientCommandSessionStartCodex() throws {
         let cmd: ClientCommand = .sessionStart(SessionStart(
             sessionId: "session-1",

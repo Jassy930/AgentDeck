@@ -966,6 +966,25 @@
             "command"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "agentKind": {
+              "$ref": "#/definitions/AgentKind"
+            },
+            "command": {
+              "enum": [
+                "agentInstall"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "agentKind",
+            "command"
+          ],
+          "type": "object"
         }
       ],
       "title": "ClientCommand"
@@ -4766,6 +4785,6 @@
       "type": "object"
     }
   },
-  "title": "AgentDeck Protocol v6",
+  "title": "AgentDeck Protocol v7",
   "type": "object"
 }

@@ -12,10 +12,12 @@
 重生成快照；仅清除不属于本地 IPC 的聚合根不改变版本。`cargo test` 的 drift 测试
 会在类型与快照脱节时失败。
 
-当前为 v6。新增 `ClientCommand::AgentUpdate { agentKind }`，admin 回复以
+当前为 v7。新增 `ClientCommand::AgentInstall { agentKind }`，由 adapter 提供官方安装命令；
+admin 回复以 `reply: "agentInstall"` 和 `agentKind` 标识目标，成功携带 `output`，失败携带 `error`。
+v6 增加 `ClientCommand::AgentUpdate { agentKind }`，admin 回复以
 `reply: "agentUpdate"` 和 `agentKind` 标识目标，成功携带 `output`，失败携带 `error`。
-`Selfcheck` 回复提供 daemon 的 `version` 和 `protocolVersion`；桌面端确认协议与当前版本一致（v6）
-后才允许发起 CLI 更新，旧 daemon 仍可读取历史。Swift mirror 同步 `AgentUpdate` 编解码。
+`Selfcheck` 回复提供 daemon 的 `version` 和 `protocolVersion`；桌面端确认协议与当前版本一致（v7）
+后才允许发起 CLI 安装／更新，旧 daemon 仍可读取历史。Swift mirror 同步两种命令编解码。
 
 v5 的历史成功 admin 回复保留 `response`，新增可选 `warnings` 数组；每项包含
 `agentKind`、`code`、`message`。空 warnings 省略；`requestId` 仍原样回显，失败仍使用

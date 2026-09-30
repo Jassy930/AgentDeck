@@ -63,6 +63,15 @@ pub trait Agent: Send + Sync + 'static {
         self.capabilities().agent_version
     }
 
+    /// 官方 CLI 安装命令（机器页一键安装）。默认不支持。
+    async fn install_command(&self) -> Result<tokio::process::Command, ProtocolError> {
+        Err(ProtocolError {
+            code: "agent-install-unsupported".into(),
+            message: format!("{} 不支持一键安装", self.kind().as_str()),
+            diagnostic_ref: None,
+        })
+    }
+
     /// CLI 自带的自更新命令（机器页一键更新）。默认不支持。
     async fn update_command(&self) -> Result<tokio::process::Command, ProtocolError> {
         Err(ProtocolError {

@@ -1194,6 +1194,7 @@ public enum ClientCommand: Codable, Sendable {
     case agentList
     case agentCapabilities(agentKind: AgentKind)
     case agentUpdate(agentKind: AgentKind)
+    case agentInstall(agentKind: AgentKind)
 
     private enum CodingKeys: String, CodingKey {
         case command, agentKind, prompt, sessionId, turnId, decision, payload
@@ -1238,6 +1239,9 @@ public enum ClientCommand: Codable, Sendable {
         case "agentUpdate":
             let k = try c.decode(AgentKind.self, forKey: .agentKind)
             self = .agentUpdate(agentKind: k)
+        case "agentInstall":
+            let k = try c.decode(AgentKind.self, forKey: .agentKind)
+            self = .agentInstall(agentKind: k)
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .command, in: c, debugDescription: "unknown ClientCommand: \(cmd)"
@@ -1284,6 +1288,9 @@ public enum ClientCommand: Codable, Sendable {
             try c.encode(k, forKey: .agentKind)
         case .agentUpdate(let k):
             try c.encode("agentUpdate", forKey: .command)
+            try c.encode(k, forKey: .agentKind)
+        case .agentInstall(let k):
+            try c.encode("agentInstall", forKey: .command)
             try c.encode(k, forKey: .agentKind)
         }
     }
