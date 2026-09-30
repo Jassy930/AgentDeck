@@ -339,9 +339,11 @@ pub(crate) struct Machine {
     pub connecting: bool,
     /// AgentList 的失败原因；各来源历史的错误由 AgentHistory 保留。
     pub error: Option<String>,
-    /// agentdeckd 自身版本；None 表示仍在查询或未连上，查询失败记为 "unknown"。
+    /// agentdeckd 自身版本；None 表示仍在查询或未连上，首次查询失败记为 "unknown"。
     pub daemon_version: Option<String>,
     pub daemon_protocol: Option<u64>,
+    pub daemon_checking: bool,
+    pub daemon_check_error: Option<String>,
     pub installing: bool,
     /// 最近一次安装 agentdeckd 的结果：成功为新 daemon 的 `--version`，失败为错误。
     pub install_result: Option<Result<String, String>>,
@@ -359,6 +361,8 @@ impl Machine {
             error: None,
             daemon_version: None,
             daemon_protocol: None,
+            daemon_checking: false,
+            daemon_check_error: None,
             installing: false,
             install_result: None,
         }
@@ -371,7 +375,23 @@ impl Machine {
     pub fn can_update_agents(&self) -> bool {
         !self.connecting
             && !self.installing
+            && !self.daemon_checking
             && self.daemon_protocol == Some(u64::from(agentdeck_protocol::PROTOCOL_VERSION))
+    }
+
+    fn complete_daemon_check(&mut self, result: Result<(String, u64), String>) {
+        self.daemon_checking = false;
+        match result {
+            Ok((version, protocol)) => {
+                self.daemon_version = Some(version);
+                self.daemon_protocol = Some(protocol);
+                self.daemon_check_error = None;
+            }
+            Err(error) => {
+                self.daemon_check_error = Some(error);
+                self.daemon_version.get_or_insert_with(|| "unknown".into());
+            }
+        }
     }
 
     /// 远端 login PATH 与 `~/.local/bin` 里都找不到 agentdeckd。
@@ -724,11 +744,21 @@ impl Shell {
         .detach();
     }
 
-    fn load_daemon_version(&mut self, id: u64, cx: &mut Context<Self>) {
-        let Some(machine) = self.machine(id) else {
+    pub fn load_daemon_version(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(machine) = self.machine_mut(id) else {
             return;
         };
+        if machine.connecting
+            || machine.installing
+            || machine.daemon_checking
+            || machine.agents.iter().any(|agent| agent.operation.is_some())
+        {
+            return;
+        }
+        machine.daemon_checking = true;
+        machine.daemon_check_error = None;
         let client = machine.client.clone();
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let version = cx
                 .background_executor()
@@ -736,12 +766,7 @@ impl Shell {
                 .await;
             this.update(cx, |shell, cx| {
                 if let Some(machine) = shell.machine_mut(id) {
-                    let (version, protocol) = match version {
-                        Ok((version, protocol)) => (version, Some(protocol)),
-                        Err(_) => ("unknown".into(), None),
-                    };
-                    machine.daemon_version = Some(version);
-                    machine.daemon_protocol = protocol;
+                    machine.complete_daemon_check(version);
                     cx.notify();
                 }
             })
@@ -758,11 +783,16 @@ impl Shell {
         let Some(host) = machine.host.clone() else {
             return;
         };
-        if machine.installing || machine.agents.iter().any(|agent| agent.operation.is_some()) {
+        if machine.connecting
+            || machine.installing
+            || machine.daemon_checking
+            || machine.agents.iter().any(|agent| agent.operation.is_some())
+        {
             return;
         }
         machine.installing = true;
         machine.install_result = None;
+        machine.daemon_check_error = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -1968,6 +1998,28 @@ mod tests {
     }
 
     #[test]
+    fn failed_daemon_check_preserves_the_last_successful_version() {
+        let mut machine = Machine::new(1, None);
+        machine.daemon_checking = true;
+        machine.complete_daemon_check(Err("timeout".into()));
+        assert!(!machine.daemon_checking);
+        assert_eq!(machine.daemon_version.as_deref(), Some("unknown"));
+        assert_eq!(machine.daemon_protocol, None);
+
+        machine.complete_daemon_check(Ok(("999.0.0".into(), 999)));
+        machine.daemon_checking = true;
+        machine.complete_daemon_check(Err("timeout".into()));
+        assert!(!machine.daemon_checking);
+        assert_eq!(machine.daemon_version.as_deref(), Some("999.0.0"));
+        assert_eq!(machine.daemon_protocol, Some(999));
+        assert_eq!(machine.daemon_check_error.as_deref(), Some("timeout"));
+
+        machine.complete_daemon_check(Ok(("999.0.1".into(), 999)));
+        assert_eq!(machine.daemon_version.as_deref(), Some("999.0.1"));
+        assert!(machine.daemon_check_error.is_none());
+    }
+
+    #[test]
     fn cli_updates_require_a_ready_daemon_with_the_current_protocol() {
         let mut machine = Machine::new(1, None);
         assert!(!machine.can_update_agents());
@@ -1978,6 +2030,9 @@ mod tests {
         machine.connecting = true;
         assert!(!machine.can_update_agents());
         machine.connecting = false;
+        machine.daemon_checking = true;
+        assert!(!machine.can_update_agents());
+        machine.daemon_checking = false;
         machine.installing = true;
         assert!(!machine.can_update_agents());
     }

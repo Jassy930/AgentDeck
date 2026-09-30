@@ -168,7 +168,7 @@ fn machine_card(
     let id = machine.id;
     let label = machine_label(&machine.host);
     let (status, dot) = if machine.installing {
-        ("安装 agentdeckd 中…", cx.theme().muted_foreground)
+        ("安装／升级 agentdeckd 中…", cx.theme().muted_foreground)
     } else if machine.connecting {
         ("连接中…", cx.theme().muted_foreground)
     } else if machine.daemon_missing() {
@@ -178,7 +178,7 @@ fn machine_card(
     } else {
         ("已连接", cx.theme().success)
     };
-    let (install, outdated) = daemon_install_offer(machine);
+    let (install, daemon_hint) = daemon_install_offer(machine);
 
     let header = h_flex()
         .gap_2()
@@ -200,14 +200,29 @@ fn machine_card(
                 .child(status)
                 .when_some(machine.daemon_version.as_deref(), |line, version| {
                     line.child(format!("· agentdeckd {}", short_version(version)))
-                })
-                .when(outdated, |line| {
-                    line.child(
-                        div()
-                            .text_color(crate::theme_tokens::WARN)
-                            .child(format!("可更新到 v{}", remotes::DAEMON_VERSION)),
-                    )
                 }),
+        )
+        .child(
+            Button::new(SharedString::from(format!("check-daemon-{label}")))
+                .ghost()
+                .xsmall()
+                .label(if machine.daemon_checking {
+                    "检查中…"
+                } else {
+                    "检查更新"
+                })
+                .disabled(
+                    machine.connecting
+                        || machine.installing
+                        || machine.daemon_checking
+                        || machine.error.is_some()
+                        || machine.agents.iter().any(|agent| agent.operation.is_some()),
+                )
+                .tooltip(format!(
+                    "检查当前运行的 agentdeckd 是否匹配桌面配套版本 v{}",
+                    remotes::DAEMON_VERSION
+                ))
+                .on_click(cx.listener(move |shell, _, _, cx| shell.load_daemon_version(id, cx))),
         )
         .when_some(install, |header, label_text| {
             header.child(
@@ -215,12 +230,15 @@ fn machine_card(
                     .ghost()
                     .xsmall()
                     .label(if machine.installing {
-                        "安装中…"
+                        "进行中…".to_string()
+                    } else if label_text == "升级 agentdeckd" {
+                        format!("升级到 v{}", remotes::DAEMON_VERSION)
                     } else {
-                        label_text
+                        label_text.to_string()
                     })
                     .disabled(
                         machine.installing
+                            || machine.daemon_checking
                             || machine.agents.iter().any(|agent| agent.operation.is_some()),
                     )
                     .tooltip(format!(
@@ -275,6 +293,23 @@ fn machine_card(
         .border_1()
         .border_color(cx.theme().border)
         .child(header)
+        .when_some(daemon_hint, |card, hint| {
+            card.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(hint),
+            )
+        })
+        .when_some(machine.daemon_check_error.clone(), |card, error| {
+            card.child(
+                div()
+                    .text_xs()
+                    .whitespace_normal()
+                    .text_color(cx.theme().danger)
+                    .child(format!("版本检查失败：{error}")),
+            )
+        })
         .when_some(machine.error.clone(), |card, error| {
             let error = if machine.daemon_missing() {
                 "目标机的 login PATH 与 ~/.local/bin 里都找不到 agentdeckd，可点「安装」装上预编译二进制。".to_string()
@@ -291,8 +326,8 @@ fn machine_card(
         })
         .when_some(machine.install_result.clone(), |card, result| {
             let (text, color) = match result {
-                Ok(version) => (format!("安装完成：{version}"), cx.theme().muted_foreground),
-                Err(error) => (format!("安装失败：{error}"), cx.theme().danger),
+                Ok(version) => (format!("安装／升级完成：{version}"), cx.theme().muted_foreground),
+                Err(error) => (format!("安装／升级失败：{error}"), cx.theme().danger),
             };
             card.child(
                 div()
@@ -305,26 +340,51 @@ fn machine_card(
         .children(agents)
 }
 
-/// 远端 daemon 缺失、版本拿不到或旧于桌面端时，给出安装按钮文案；第二项表示是否已知过旧。
-fn daemon_install_offer(machine: &Machine) -> (Option<&'static str>, bool) {
-    if machine.host.is_none() || machine.connecting {
-        return (None, false);
+fn daemon_install_offer(machine: &Machine) -> (Option<&'static str>, Option<String>) {
+    if machine.connecting || machine.daemon_checking {
+        return (None, None);
+    }
+    if machine.host.is_none() {
+        let hint = machine.daemon_version.as_deref().map(|version| {
+            format!(
+                "{}；本机 agentdeckd 随 AgentDeck 桌面应用一起更新",
+                daemon_version_offer(version, machine.daemon_protocol).1
+            )
+        });
+        return (None, hint);
     }
     if machine.daemon_missing() {
-        return (Some("安装"), false);
+        return (Some("安装"), None);
     }
-    if machine.daemon_version.is_some()
-        && machine.daemon_protocol != Some(u64::from(agentdeck_protocol::PROTOCOL_VERSION))
-    {
-        return (Some("重装 agentdeckd"), false);
-    }
-    match machine.daemon_version.as_deref().map(versions::extract) {
-        Some(Some(version)) => {
-            let outdated = versions::compare(version, remotes::DAEMON_VERSION) == Ordering::Less;
-            (outdated.then_some("更新 agentdeckd"), outdated)
+    match machine.daemon_version.as_deref() {
+        Some(version) => {
+            let (action, hint) = daemon_version_offer(version, machine.daemon_protocol);
+            (action, Some(hint))
         }
-        Some(None) => (Some("重装 agentdeckd"), false),
-        None => (None, false),
+        None => (None, None),
+    }
+}
+
+fn daemon_version_offer(version: &str, protocol: Option<u64>) -> (Option<&'static str>, String) {
+    let target = remotes::DAEMON_VERSION;
+    match versions::extract(version).map(|version| versions::compare(version, target)) {
+        Some(Ordering::Less) => (
+            Some("升级 agentdeckd"),
+            format!("可升级到桌面配套版本 v{target}"),
+        ),
+        Some(Ordering::Greater) => (
+            None,
+            "daemon 版本高于桌面配套版本，请先更新 AgentDeck 桌面应用".into(),
+        ),
+        Some(Ordering::Equal)
+            if protocol == Some(u64::from(agentdeck_protocol::PROTOCOL_VERSION)) =>
+        {
+            (None, format!("已是桌面配套版本 v{target}"))
+        }
+        _ => (
+            Some("重装 agentdeckd"),
+            format!("版本未知或协议不兼容，可重装桌面配套版本 v{target}"),
+        ),
     }
 }
 
@@ -459,7 +519,11 @@ fn agent_row(
                 .disabled(busy || operation.is_none() || !machine.can_update_agents())
                 .when(armed, |button| button.text_color(cx.theme().success))
                 .tooltip(if !machine.can_update_agents() {
-                    if machine.daemon_version.is_none() {
+                    if machine.daemon_checking {
+                        "正在检查 daemon 版本，请稍候".to_string()
+                    } else if machine.installing {
+                        "正在安装或升级 agentdeckd，请稍候".to_string()
+                    } else if machine.daemon_version.is_none() {
                         "正在确认 daemon 协议".to_string()
                     } else {
                         "请先更新或重装 agentdeckd，再安装或更新 CLI".to_string()
@@ -575,6 +639,27 @@ fn last_line(output: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn daemon_upgrade_compares_versions_before_protocol_and_never_downgrades() {
+        use super::{daemon_version_offer, remotes};
+        let current_protocol = Some(u64::from(agentdeck_protocol::PROTOCOL_VERSION));
+        let (action, hint) = daemon_version_offer("0.0.1", Some(6));
+        assert_eq!(action, Some("升级 agentdeckd"));
+        assert!(hint.contains(remotes::DAEMON_VERSION));
+        let (action, hint) = daemon_version_offer(remotes::DAEMON_VERSION, current_protocol);
+        assert_eq!(action, None);
+        assert!(hint.starts_with("已是桌面配套版本"));
+        assert_eq!(
+            daemon_version_offer(remotes::DAEMON_VERSION, Some(0)).0,
+            Some("重装 agentdeckd")
+        );
+        assert_eq!(
+            daemon_version_offer("unknown", current_protocol).0,
+            Some("重装 agentdeckd")
+        );
+        assert_eq!(daemon_version_offer("999.0.0", Some(999)).0, None);
+    }
+
     #[test]
     fn install_result_preserves_action_and_explains_login() {
         let output = "downloading\n  installed v1.0\n\n";

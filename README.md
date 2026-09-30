@@ -130,9 +130,15 @@ macOS 启动 daemon 前会在子进程恢复信号接收，避免继承 GPUI 后
   history 按 requestId 并发；`ServerAliveInterval=15` 让对端休眠/断网后约 45 秒内断开，
   下次请求自动重连（`ControlMaster` `~/.ssh/agentdeck-%C` 让重连免去完整握手）。
 
-一键安装：远端找不到 `agentdeckd` 时，机器页卡片显示「未安装 agentdeckd」和「安装」按钮；
-版本旧于桌面端时显示「更新 agentdeckd」。桌面端先 `ssh <host> uname -sm` 选目标（Linux x86_64 /
-aarch64），在本机 `curl` 下载与桌面端同版本的 GitHub Release 资产
+机器卡片提供「检查更新」，读取当前常驻连接中运行的 `agentdeckd` 版本，与桌面配套版本比较；
+检查不查询 GitHub 最新发布，也不主动重启连接。检查期间显示「检查中…」，失败显示具体原因并保留上次成功读取的版本和协议，
+并与该机器的 CLI 安装／更新、daemon 安装／升级互斥。本机 `agentdeckd` 随桌面 App 一起更新。
+远端版本旧于配套版本时，即使协议较旧，也显示「升级到 v<配套版本>」；同版且协议匹配时显示
+「已是桌面配套版本」，同版协议不匹配或版本未知时提供「重装 agentdeckd」。远端版本更高时
+提示先更新桌面 App，不提供降级；找不到 `agentdeckd` 时显示「未安装 agentdeckd」和「安装」。
+
+安装／升级沿用同一流程：桌面端先 `ssh <host> uname -sm` 选目标（Linux x86_64 / aarch64），
+在本机 `curl` 下载与桌面端同版本的 GitHub Release 资产
 `agentdeckd-<target>.tar.gz`（`v<版本>` tag，由 `.github/workflows/release.yml` 构建 musl 静态二进制），
 经 ssh stdin 写入远端 `~/.local/bin/agentdeckd`，试运行成功后才替换并重连；启动时优先使用该目录，避免继续命中 PATH 中的旧安装。
 `AGENTDECK_RELEASE_URL` 可把下载前缀改成别的地址（如 `file:///tmp/agentdeck-release`）用于测试。
