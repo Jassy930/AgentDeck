@@ -196,7 +196,12 @@ pub fn render(
                         )
                         .child(
                             div()
-                                .text_sm()
+                                .px_2()
+                                .py_0p5()
+                                .rounded_full()
+                                .border_1()
+                                .border_color(cx.theme().sidebar_border)
+                                .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(brand_hint),
                         ),
@@ -210,6 +215,7 @@ pub fn render(
                                 .selected(is_new_session)
                                 .w_full()
                                 .justify_start()
+                                .icon(Icon::empty().path(crate::PLUS_ICON))
                                 .label("新建会话")
                                 .on_click(cx.listener(|shell, _, _, cx| shell.show_empty(cx))),
                         )
@@ -287,7 +293,7 @@ pub fn titlebar_area(id: &'static str) -> impl IntoElement {
 fn section_label(text: &str, cx: &Context<Shell>) -> impl IntoElement {
     div()
         .px_2()
-        .text_sm()
+        .text_xs()
         .font_semibold()
         .text_color(cx.theme().muted_foreground)
         .child(text.to_string())
@@ -343,7 +349,8 @@ fn session_row(
                     div()
                         .absolute()
                         .inset_0()
-                        .opacity(if keyboard_cursor { 1. } else { 0. })
+                        // 选中行常亮彩色图标，与只有底色的悬停态拉开差别。
+                        .opacity(if keyboard_cursor || selected { 1. } else { 0. })
                         .group_hover("session-row", |style| style.opacity(1.))
                         .child(agent_icon(item.agent_kind, false)),
                 ),
@@ -351,6 +358,7 @@ fn session_row(
         .child(
             div()
                 .w(title_width)
+                .when(selected, |title| title.font_medium())
                 // nowrap 的文字缓存不随截断宽度变化；单行 clamp 保留按宽度重新测量。
                 .whitespace_normal()
                 .line_clamp(1)

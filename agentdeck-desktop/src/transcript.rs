@@ -15,7 +15,7 @@ use gpui::{
     list, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme, Sizable, StyledExt,
+    ActiveTheme, Icon, Sizable, StyledExt,
     button::Button,
     button::ButtonVariants,
     h_flex,
@@ -398,13 +398,28 @@ fn summary_row(
     cx: &gpui::App,
 ) -> gpui::Stateful<gpui::Div> {
     let (muted, danger) = (cx.theme().muted_foreground, cx.theme().danger);
+    let hover = cx.theme().secondary;
     h_flex()
         .id(id)
         .gap_2()
         .min_w(px(0.))
+        .mx(px(-8.))
+        .px_2()
+        .py_1()
+        .rounded_md()
         .text_sm()
         .text_color(muted)
-        .child(div().w(px(10.)).flex_shrink_0().child(arrow))
+        .hover(move |style| style.bg(hover))
+        .child(div().w(px(12.)).flex_shrink_0().flex().items_center().when(
+            !arrow.is_empty(),
+            |slot| {
+                slot.child(Icon::empty().xsmall().path(if arrow == "▾" {
+                    crate::CHEVRON_DOWN_ICON
+                } else {
+                    crate::CHEVRON_RIGHT_ICON
+                }))
+            },
+        ))
         .child(div().flex_shrink_0().font_semibold().child(label))
         .child(
             div()
@@ -488,17 +503,55 @@ pub fn render(
                 } else {
                     block.body.clone().into_any_element()
                 };
-                v_flex()
-                    .gap_1()
+                // 用户消息是一张浅色卡片；助手消息直接铺在底色上；不支持的内容用虚线框降级。
+                let is_user = block.label == "你";
+                let theme = cx.theme();
+                let dot = if is_user {
+                    theme.primary
+                } else if block.markdown {
+                    theme.foreground.opacity(0.55)
+                } else {
+                    theme.warning
+                };
+                let surface = theme.secondary;
+                let message = v_flex()
+                    .gap_2()
                     .child(
-                        div()
-                            .text_sm()
-                            .font_semibold()
-                            .text_color(muted)
-                            .child(block.label),
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(div().size(px(6.)).rounded_full().bg(dot))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_semibold()
+                                    .text_color(muted)
+                                    .child(block.label),
+                            ),
                     )
-                    .child(div().text_sm().child(body))
-                    .into_any_element()
+                    .child(div().text_sm().child(body));
+                if is_user {
+                    message
+                        .px_4()
+                        .py_3()
+                        .rounded(px(14.))
+                        .bg(surface)
+                        .border_1()
+                        .border_color(border)
+                        .into_any_element()
+                } else if !block.markdown {
+                    message
+                        .px_4()
+                        .py_3()
+                        .rounded(px(12.))
+                        .border_1()
+                        .border_dashed()
+                        .border_color(border)
+                        .text_color(muted)
+                        .into_any_element()
+                } else {
+                    message.into_any_element()
+                }
             }
             Some(summary) => {
                 let expandable = !block.body.is_empty();
@@ -615,8 +668,26 @@ pub fn render(
         .min_h(px(0.))
         .w_full()
         .child(rows)
+        // 上下缘渐隐：记录滚入滚出时不被硬边切断。无交互的 div 不拦截滚动。
+        .child(edge_fade(true, cx))
+        .child(edge_fade(false, cx))
         // Scrollbar 自身是绝对定位但不带 inset，直接放在列表后面会落到列表下方。
         .child(div().absolute().inset_0().child(scrollbar))
+}
+
+fn edge_fade(top: bool, cx: &gpui::App) -> gpui::Div {
+    let bg = cx.theme().background;
+    let fade = div()
+        .absolute()
+        .left_0()
+        .right(px(12.))
+        .h(px(28.))
+        .bg(gpui::linear_gradient(
+            if top { 180. } else { 0. },
+            gpui::linear_color_stop(bg, 0.),
+            gpui::linear_color_stop(bg.opacity(0.), 1.),
+        ));
+    if top { fade.top_0() } else { fade.bottom_0() }
 }
 
 #[cfg(test)]
