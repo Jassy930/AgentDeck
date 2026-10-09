@@ -11,7 +11,7 @@ use gpui::{
     Window, div, img, prelude::*, px, uniform_list,
 };
 use gpui_component::{
-    ActiveTheme, Icon, InteractiveElementExt, Selectable, Sizable, StyledExt,
+    ActiveTheme, Disableable, Icon, InteractiveElementExt, Selectable, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
     input::Input,
@@ -213,7 +213,26 @@ pub fn render(
                                 .label("新建会话")
                                 .on_click(cx.listener(|shell, _, _, cx| shell.show_empty(cx))),
                         )
-                        .child(Input::new(&shell.search).small().cleanable(true)),
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(Input::new(&shell.search).small().cleanable(true).flex_1())
+                                .child(
+                                    Button::new("refresh-sessions")
+                                        .ghost()
+                                        .small()
+                                        .icon(Icon::empty().path(crate::REFRESH_ICON))
+                                        .disabled(!shell.can_refresh_sessions())
+                                        .tooltip(if shell.can_refresh_sessions() {
+                                            "重新读取最新会话列表"
+                                        } else {
+                                            "正在刷新会话列表…"
+                                        })
+                                        .on_click(cx.listener(|shell, _, _, cx| {
+                                            shell.refresh_sessions(cx)
+                                        })),
+                                ),
+                        ),
                 )
                 .child(
                     v_flex()
