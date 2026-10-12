@@ -43,6 +43,8 @@ pub struct Block {
     /// 正文按 Markdown 渲染；用户消息里常夹带 `<in-app-browser-context>` 这类注入标签，
     /// TextView 会静默丢弃未识别的内联 HTML，所以用户消息保持纯文本。
     pub markdown: bool,
+    unsupported: bool,
+    continued_assistant: bool,
     /// 命令失败等需要醒目提示的状态。
     pub failed: bool,
     /// 所在连续过程块组的 `(起始下标, 块数)`；连续两个以上过程块才成组。
@@ -65,6 +67,8 @@ impl Block {
             status: None,
             body: body.into(),
             markdown,
+            unsupported: false,
+            continued_assistant: false,
             failed: false,
             group: None,
             group_summary: None,
@@ -78,6 +82,8 @@ impl Block {
             status: None,
             body: markdown_fallback::images_as_links(body.trim()).into(),
             markdown: true,
+            unsupported: false,
+            continued_assistant: false,
             failed: false,
             group: None,
             group_summary: None,
@@ -93,11 +99,14 @@ pub fn describe(item: &AgentItem) -> Block {
     match item {
         AgentItem::UserMessage { text, .. } => Block::message("你", text, false),
         AgentItem::AssistantMessage { text, .. } => Block::message("助手", text, true),
-        AgentItem::Raw { raw_kind, .. } => Block::message(
-            "暂不支持的内容",
-            &format!("类型：{raw_kind}\n当前 AgentDeck 无法展示此内容，请检查更新"),
-            false,
-        ),
+        AgentItem::Raw { raw_kind, .. } => Block {
+            unsupported: true,
+            ..Block::message(
+                "暂不支持的内容",
+                &format!("类型：{raw_kind}\n当前 AgentDeck 无法展示此内容，请检查更新"),
+                false,
+            )
+        },
         AgentItem::Reasoning { text, .. } => {
             let text = text.trim();
             let first = text
@@ -309,12 +318,21 @@ fn truncate(body: &str) -> String {
 }
 
 pub fn prepare(turns: Vec<HistoryTurn>) -> Vec<Block> {
-    let mut blocks: Vec<Block> = turns
-        .into_iter()
-        .flat_map(|turn| turn.items)
-        .map(|item| describe(&item))
-        .filter(|block| !block.is_empty())
-        .collect();
+    let mut blocks = Vec::new();
+    for turn in turns {
+        let mut previous_assistant = false;
+        for item in turn.items {
+            let mut block = describe(&item);
+            if block.is_empty() {
+                continue;
+            }
+            if block.summary.is_none() {
+                block.continued_assistant = block.markdown && previous_assistant;
+                previous_assistant = block.markdown;
+            }
+            blocks.push(block);
+        }
+    }
     let mut start = 0;
     while start < blocks.len() {
         let len = blocks[start..]
@@ -538,16 +556,9 @@ pub fn render(
                         )
                         .into_any_element()
                 } else if block.markdown {
-                    // 同一轮里连续的助手消息只在第一条标身份，后续直接接正文。
-                    // ponytail: 逐行向前扫过程块，组极长时是 O(组长)，慢了再预计算到 Block。
-                    let continued = blocks[..ix]
-                        .iter()
-                        .rev()
-                        .find(|prev| prev.summary.is_none())
-                        .is_some_and(|prev| prev.markdown);
                     v_flex()
                         .gap_2()
-                        .when(!continued, |message| {
+                        .when(!block.continued_assistant, |message| {
                             message.child(
                                 h_flex()
                                     .gap_2()
@@ -567,23 +578,28 @@ pub fn render(
                 } else {
                     v_flex()
                         .gap_2()
-                        .px_4()
-                        .py_3()
-                        .rounded(px(12.))
-                        .border_1()
-                        .border_dashed()
-                        .border_color(border)
-                        .text_color(muted)
+                        .when(block.unsupported, |message| {
+                            message
+                                .px_4()
+                                .py_3()
+                                .rounded(px(12.))
+                                .border_1()
+                                .border_dashed()
+                                .border_color(border)
+                                .text_color(muted)
+                        })
                         .child(
                             h_flex()
                                 .gap_2()
                                 .items_center()
-                                .child(
-                                    Icon::empty()
-                                        .xsmall()
-                                        .path(crate::ALERT_ICON)
-                                        .text_color(theme.warning),
-                                )
+                                .when(block.unsupported, |header| {
+                                    header.child(
+                                        Icon::empty()
+                                            .xsmall()
+                                            .path(crate::ALERT_ICON)
+                                            .text_color(theme.warning),
+                                    )
+                                })
                                 .child(div().text_xs().font_semibold().child(block.label)),
                         )
                         .child(div().text_sm().child(body))
@@ -733,11 +749,74 @@ mod tests {
         BODY_LIMIT, Block, VisibleRows, collapsed_indices, describe, fence, is_binary, prepare,
         truncate,
     };
-    use agentdeck_protocol::{AgentItem, AgentItemMeta, HistoryTurn, ShellStatus};
+    use agentdeck_protocol::{
+        AgentItem, AgentItemMeta, HistoryTurn, PlanStep, PlanStepStatus, ShellStatus,
+    };
     use gpui::{ListAlignment, ListOffset, ListState, px};
 
     fn meta() -> AgentItemMeta {
         AgentItemMeta::default()
+    }
+
+    #[test]
+    fn only_raw_content_uses_unsupported_presentation() {
+        let plan = describe(&AgentItem::Plan {
+            steps: vec![PlanStep {
+                title: "运行测试".into(),
+                status: PlanStepStatus::InProgress,
+                detail: None,
+            }],
+            meta: meta(),
+        });
+        assert!(!plan.unsupported);
+        assert_eq!(plan.label, "计划");
+        assert_eq!(plan.body, "◐ 运行测试");
+
+        let raw = describe(&AgentItem::Raw {
+            raw_kind: "futureItem".into(),
+            raw_payload: "withheld".into(),
+            meta: meta(),
+        });
+        assert!(raw.unsupported);
+        assert!(raw.body.contains("futureItem"));
+    }
+
+    #[test]
+    fn assistant_identity_restarts_each_turn_and_skips_process_blocks() {
+        let assistant = || AgentItem::AssistantMessage {
+            text: "测试结果".into(),
+            meta: meta(),
+        };
+        let blocks = prepare(vec![
+            HistoryTurn {
+                items: vec![
+                    assistant(),
+                    AgentItem::Reasoning {
+                        text: "检查结果".into(),
+                        meta: meta(),
+                    },
+                    assistant(),
+                ],
+            },
+            HistoryTurn {
+                items: vec![assistant()],
+            },
+            HistoryTurn {
+                items: vec![
+                    AgentItem::UserMessage {
+                        text: " ".into(),
+                        meta: meta(),
+                    },
+                    assistant(),
+                ],
+            },
+        ]);
+        let continued: Vec<_> = blocks
+            .iter()
+            .filter(|block| block.label == "助手")
+            .map(|block| block.continued_assistant)
+            .collect();
+        assert_eq!(continued, [false, true, false, false]);
     }
 
     #[test]

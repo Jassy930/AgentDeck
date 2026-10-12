@@ -16,7 +16,7 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme, Colorize, Icon, InteractiveElementExt, Sizable, StyledExt,
-    button::Button,
+    button::{Button, ButtonVariants},
     h_flex,
     input::{InputEvent, InputState},
     v_flex,
@@ -1566,13 +1566,11 @@ impl Shell {
                             .text_color(cx.theme().warning)
                             .child(
                                 h_flex()
-                                    .id(("transcript-warning-toggle", read_id))
                                     .w_full()
                                     .py_0p5()
                                     .gap_2()
                                     .items_center()
                                     .text_xs()
-                                    .cursor_pointer()
                                     .child(Icon::empty().xsmall().path(crate::ALERT_ICON))
                                     .child(div().font_semibold().child("兼容性警告"))
                                     .child(
@@ -1582,24 +1580,23 @@ impl Shell {
                                             .child(format!("{} 条", warnings.len())),
                                     )
                                     .child(
-                                        h_flex()
-                                            .gap_1()
-                                            .items_center()
-                                            .text_color(cx.theme().warning.opacity(0.7))
-                                            .hover(|style| style.text_color(cx.theme().warning))
-                                            .child(if open { "收起" } else { "展开" })
+                                        Button::new(("transcript-warning-toggle", read_id))
+                                            .ghost()
+                                            .xsmall()
+                                            .text_color(cx.theme().warning)
+                                            .label(if open { "收起" } else { "展开" })
                                             .child(Icon::empty().xsmall().path(if open {
                                                 crate::CHEVRON_DOWN_ICON
                                             } else {
                                                 crate::CHEVRON_RIGHT_ICON
-                                            })),
-                                    )
-                                    .on_click(move |_, _, cx| {
-                                        expanded.update(cx, |expanded, cx| {
-                                            *expanded = !*expanded;
-                                            cx.notify();
-                                        });
-                                    }),
+                                            }))
+                                            .on_click(move |_, _, cx| {
+                                                expanded.update(cx, |expanded, cx| {
+                                                    *expanded = !*expanded;
+                                                    cx.notify();
+                                                });
+                                            }),
+                                    ),
                             )
                             .when(open, |section| {
                                 section.child(
