@@ -755,6 +755,7 @@ impl Shell {
                         ) {
                             shell.agent_filter = None;
                         }
+                        shell.rebuild_rows(cx);
                         for kind in kinds {
                             shell.load_agent_sessions(id, kind, cx);
                             shell.load_agent_version(id, kind, cx);
