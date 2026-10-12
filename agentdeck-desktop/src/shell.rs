@@ -15,7 +15,7 @@ use gpui::{
     ScrollStrategy, SharedString, UniformListScrollHandle, Window, div, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme, InteractiveElementExt, Sizable, StyledExt,
+    ActiveTheme, Colorize, InteractiveElementExt, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
     input::{InputEvent, InputState},
@@ -1324,54 +1324,111 @@ impl Shell {
                 machine.agents.iter().map(|agent| {
                     let source = (machine.host.clone(), agent.kind);
                     let selected = self.agent_filter.as_ref() == Some(&source);
-                    (source, agent.status(), selected)
+                    // 已加载完成时大数字已说明一切，只在读取中或失败时补一行状态。
+                    let note = (!matches!(agent.result, Some(Ok(())))).then(|| agent.status());
+                    let failed = matches!(agent.result, Some(Err(_)));
+                    (source, agent.loaded, note, failed, selected)
                 })
             })
             .collect::<Vec<_>>()
             .into_iter()
-            .map(|(source, status, selected)| {
-                connector_card(source, multi_machine, &status, selected, cx)
+            .map(|(source, loaded, note, failed, selected)| {
+                connector_card(source, multi_machine, loaded, note, failed, selected, cx)
             })
             .collect();
+        // 固定列数的 grid：flex_wrap 会留下孤儿行，且高度计算不可靠。
+        let columns = match cards.len() {
+            0 | 1 => 1,
+            2 | 4 => 2,
+            _ => 3,
+        };
+        let sessions: usize = self
+            .machines
+            .iter()
+            .flat_map(|machine| &machine.agents)
+            .map(|agent| agent.loaded)
+            .sum();
 
         let hint = empty_hint(
             &self.machines,
             self.pending,
             !self.sessions.is_empty() && self.rows.is_empty(),
         );
+        let accent: gpui::Hsla = crate::theme_tokens::ACCENT.into();
 
         v_flex()
+            .relative()
             .flex_1()
+            .min_w(px(0.))
             .h_full()
+            .child(
+                // 顶部一层极淡的品牌色光晕，给大面积深色一点空气感。
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(420.))
+                    .bg(gpui::linear_gradient(
+                        180.,
+                        gpui::linear_color_stop(accent.opacity(0.07), 0.),
+                        gpui::linear_color_stop(accent.opacity(0.), 1.),
+                    )),
+            )
             .child(sidebar::titlebar_area("empty-titlebar"))
             .child(
                 v_flex()
+                    .id("empty-body")
                     .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .gap_8()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
                     .px_10()
-                    .pb_10()
+                    .pb_16()
                     .child(
                         v_flex()
+                            .w_full()
+                            .flex_shrink_0()
+                            // 自动外边距只分配剩余高度，内容溢出时从顶部开始滚动。
+                            .my_auto()
                             .items_center()
-                            .gap_2()
-                            .child(div().text_3xl().child("今天要做什么？"))
+                            .gap_10()
+                            .child(
+                                v_flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(eyebrow(
+                                        format!(
+                                            "{} 台机器 · {} 个会话",
+                                            self.machines.len(),
+                                            sessions
+                                        ),
+                                        cx,
+                                    ))
+                                    .child(
+                                        div()
+                                            .text_size(px(40.))
+                                            .line_height(px(48.))
+                                            .font_semibold()
+                                            .child("今天要做什么？"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_base()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(hint),
+                                    ),
+                            )
                             .child(
                                 div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(hint),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .flex_wrap()
-                            .justify_center()
-                            .gap_3()
-                            .children(cards),
-                    )
-                    .child(read_only_notice(cx)),
+                                    .grid()
+                                    .grid_cols(columns)
+                                    .w_full()
+                                    .max_w(px(columns as f32 * 232. + (columns - 1) as f32 * 16.))
+                                    .gap_4()
+                                    .children(cards),
+                            )
+                            .child(read_only_notice(cx)),
+                    ),
             )
     }
 
@@ -1453,16 +1510,31 @@ impl Shell {
                             .child(session_title(item)),
                     )
                     .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!(
-                                "{} · {} · {}",
-                                agent_label(item.agent_kind),
-                                project_name(item),
-                                machine_label(&session.host)
-                            )),
+                        // 元信息拆成标签：agent、项目、机器；长名称截断，不顶出窗口。
+                        h_flex()
+                            .flex_shrink()
+                            .min_w(px(0.))
+                            .max_w(px(420.))
+                            .gap_1p5()
+                            .child(
+                                meta_chip(cx)
+                                    .flex_shrink_0()
+                                    .child(sidebar::agent_icon(item.agent_kind, false))
+                                    .child(agent_label(item.agent_kind)),
+                            )
+                            .child(
+                                meta_chip(cx).min_w(px(0.)).child(
+                                    div().min_w(px(0.)).truncate().child(project_name(item)),
+                                ),
+                            )
+                            .child(
+                                meta_chip(cx).min_w(px(0.)).child(
+                                    div()
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .child(machine_label(&session.host)),
+                                ),
+                            ),
                     ),
             )
             .when_some(
@@ -1483,7 +1555,10 @@ impl Shell {
                             .flex_shrink_0()
                             .px_5()
                             .py_1()
-                            .bg(crate::theme_tokens::WARN_WEAK)
+                            .bg(cx.theme().warning.opacity(0.06))
+                            .border_b_1()
+                            .border_color(crate::theme_tokens::WARN_WEAK)
+                            .text_color(cx.theme().warning)
                             .child(
                                 Button::new(("transcript-warning-toggle", read_id))
                                     .ghost()
@@ -1528,9 +1603,8 @@ impl Shell {
                     .w_full()
                     .flex_shrink_0()
                     .justify_center()
-                    .py_3()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
+                    .pt_2()
+                    .pb_4()
                     .child(read_only_notice(cx)),
             )
     }
@@ -1545,72 +1619,178 @@ fn placeholder(text: &str, cx: &App) -> impl IntoElement + use<> {
     )
 }
 
+/// 只读提示胶囊：状态点 + 文案，常驻但不抢视线。
 fn read_only_notice(cx: &App) -> impl IntoElement + use<> {
-    div()
-        .text_sm()
+    h_flex()
+        .gap_2()
+        .px_3()
+        .py_1()
+        .items_center()
+        .rounded_full()
+        .border_1()
+        .border_color(cx.theme().border)
+        .bg(cx.theme().muted.opacity(0.6))
+        .text_xs()
         .text_color(cx.theme().muted_foreground)
-        .child("只读历史预览，暂不能发送任务")
+        .child(div().size(px(6.)).rounded_full().bg(cx.theme().warning))
+        .child("只读历史预览 · 暂不能发送任务")
+}
+
+/// 会话头部的元信息标签。
+fn meta_chip(cx: &App) -> gpui::Div {
+    h_flex()
+        .gap_1p5()
+        .items_center()
+        .px_2()
+        .py_0p5()
+        .rounded_md()
+        .bg(cx.theme().muted)
+        .border_1()
+        .border_color(cx.theme().border)
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+}
+
+/// 标题上方的小号强调行。
+fn eyebrow(text: String, cx: &App) -> impl IntoElement + use<> {
+    div()
+        .px_3()
+        .py_0p5()
+        .rounded_full()
+        .bg(cx.theme().primary.opacity(0.1))
+        .text_xs()
+        .font_medium()
+        .text_color(cx.theme().primary)
+        .child(text)
 }
 
 /// 主页 agent 卡片：点击只看该机器上该 agent 的会话，再点取消。
-/// 多台机器时标题带机器名，否则与单机时一致。
+/// 多台机器时右上角带机器名标签。
+#[allow(clippy::too_many_arguments)]
 fn connector_card(
     (host, kind): (Host, AgentKind),
     show_machine: bool,
-    status: &str,
+    loaded: usize,
+    note: Option<String>,
+    failed: bool,
     selected: bool,
     cx: &mut Context<Shell>,
 ) -> impl IntoElement + use<> {
-    let title = if show_machine {
-        format!("{} · {}", agent_label(kind), machine_label(&host))
-    } else {
-        agent_label(kind)
-    };
+    let theme = cx.theme();
+    let (accent, border, muted) = (theme.primary, theme.border, theme.muted);
+    let surface: gpui::Hsla = theme.secondary;
+    let machine = machine_label(&host);
     v_flex()
         .id(SharedString::from(format!(
             "agent-card-{}-{}",
-            machine_label(&host),
+            machine,
             kind.as_str()
         )))
-        .w(px(220.))
-        .gap_1()
-        .p_4()
-        .rounded_lg()
-        .bg(cx.theme().muted)
+        .w_full()
+        .min_w(px(0.))
+        .gap_4()
+        .p_5()
+        .rounded(px(14.))
+        .bg(gpui::linear_gradient(
+            180.,
+            gpui::linear_color_stop(
+                if selected {
+                    accent.opacity(0.12)
+                } else {
+                    surface
+                },
+                0.,
+            ),
+            gpui::linear_color_stop(muted, 1.),
+        ))
         .border_1()
         .border_color(if selected {
-            cx.theme().ring
+            accent.opacity(0.7)
         } else {
-            cx.theme().border
+            border
         })
+        .shadow_md()
         .cursor_pointer()
-        .hover(|style| style.bg(cx.theme().secondary_hover))
+        .hover(move |style| {
+            style.border_color(if selected {
+                accent
+            } else {
+                border.lighten(0.6)
+            })
+        })
         .on_click(
             cx.listener(move |shell, _, _, cx| shell.toggle_agent_filter(host.clone(), kind, cx)),
         )
         .child(
             h_flex()
-                .gap_2()
+                .justify_between()
                 .items_center()
-                .child(sidebar::agent_icon(kind, false))
                 .child(
                     div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .whitespace_normal()
-                        .text_sm()
-                        .font_semibold()
-                        .child(title),
-                ),
+                        .size(px(32.))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(9.))
+                        .bg(gpui::white().opacity(0.05))
+                        .border_1()
+                        .border_color(gpui::white().opacity(0.06))
+                        .child(sidebar::agent_icon(kind, false)),
+                )
+                .when(show_machine, |row| {
+                    row.child(
+                        div()
+                            .min_w(px(0.))
+                            .px_2()
+                            .py_0p5()
+                            .rounded_full()
+                            .border_1()
+                            .border_color(border)
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .truncate()
+                            .child(machine),
+                    )
+                }),
         )
         .child(
-            div()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(if selected {
-                    format!("{status} · 已筛选")
-                } else {
-                    status.to_string()
+            v_flex()
+                .gap_1()
+                .child(div().text_sm().font_semibold().child(agent_label(kind)))
+                .child(
+                    h_flex()
+                        .gap_1p5()
+                        .items_baseline()
+                        .child(
+                            div()
+                                .text_size(px(28.))
+                                .line_height(px(32.))
+                                .font_semibold()
+                                .child(loaded.to_string()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if selected {
+                                    "个会话 · 已筛选"
+                                } else {
+                                    "个会话"
+                                }),
+                        ),
+                )
+                .when_some(note, |col, note| {
+                    col.child(
+                        div()
+                            .text_xs()
+                            .text_color(if failed {
+                                cx.theme().danger
+                            } else {
+                                cx.theme().muted_foreground
+                            })
+                            .child(note),
+                    )
                 }),
         )
 }

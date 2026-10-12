@@ -49,8 +49,30 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement + use<
                         .gap_6()
                         .child(
                             v_flex()
-                                .gap_1()
-                                .child(div().text_2xl().child("机器"))
+                                .gap_2()
+                                .child(
+                                    h_flex()
+                                        .gap_3()
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .text_size(px(32.))
+                                                .line_height(px(40.))
+                                                .font_semibold()
+                                                .child("机器"),
+                                        )
+                                        .child(
+                                            div()
+                                                .px_2()
+                                                .py_0p5()
+                                                .rounded_full()
+                                                .bg(cx.theme().primary.opacity(0.1))
+                                                .text_xs()
+                                                .font_medium()
+                                                .text_color(cx.theme().primary)
+                                                .child(format!("{} 台", shell.machines.len())),
+                                        ),
+                                )
                                 .child(
                                     div()
                                         .text_sm()
@@ -183,11 +205,11 @@ fn machine_card(
     let header = h_flex()
         .gap_2()
         .items_center()
-        .child(div().size_2().rounded_full().flex_shrink_0().bg(dot))
         .child(
             div()
                 .min_w(px(0.))
                 .text_ellipsis()
+                .text_base()
                 .font_semibold()
                 .child(label.clone()),
         )
@@ -195,11 +217,38 @@ fn machine_card(
             h_flex()
                 .flex_1()
                 .gap_2()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(status)
+                .items_center()
+                .child(
+                    // 状态胶囊：圆点外加一圈同色光晕，颜色即状态。
+                    h_flex()
+                        .gap_1p5()
+                        .items_center()
+                        .px_2()
+                        .py_0p5()
+                        .rounded_full()
+                        .bg(dot.opacity(0.1))
+                        .text_xs()
+                        .text_color(dot)
+                        .child(
+                            div()
+                                .size(px(10.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .bg(dot.opacity(0.25))
+                                .child(div().size(px(6.)).rounded_full().bg(dot)),
+                        )
+                        .child(status),
+                )
                 .when_some(machine.daemon_version.as_deref(), |line, version| {
-                    line.child(format!("· agentdeckd {}", short_version(version)))
+                    line.child(
+                        div()
+                            .text_xs()
+                            .font_family("Menlo")
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("agentdeckd {}", short_version(version))),
+                    )
                 }),
         )
         .child(
@@ -226,8 +275,9 @@ fn machine_card(
         )
         .when_some(install, |header, label_text| {
             header.child(
+                // 安装／升级是这张卡片唯一的主操作，用描边按钮和纯文字操作区分主次。
                 Button::new(SharedString::from(format!("install-daemon-{label}")))
-                    .ghost()
+                    .outline()
                     .xsmall()
                     .label(if machine.installing {
                         "进行中…".to_string()
@@ -287,11 +337,16 @@ fn machine_card(
 
     v_flex()
         .gap_3()
-        .p_4()
-        .rounded_lg()
-        .bg(cx.theme().muted)
+        .p_5()
+        .rounded(px(14.))
+        .bg(gpui::linear_gradient(
+            180.,
+            gpui::linear_color_stop(cx.theme().secondary, 0.),
+            gpui::linear_color_stop(cx.theme().muted, 1.),
+        ))
         .border_1()
         .border_color(cx.theme().border)
+        .shadow_md()
         .child(header)
         .when_some(daemon_hint, |card, hint| {
             card.child(
@@ -337,7 +392,14 @@ fn machine_card(
                     .child(text),
             )
         })
-        .children(agents)
+        .child(
+            v_flex()
+                .gap_1()
+                .pt_2()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .children(agents),
+        )
 }
 
 fn daemon_install_offer(machine: &Machine) -> (Option<&'static str>, Option<String>) {

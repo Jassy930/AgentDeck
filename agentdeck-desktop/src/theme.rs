@@ -22,7 +22,8 @@ pub fn apply(cx: &mut App) {
     t.muted_foreground = tokens::TEXT2.into();
     t.border = tokens::BORDER.into();
     t.input = tokens::BORDER.into();
-    t.ring = accent;
+    // 聚焦环降一档透明度：搜索框启动即聚焦，全亮橙色会抢走首屏视线。
+    t.ring = accent.opacity(0.55);
     t.caret = accent;
     t.selection = tokens::ACCENT_WEAK.into();
 
