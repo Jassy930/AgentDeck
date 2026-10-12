@@ -372,6 +372,20 @@ impl Machine {
         self.error.is_some() || self.agents.iter().any(|agent| agent.error().is_some())
     }
 
+    fn prepare_agents(&mut self, kinds: &[AgentKind]) {
+        self.agents = kinds
+            .iter()
+            .map(|&kind| AgentHistory {
+                loaded: self
+                    .agents
+                    .iter()
+                    .find(|agent| agent.kind == kind)
+                    .map_or(0, |agent| agent.loaded),
+                ..AgentHistory::new(kind)
+            })
+            .collect();
+    }
+
     pub fn can_update_agents(&self) -> bool {
         !self.connecting
             && !self.installing
@@ -425,6 +439,26 @@ fn empty_hint(machines: &[Machine], pending: usize, filtered_empty: bool) -> Str
     } else {
         "没有可显示的会话".to_string()
     }
+}
+
+fn sessions_refresh_ready(pending: usize, machines: &[Machine]) -> bool {
+    pending == 0
+        && !machines.is_empty()
+        && machines.iter().all(|machine| {
+            !machine.connecting
+                && !machine.installing
+                && machine.agents.iter().all(|agent| agent.operation.is_none())
+        })
+}
+
+fn retain_active_machine_sessions(
+    sessions: &mut Vec<Session>,
+    host: &Host,
+    active_kinds: &[AgentKind],
+) {
+    sessions.retain(|session| {
+        session.host.as_ref() != host.as_ref() || active_kinds.contains(&session.item.agent_kind)
+    });
 }
 
 /// 开发者模式的帧统计：只记录真实发生的绘制，GPUI 按需重绘，空闲时帧率本来就低。
@@ -697,20 +731,42 @@ impl Shell {
                 shell.pending -= 1;
                 cx.notify();
                 // 机器已被移除：丢弃迟到的回复。
-                let Some(machine) = shell.machine_mut(id) else {
+                if shell.machine(id).is_none() {
                     return;
-                };
-                machine.connecting = false;
+                }
+                if let Some(machine) = shell.machine_mut(id) {
+                    machine.connecting = false;
+                }
                 match agents {
                     Ok(kinds) => {
-                        machine.agents = kinds.iter().copied().map(AgentHistory::new).collect();
+                        let host = shell
+                            .machine(id)
+                            .map_or(None, |machine| machine.host.clone());
+                        let active_kinds = kinds.clone();
+                        if let Some(machine) = shell.machine_mut(id) {
+                            machine.prepare_agents(&kinds);
+                        }
+                        retain_active_machine_sessions(&mut shell.sessions, &host, &active_kinds);
+                        if shell.agent_filter.as_ref().is_some_and(
+                            |(filtered_host, filtered_kind)| {
+                                filtered_host.as_ref() == host.as_ref()
+                                    && !active_kinds.contains(filtered_kind)
+                            },
+                        ) {
+                            shell.agent_filter = None;
+                        }
+                        shell.rebuild_rows(cx);
                         for kind in kinds {
                             shell.load_agent_sessions(id, kind, cx);
                             shell.load_agent_version(id, kind, cx);
                         }
                         shell.load_daemon_version(id, cx);
                     }
-                    Err(message) => machine.error = Some(message),
+                    Err(message) => {
+                        if let Some(machine) = shell.machine_mut(id) {
+                            machine.error = Some(message);
+                        }
+                    }
                 }
             })
             .ok();
@@ -1095,6 +1151,24 @@ impl Shell {
             {
                 self.load_agent_sessions(id, kind, cx);
             }
+        }
+        cx.notify();
+    }
+
+    pub fn can_refresh_sessions(&self) -> bool {
+        sessions_refresh_ready(self.pending, &self.machines)
+    }
+
+    pub fn refresh_sessions(&mut self, cx: &mut Context<Self>) {
+        if !self.can_refresh_sessions() {
+            return;
+        }
+        let machine_ids: Vec<_> = self.machines.iter().map(|machine| machine.id).collect();
+        for id in machine_ids {
+            if let Some(machine) = self.machine_mut(id) {
+                machine.error = None;
+            }
+            self.load_machine(id, cx);
         }
         cx.notify();
     }
@@ -2082,6 +2156,65 @@ mod tests {
         machines[0].agents[1].complete(&mut Ok((vec![item(None)], vec![])));
         assert_eq!(empty_hint(&machines, 0, false), "选择左侧会话查看记录");
         assert_eq!(empty_hint(&machines, 0, true), "没有匹配的会话");
+    }
+
+    #[test]
+    fn refresh_waits_until_machine_requests_and_installs_finish() {
+        let mut machines = vec![Machine::new(1, None)];
+        assert!(super::sessions_refresh_ready(0, &machines));
+
+        machines[0].connecting = true;
+        assert!(!super::sessions_refresh_ready(0, &machines));
+        machines[0].connecting = false;
+        machines[0].installing = true;
+        assert!(!super::sessions_refresh_ready(0, &machines));
+        machines[0].installing = false;
+        machines[0].agents.push(AgentHistory::new(AgentKind::Codex));
+        machines[0].agents[0].operation = Some(super::AgentOperation::Update);
+        assert!(!super::sessions_refresh_ready(0, &machines));
+        assert!(!super::sessions_refresh_ready(1, &machines));
+    }
+
+    #[test]
+    fn refresh_keeps_loaded_count_until_new_history_succeeds() {
+        let mut machine = Machine::new(1, None);
+        machine.prepare_agents(&[AgentKind::Codex]);
+        machine.agents[0].complete(&mut Ok((vec![item(None); 51], vec![])));
+        assert!(machine.agents[0].load_more());
+        machine.agents[0].complete(&mut Ok((vec![item(None); 100], vec![])));
+
+        machine.prepare_agents(&[AgentKind::ClaudeCode, AgentKind::Codex]);
+        assert_eq!(machine.agents[0].status(), "读取中…");
+        let source = &mut machine.agents[1];
+        assert_eq!(source.status(), "已加载 100 · 加载中…");
+        assert_eq!(source.request_limit(), 51);
+        source.complete(&mut Err("timeout".into()));
+        assert_eq!(source.status(), "已加载 100 · 加载失败");
+        assert!(source.retry());
+        source.complete(&mut Ok((vec![item(None); 12], vec![])));
+        assert_eq!(source.status(), "已加载 12 个会话");
+
+        machine.prepare_agents(&[AgentKind::Codex]);
+        assert_eq!(machine.agents.len(), 1);
+        assert_eq!(machine.agents[0].status(), "已加载 12 · 加载中…");
+    }
+
+    #[test]
+    fn refresh_drops_sessions_for_agents_removed_from_a_machine() {
+        let mut removed = item(None);
+        removed.agent_kind = AgentKind::Codex;
+        let mut sessions = vec![local(item(None)), local(removed), remote(item(None))];
+
+        super::retain_active_machine_sessions(&mut sessions, &None, &[AgentKind::ClaudeCode]);
+
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions[0].host.is_none());
+        assert!(sessions[1].host.is_some());
+        assert!(
+            sessions
+                .iter()
+                .all(|session| session.item.agent_kind == AgentKind::ClaudeCode)
+        );
     }
 
     #[test]
