@@ -9,10 +9,10 @@ use std::rc::Rc;
 
 mod markdown_fallback;
 
-use agentdeck_protocol::{AgentItem, HistoryTurn, PlanStepStatus, ShellStatus};
+use agentdeck_protocol::{AgentItem, AgentKind, HistoryTurn, PlanStepStatus, ShellStatus};
 use gpui::{
     ClipboardItem, ElementId, IntoElement, ListState, ParentElement, SharedString, Window, div,
-    list, prelude::*, px,
+    list, prelude::*, px, relative,
 };
 use gpui_component::{
     ActiveTheme, Icon, Sizable, StyledExt,
@@ -400,6 +400,7 @@ fn summary_row(
 ) -> gpui::Stateful<gpui::Div> {
     let (muted, danger) = (cx.theme().muted_foreground, cx.theme().danger);
     let hover = cx.theme().secondary;
+    let tag_bg = cx.theme().foreground.opacity(0.06);
     h_flex()
         .id(id)
         .gap_2()
@@ -421,7 +422,17 @@ fn summary_row(
                 }))
             },
         ))
-        .child(div().flex_shrink_0().font_semibold().child(label))
+        // 类别做成小标签，扫读时先看类别再看摘要。
+        .child(
+            div()
+                .flex_shrink_0()
+                .px_1p5()
+                .rounded(px(5.))
+                .bg(tag_bg)
+                .text_xs()
+                .font_semibold()
+                .child(label),
+        )
         .child(
             div()
                 .flex_1()
@@ -468,6 +479,7 @@ fn markdown(
 /// 同一下标若沿用旧 key，会先显示上个会话的内容再延迟 200ms 重新解析。
 pub fn render(
     blocks: Rc<[Block]>,
+    agent: AgentKind,
     state: ListState,
     read_id: u64,
     window: &mut Window,
@@ -504,44 +516,57 @@ pub fn render(
                 } else {
                     block.body.clone().into_any_element()
                 };
-                // 用户消息是一张浅色卡片；助手消息直接铺在底色上；不支持的内容用虚线框降级。
-                let is_user = block.label == "你";
+                // 用户消息靠右成气泡；助手消息以 agent 身份铺在底色上；不支持的内容用虚线框降级。
                 let theme = cx.theme();
-                let dot = if is_user {
-                    theme.primary
-                } else if block.markdown {
-                    theme.foreground.opacity(0.55)
-                } else {
-                    theme.warning
-                };
                 let surface = theme.secondary;
-                let message = v_flex()
-                    .gap_2()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(div().size(px(6.)).rounded_full().bg(dot))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_semibold()
-                                    .text_color(muted)
-                                    .child(block.label),
-                            ),
-                    )
-                    .child(div().text_sm().child(body));
-                if is_user {
-                    message
-                        .px_4()
-                        .py_3()
-                        .rounded(px(14.))
-                        .bg(surface)
-                        .border_1()
-                        .border_color(border)
+                if block.label == "你" {
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .child(
+                            div()
+                                .max_w(relative(0.82))
+                                .px_4()
+                                .py_2p5()
+                                .rounded(px(16.))
+                                .rounded_tr(px(6.))
+                                .bg(surface)
+                                .border_1()
+                                .border_color(border)
+                                .text_sm()
+                                .child(body),
+                        )
                         .into_any_element()
-                } else if !block.markdown {
-                    message
+                } else if block.markdown {
+                    // 同一轮里连续的助手消息只在第一条标身份，后续直接接正文。
+                    // ponytail: 逐行向前扫过程块，组极长时是 O(组长)，慢了再预计算到 Block。
+                    let continued = blocks[..ix]
+                        .iter()
+                        .rev()
+                        .find(|prev| prev.summary.is_none())
+                        .is_some_and(|prev| prev.markdown);
+                    v_flex()
+                        .gap_2()
+                        .when(!continued, |message| {
+                            message.child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(crate::sidebar::agent_icon(agent, false))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_semibold()
+                                            .text_color(muted)
+                                            .child(crate::shell::agent_label(agent)),
+                                    ),
+                            )
+                        })
+                        .child(div().text_sm().child(body))
+                        .into_any_element()
+                } else {
+                    v_flex()
+                        .gap_2()
                         .px_4()
                         .py_3()
                         .rounded(px(12.))
@@ -549,9 +574,20 @@ pub fn render(
                         .border_dashed()
                         .border_color(border)
                         .text_color(muted)
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    Icon::empty()
+                                        .xsmall()
+                                        .path(crate::ALERT_ICON)
+                                        .text_color(theme.warning),
+                                )
+                                .child(div().text_xs().font_semibold().child(block.label)),
+                        )
+                        .child(div().text_sm().child(body))
                         .into_any_element()
-                } else {
-                    message.into_any_element()
                 }
             }
             Some(summary) => {

@@ -159,10 +159,7 @@ pub fn render(
         "机器管理".to_string()
     };
     let can_load_more = !shell.load_more_targets().is_empty();
-    let brand_hint = match shell.machines.len() {
-        0 | 1 => "本机".to_string(),
-        count => format!("{count} 台机器"),
-    };
+    let connecting = shell.machines.iter().any(|machine| machine.connecting);
 
     v_flex()
         .w(px(WIDTH))
@@ -182,29 +179,13 @@ pub fn render(
                 .overflow_hidden()
                 .child(
                     // 品牌行：对应 Codex Desktop 侧栏顶部的 workspace 切换位，当前不可切换。
-                    h_flex()
-                        .px_2()
-                        .pb_1()
-                        .justify_between()
-                        .items_center()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .items_center()
-                                .child(img(BRAND_ICON.clone()).size(px(24.)).flex_shrink_0())
-                                .child(div().text_sm().font_semibold().child("AgentDeck")),
-                        )
-                        .child(
-                            div()
-                                .px_2()
-                                .py_0p5()
-                                .rounded_full()
-                                .border_1()
-                                .border_color(cx.theme().sidebar_border)
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(brand_hint),
-                        ),
+                    h_flex().px_2().pb_1().items_center().child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(img(BRAND_ICON.clone()).size(px(24.)).flex_shrink_0())
+                            .child(div().text_sm().font_semibold().child("AgentDeck")),
+                    ),
                 )
                 .child(
                     v_flex()
@@ -280,13 +261,41 @@ pub fn render(
                 .border_t_1()
                 .border_color(cx.theme().sidebar_border)
                 .child(
+                    // 带文字和机器摘要的整行入口：失败时摘要变红，不必悬停才知道。
                     Button::new("show-machines")
                         .ghost()
                         .small()
+                        .w_full()
+                        .justify_start()
                         .selected(matches!(shell.stage, Stage::Machines))
                         .icon(Icon::empty().path(crate::SERVER_ICON))
+                        .label("机器")
+                        .child(div().flex_1())
+                        .child(
+                            // 健康度圆点：绿 = 全部连上，灰 = 连接中，红 = 有失败。
+                            div().size(px(6.)).rounded_full().bg(if failed > 0 {
+                                cx.theme().danger
+                            } else if connecting {
+                                cx.theme().muted_foreground
+                            } else {
+                                cx.theme().success
+                            }),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(if failed > 0 {
+                                    cx.theme().danger
+                                } else {
+                                    cx.theme().muted_foreground
+                                })
+                                .child(if failed > 0 {
+                                    format!("{failed} 台失败")
+                                } else {
+                                    format!("{} 台", shell.machines.len())
+                                }),
+                        )
                         .tooltip(machines_tooltip)
-                        .when(failed > 0, |button| button.text_color(cx.theme().danger))
                         .on_click(
                             cx.listener(|shell, _, window, cx| shell.show_machines(window, cx)),
                         ),

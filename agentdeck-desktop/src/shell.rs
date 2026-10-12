@@ -15,8 +15,8 @@ use gpui::{
     ScrollStrategy, SharedString, UniformListScrollHandle, Window, div, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme, Colorize, InteractiveElementExt, Sizable, StyledExt,
-    button::{Button, ButtonVariants},
+    ActiveTheme, Colorize, Icon, InteractiveElementExt, Sizable, StyledExt,
+    button::Button,
     h_flex,
     input::{InputEvent, InputState},
     v_flex,
@@ -1473,10 +1473,15 @@ impl Shell {
             Transcript::Ready { blocks, .. } if blocks.is_empty() => {
                 placeholder("这个会话没有可显示的记录", cx).into_any_element()
             }
-            Transcript::Ready { blocks, .. } => {
-                transcript::render(blocks.clone(), list.clone(), read_id, window, cx)
-                    .into_any_element()
-            }
+            Transcript::Ready { blocks, .. } => transcript::render(
+                blocks.clone(),
+                item.agent_kind,
+                list.clone(),
+                read_id,
+                window,
+                cx,
+            )
+            .into_any_element(),
         };
 
         v_flex()
@@ -1560,16 +1565,35 @@ impl Shell {
                             .border_color(crate::theme_tokens::WARN_WEAK)
                             .text_color(cx.theme().warning)
                             .child(
-                                Button::new(("transcript-warning-toggle", read_id))
-                                    .ghost()
-                                    .xsmall()
+                                h_flex()
+                                    .id(("transcript-warning-toggle", read_id))
                                     .w_full()
-                                    .justify_start()
-                                    .label(if open {
-                                        "▾ 兼容性警告 · 收起详情"
-                                    } else {
-                                        "▸ 兼容性警告 · 展开详情"
-                                    })
+                                    .py_0p5()
+                                    .gap_2()
+                                    .items_center()
+                                    .text_xs()
+                                    .cursor_pointer()
+                                    .child(Icon::empty().xsmall().path(crate::ALERT_ICON))
+                                    .child(div().font_semibold().child("兼容性警告"))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .text_color(cx.theme().warning.opacity(0.7))
+                                            .child(format!("{} 条", warnings.len())),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_1()
+                                            .items_center()
+                                            .text_color(cx.theme().warning.opacity(0.7))
+                                            .hover(|style| style.text_color(cx.theme().warning))
+                                            .child(if open { "收起" } else { "展开" })
+                                            .child(Icon::empty().xsmall().path(if open {
+                                                crate::CHEVRON_DOWN_ICON
+                                            } else {
+                                                crate::CHEVRON_RIGHT_ICON
+                                            })),
+                                    )
                                     .on_click(move |_, _, cx| {
                                         expanded.update(cx, |expanded, cx| {
                                             *expanded = !*expanded;
@@ -1767,6 +1791,8 @@ fn connector_card(
                                 .text_size(px(28.))
                                 .line_height(px(32.))
                                 .font_semibold()
+                                // 空来源降一档，视线先落到有内容的卡片上。
+                                .when(loaded == 0, |n| n.text_color(cx.theme().muted_foreground))
                                 .child(loaded.to_string()),
                         )
                         .child(
