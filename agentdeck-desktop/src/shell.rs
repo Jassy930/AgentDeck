@@ -1304,44 +1304,57 @@ impl Shell {
             .child(sidebar::titlebar_area("empty-titlebar"))
             .child(
                 v_flex()
+                    .id("empty-body")
                     .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .gap_10()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
                     .px_10()
                     .pb_16()
                     .child(
                         v_flex()
+                            .w_full()
+                            .flex_shrink_0()
+                            // 自动外边距只分配剩余高度，内容溢出时从顶部开始滚动。
+                            .my_auto()
                             .items_center()
-                            .gap_3()
-                            .child(eyebrow(
-                                format!("{} 台机器 · {} 个会话", self.machines.len(), sessions),
-                                cx,
-                            ))
+                            .gap_10()
                             .child(
-                                div()
-                                    .text_size(px(40.))
-                                    .line_height(px(48.))
-                                    .font_semibold()
-                                    .child("今天要做什么？"),
+                                v_flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(eyebrow(
+                                        format!(
+                                            "{} 台机器 · {} 个会话",
+                                            self.machines.len(),
+                                            sessions
+                                        ),
+                                        cx,
+                                    ))
+                                    .child(
+                                        div()
+                                            .text_size(px(40.))
+                                            .line_height(px(48.))
+                                            .font_semibold()
+                                            .child("今天要做什么？"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_base()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(hint),
+                                    ),
                             )
                             .child(
                                 div()
-                                    .text_base()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(hint),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .grid()
-                            .grid_cols(columns)
-                            .w_full()
-                            .max_w(px(columns as f32 * 232. + (columns - 1) as f32 * 16.))
-                            .gap_4()
-                            .children(cards),
-                    )
-                    .child(read_only_notice(cx)),
+                                    .grid()
+                                    .grid_cols(columns)
+                                    .w_full()
+                                    .max_w(px(columns as f32 * 232. + (columns - 1) as f32 * 16.))
+                                    .gap_4()
+                                    .children(cards),
+                            )
+                            .child(read_only_notice(cx)),
+                    ),
             )
     }
 
@@ -1423,7 +1436,7 @@ impl Shell {
                             .child(session_title(item)),
                     )
                     .child(
-                        // 元信息拆成标签：agent、项目、机器；项目名过长时截断，不顶出窗口。
+                        // 元信息拆成标签：agent、项目、机器；长名称截断，不顶出窗口。
                         h_flex()
                             .flex_shrink()
                             .min_w(px(0.))
@@ -1441,9 +1454,12 @@ impl Shell {
                                 ),
                             )
                             .child(
-                                meta_chip(cx)
-                                    .flex_shrink_0()
-                                    .child(machine_label(&session.host)),
+                                meta_chip(cx).min_w(px(0.)).child(
+                                    div()
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .child(machine_label(&session.host)),
+                                ),
                             ),
                     ),
             )
