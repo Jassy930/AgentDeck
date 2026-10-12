@@ -1285,6 +1285,7 @@ impl Shell {
         v_flex()
             .relative()
             .flex_1()
+            .min_w(px(0.))
             .h_full()
             .child(
                 // 顶部一层极淡的品牌色光晕，给大面积深色一点空气感。
@@ -1331,7 +1332,15 @@ impl Shell {
                                     .child(hint),
                             ),
                     )
-                    .child(div().grid().grid_cols(columns).gap_4().children(cards))
+                    .child(
+                        div()
+                            .grid()
+                            .grid_cols(columns)
+                            .w_full()
+                            .max_w(px(columns as f32 * 232. + (columns - 1) as f32 * 16.))
+                            .gap_4()
+                            .children(cards),
+                    )
                     .child(read_only_notice(cx)),
             )
     }
@@ -1587,7 +1596,8 @@ fn connector_card(
             machine,
             kind.as_str()
         )))
-        .w(px(232.))
+        .w_full()
+        .min_w(px(0.))
         .gap_4()
         .p_5()
         .rounded(px(14.))
@@ -1628,6 +1638,7 @@ fn connector_card(
                 .child(
                     div()
                         .size(px(32.))
+                        .flex_shrink_0()
                         .flex()
                         .items_center()
                         .justify_center()
@@ -1640,6 +1651,7 @@ fn connector_card(
                 .when(show_machine, |row| {
                     row.child(
                         div()
+                            .min_w(px(0.))
                             .px_2()
                             .py_0p5()
                             .rounded_full()
@@ -1647,6 +1659,7 @@ fn connector_card(
                             .border_color(border)
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
+                            .truncate()
                             .child(machine),
                     )
                 }),

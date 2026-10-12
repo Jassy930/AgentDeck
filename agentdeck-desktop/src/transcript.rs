@@ -30,6 +30,7 @@ const BODY_LIMIT: usize = 2_000;
 const SUMMARY_LIMIT: usize = 120;
 /// 只折叠明确带 base64 标记的 data URI，普通文本不能靠字符集判断。
 const BINARY_MIN_LEN: usize = 256;
+const EDGE_FADE_HEIGHT: f32 = 28.;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Block {
@@ -654,13 +655,13 @@ pub fn render(
                     .max_w(px(760.))
                     .mx_auto()
                     .px_6()
-                    .when(ix == 0, |block| block.pt_4())
                     .pb(gap)
                     .child(content),
             )
             .into_any_element()
     })
-    .size_full();
+    .size_full()
+    .py(px(EDGE_FADE_HEIGHT));
     // min_h(0)：flex item 默认按内容撑高，不加这行长记录会顶穿底部 composer。
     div()
         .relative()
@@ -681,7 +682,7 @@ fn edge_fade(top: bool, cx: &gpui::App) -> gpui::Div {
         .absolute()
         .left_0()
         .right(px(12.))
-        .h(px(28.))
+        .h(px(EDGE_FADE_HEIGHT))
         .bg(gpui::linear_gradient(
             if top { 180. } else { 0. },
             gpui::linear_color_stop(bg, 0.),
