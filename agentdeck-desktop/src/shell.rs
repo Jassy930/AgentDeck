@@ -372,6 +372,20 @@ impl Machine {
         self.error.is_some() || self.agents.iter().any(|agent| agent.error().is_some())
     }
 
+    fn prepare_agents(&mut self, kinds: &[AgentKind]) {
+        self.agents = kinds
+            .iter()
+            .map(|&kind| AgentHistory {
+                loaded: self
+                    .agents
+                    .iter()
+                    .find(|agent| agent.kind == kind)
+                    .map_or(0, |agent| agent.loaded),
+                ..AgentHistory::new(kind)
+            })
+            .collect();
+    }
+
     pub fn can_update_agents(&self) -> bool {
         !self.connecting
             && !self.installing
@@ -730,7 +744,7 @@ impl Shell {
                             .map_or(None, |machine| machine.host.clone());
                         let active_kinds = kinds.clone();
                         if let Some(machine) = shell.machine_mut(id) {
-                            machine.agents = kinds.iter().copied().map(AgentHistory::new).collect();
+                            machine.prepare_agents(&kinds);
                         }
                         retain_active_machine_sessions(&mut shell.sessions, &host, &active_kinds);
                         if shell.agent_filter.as_ref().is_some_and(
@@ -2158,6 +2172,30 @@ mod tests {
         machines[0].agents[0].operation = Some(super::AgentOperation::Update);
         assert!(!super::sessions_refresh_ready(0, &machines));
         assert!(!super::sessions_refresh_ready(1, &machines));
+    }
+
+    #[test]
+    fn refresh_keeps_loaded_count_until_new_history_succeeds() {
+        let mut machine = Machine::new(1, None);
+        machine.prepare_agents(&[AgentKind::Codex]);
+        machine.agents[0].complete(&mut Ok((vec![item(None); 51], vec![])));
+        assert!(machine.agents[0].load_more());
+        machine.agents[0].complete(&mut Ok((vec![item(None); 100], vec![])));
+
+        machine.prepare_agents(&[AgentKind::ClaudeCode, AgentKind::Codex]);
+        assert_eq!(machine.agents[0].status(), "读取中…");
+        let source = &mut machine.agents[1];
+        assert_eq!(source.status(), "已加载 100 · 加载中…");
+        assert_eq!(source.request_limit(), 51);
+        source.complete(&mut Err("timeout".into()));
+        assert_eq!(source.status(), "已加载 100 · 加载失败");
+        assert!(source.retry());
+        source.complete(&mut Ok((vec![item(None); 12], vec![])));
+        assert_eq!(source.status(), "已加载 12 个会话");
+
+        machine.prepare_agents(&[AgentKind::Codex]);
+        assert_eq!(machine.agents.len(), 1);
+        assert_eq!(machine.agents[0].status(), "已加载 12 · 加载中…");
     }
 
     #[test]
