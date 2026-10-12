@@ -135,10 +135,22 @@ fn remote_form(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement + use
         .child(
             h_flex()
                 .gap_2()
-                .child(Input::new(&shell.remote_input).small().flex_1())
+                .child(
+                    Input::new(&shell.remote_input)
+                        .small()
+                        .prefix(
+                            Icon::empty()
+                                .path(crate::SERVER_ICON)
+                                .xsmall()
+                                .text_color(cx.theme().muted_foreground),
+                        )
+                        .flex_1(),
+                )
                 .child(
                     Button::new("connect-remote")
+                        .primary()
                         .small()
+                        .icon(Icon::empty().path(crate::PLUS_ICON))
                         .label("连接")
                         .on_click(cx.listener(|shell, _, _, cx| shell.connect_remote(cx))),
                 ),

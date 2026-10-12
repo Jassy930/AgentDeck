@@ -9,10 +9,10 @@ use std::rc::Rc;
 
 mod markdown_fallback;
 
-use agentdeck_protocol::{AgentItem, HistoryTurn, PlanStepStatus, ShellStatus};
+use agentdeck_protocol::{AgentItem, AgentKind, HistoryTurn, PlanStepStatus, ShellStatus};
 use gpui::{
     ClipboardItem, ElementId, IntoElement, ListState, ParentElement, SharedString, Window, div,
-    list, prelude::*, px,
+    list, prelude::*, px, relative,
 };
 use gpui_component::{
     ActiveTheme, Icon, Sizable, StyledExt,
@@ -43,6 +43,8 @@ pub struct Block {
     /// 正文按 Markdown 渲染；用户消息里常夹带 `<in-app-browser-context>` 这类注入标签，
     /// TextView 会静默丢弃未识别的内联 HTML，所以用户消息保持纯文本。
     pub markdown: bool,
+    unsupported: bool,
+    continued_assistant: bool,
     /// 命令失败等需要醒目提示的状态。
     pub failed: bool,
     /// 所在连续过程块组的 `(起始下标, 块数)`；连续两个以上过程块才成组。
@@ -65,6 +67,8 @@ impl Block {
             status: None,
             body: body.into(),
             markdown,
+            unsupported: false,
+            continued_assistant: false,
             failed: false,
             group: None,
             group_summary: None,
@@ -78,6 +82,8 @@ impl Block {
             status: None,
             body: markdown_fallback::images_as_links(body.trim()).into(),
             markdown: true,
+            unsupported: false,
+            continued_assistant: false,
             failed: false,
             group: None,
             group_summary: None,
@@ -93,11 +99,14 @@ pub fn describe(item: &AgentItem) -> Block {
     match item {
         AgentItem::UserMessage { text, .. } => Block::message("你", text, false),
         AgentItem::AssistantMessage { text, .. } => Block::message("助手", text, true),
-        AgentItem::Raw { raw_kind, .. } => Block::message(
-            "暂不支持的内容",
-            &format!("类型：{raw_kind}\n当前 AgentDeck 无法展示此内容，请检查更新"),
-            false,
-        ),
+        AgentItem::Raw { raw_kind, .. } => Block {
+            unsupported: true,
+            ..Block::message(
+                "暂不支持的内容",
+                &format!("类型：{raw_kind}\n当前 AgentDeck 无法展示此内容，请检查更新"),
+                false,
+            )
+        },
         AgentItem::Reasoning { text, .. } => {
             let text = text.trim();
             let first = text
@@ -309,12 +318,21 @@ fn truncate(body: &str) -> String {
 }
 
 pub fn prepare(turns: Vec<HistoryTurn>) -> Vec<Block> {
-    let mut blocks: Vec<Block> = turns
-        .into_iter()
-        .flat_map(|turn| turn.items)
-        .map(|item| describe(&item))
-        .filter(|block| !block.is_empty())
-        .collect();
+    let mut blocks = Vec::new();
+    for turn in turns {
+        let mut previous_assistant = false;
+        for item in turn.items {
+            let mut block = describe(&item);
+            if block.is_empty() {
+                continue;
+            }
+            if block.summary.is_none() {
+                block.continued_assistant = block.markdown && previous_assistant;
+                previous_assistant = block.markdown;
+            }
+            blocks.push(block);
+        }
+    }
     let mut start = 0;
     while start < blocks.len() {
         let len = blocks[start..]
@@ -400,6 +418,7 @@ fn summary_row(
 ) -> gpui::Stateful<gpui::Div> {
     let (muted, danger) = (cx.theme().muted_foreground, cx.theme().danger);
     let hover = cx.theme().secondary;
+    let tag_bg = cx.theme().foreground.opacity(0.06);
     h_flex()
         .id(id)
         .gap_2()
@@ -421,7 +440,17 @@ fn summary_row(
                 }))
             },
         ))
-        .child(div().flex_shrink_0().font_semibold().child(label))
+        // 类别做成小标签，扫读时先看类别再看摘要。
+        .child(
+            div()
+                .flex_shrink_0()
+                .px_1p5()
+                .rounded(px(5.))
+                .bg(tag_bg)
+                .text_xs()
+                .font_semibold()
+                .child(label),
+        )
         .child(
             div()
                 .flex_1()
@@ -468,6 +497,7 @@ fn markdown(
 /// 同一下标若沿用旧 key，会先显示上个会话的内容再延迟 200ms 重新解析。
 pub fn render(
     blocks: Rc<[Block]>,
+    agent: AgentKind,
     state: ListState,
     read_id: u64,
     window: &mut Window,
@@ -504,54 +534,76 @@ pub fn render(
                 } else {
                     block.body.clone().into_any_element()
                 };
-                // 用户消息是一张浅色卡片；助手消息直接铺在底色上；不支持的内容用虚线框降级。
-                let is_user = block.label == "你";
+                // 用户消息靠右成气泡；助手消息以 agent 身份铺在底色上；不支持的内容用虚线框降级。
                 let theme = cx.theme();
-                let dot = if is_user {
-                    theme.primary
-                } else if block.markdown {
-                    theme.foreground.opacity(0.55)
-                } else {
-                    theme.warning
-                };
                 let surface = theme.secondary;
-                let message = v_flex()
-                    .gap_2()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(div().size(px(6.)).rounded_full().bg(dot))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_semibold()
-                                    .text_color(muted)
-                                    .child(block.label),
-                            ),
-                    )
-                    .child(div().text_sm().child(body));
-                if is_user {
-                    message
-                        .px_4()
-                        .py_3()
-                        .rounded(px(14.))
-                        .bg(surface)
-                        .border_1()
-                        .border_color(border)
+                if block.label == "你" {
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .child(
+                            div()
+                                .max_w(relative(0.82))
+                                .px_4()
+                                .py_2p5()
+                                .rounded(px(16.))
+                                .rounded_tr(px(6.))
+                                .bg(surface)
+                                .border_1()
+                                .border_color(border)
+                                .text_sm()
+                                .child(body),
+                        )
                         .into_any_element()
-                } else if !block.markdown {
-                    message
-                        .px_4()
-                        .py_3()
-                        .rounded(px(12.))
-                        .border_1()
-                        .border_dashed()
-                        .border_color(border)
-                        .text_color(muted)
+                } else if block.markdown {
+                    v_flex()
+                        .gap_2()
+                        .when(!block.continued_assistant, |message| {
+                            message.child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(crate::sidebar::agent_icon(agent, false))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_semibold()
+                                            .text_color(muted)
+                                            .child(crate::shell::agent_label(agent)),
+                                    ),
+                            )
+                        })
+                        .child(div().text_sm().child(body))
                         .into_any_element()
                 } else {
-                    message.into_any_element()
+                    v_flex()
+                        .gap_2()
+                        .when(block.unsupported, |message| {
+                            message
+                                .px_4()
+                                .py_3()
+                                .rounded(px(12.))
+                                .border_1()
+                                .border_dashed()
+                                .border_color(border)
+                                .text_color(muted)
+                        })
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .when(block.unsupported, |header| {
+                                    header.child(
+                                        Icon::empty()
+                                            .xsmall()
+                                            .path(crate::ALERT_ICON)
+                                            .text_color(theme.warning),
+                                    )
+                                })
+                                .child(div().text_xs().font_semibold().child(block.label)),
+                        )
+                        .child(div().text_sm().child(body))
+                        .into_any_element()
                 }
             }
             Some(summary) => {
@@ -697,11 +749,74 @@ mod tests {
         BODY_LIMIT, Block, VisibleRows, collapsed_indices, describe, fence, is_binary, prepare,
         truncate,
     };
-    use agentdeck_protocol::{AgentItem, AgentItemMeta, HistoryTurn, ShellStatus};
+    use agentdeck_protocol::{
+        AgentItem, AgentItemMeta, HistoryTurn, PlanStep, PlanStepStatus, ShellStatus,
+    };
     use gpui::{ListAlignment, ListOffset, ListState, px};
 
     fn meta() -> AgentItemMeta {
         AgentItemMeta::default()
+    }
+
+    #[test]
+    fn only_raw_content_uses_unsupported_presentation() {
+        let plan = describe(&AgentItem::Plan {
+            steps: vec![PlanStep {
+                title: "运行测试".into(),
+                status: PlanStepStatus::InProgress,
+                detail: None,
+            }],
+            meta: meta(),
+        });
+        assert!(!plan.unsupported);
+        assert_eq!(plan.label, "计划");
+        assert_eq!(plan.body, "◐ 运行测试");
+
+        let raw = describe(&AgentItem::Raw {
+            raw_kind: "futureItem".into(),
+            raw_payload: "withheld".into(),
+            meta: meta(),
+        });
+        assert!(raw.unsupported);
+        assert!(raw.body.contains("futureItem"));
+    }
+
+    #[test]
+    fn assistant_identity_restarts_each_turn_and_skips_process_blocks() {
+        let assistant = || AgentItem::AssistantMessage {
+            text: "测试结果".into(),
+            meta: meta(),
+        };
+        let blocks = prepare(vec![
+            HistoryTurn {
+                items: vec![
+                    assistant(),
+                    AgentItem::Reasoning {
+                        text: "检查结果".into(),
+                        meta: meta(),
+                    },
+                    assistant(),
+                ],
+            },
+            HistoryTurn {
+                items: vec![assistant()],
+            },
+            HistoryTurn {
+                items: vec![
+                    AgentItem::UserMessage {
+                        text: " ".into(),
+                        meta: meta(),
+                    },
+                    assistant(),
+                ],
+            },
+        ]);
+        let continued: Vec<_> = blocks
+            .iter()
+            .filter(|block| block.label == "助手")
+            .map(|block| block.continued_assistant)
+            .collect();
+        assert_eq!(continued, [false, true, false, false]);
     }
 
     #[test]
