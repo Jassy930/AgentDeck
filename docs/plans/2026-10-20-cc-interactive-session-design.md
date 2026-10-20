@@ -96,7 +96,7 @@ claude --print --input-format stream-json --output-format stream-json \
 - `shell.rs`：每台机器一个事件监听任务，按 machine id 定位，不按 host，避免重新添加同名机器时串线。
   会话页底部有审批条、错误行、输入框和发送/停止按钮，记录区 = 历史块 + live 块。
 - `transcript.rs`：`append` 平移 live 块的组下标；`render` 发现 blocks 换了一份时，
-  保留已展开的组重算可见行，并跟随到底部。
+  保留已展开的组重算可见行；原本停在底部时跟随到底部，往上翻看时按原始块下标保持位置。
 - N2：`SessionRouter` 按 typed `VendorCapabilities` 构造 `VendorSessionOptions`，确认 advertised 能力支持默认配置；
   CC 保持 default 权限模式，Codex 保持 daemon 固定的 M0 选项（未从桌面验证），缺失支持时不回退放宽权限。
   首轮使用缓存的 agent 能力，`SessionCapabilities` 握手后改以会话能力为准：`StreamingMessages` 启用续聊，
@@ -176,7 +176,7 @@ desktop live 测试（开始前本地、开始后事件驱动）；经 daemon �
 - 桌面不发 `SessionClose`，CC 子进程随 daemon（应用退出或连接重置）回收。
 - 显式断开机器或装完 daemon 后的 `reset()` 会在 2 秒后 SIGKILL daemon；若此时 CC 正在收尾（宽限 10 秒），
   `claude` 子进程可能成为孤儿。应用正常退出走 stdin EOF，不受影响。
-- live 内容更新时总是跟随到底部，用户上翻查看时会被拉回。
+- live 内容更新时只在原本停在底部时跟随（2026-10-20，PR #49）；单测覆盖锚点换算，真实窗口滚动行为尚待目视验证。
 
 
 - CLI one-shot `agentdeck run` 的 CC 默认权限改为 `acceptEdits`（2026-10-20），文件编辑不再等审批；

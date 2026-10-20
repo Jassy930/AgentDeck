@@ -13,8 +13,8 @@ use agentdeck_protocol::{
     AgentItem, AgentKind, CONTEXT_KIND_KEY, HistoryTurn, PlanStepStatus, ShellStatus,
 };
 use gpui::{
-    ClipboardItem, ElementId, IntoElement, ListState, ParentElement, SharedString, Window, div,
-    list, prelude::*, px, relative,
+    ClipboardItem, ElementId, IntoElement, ListOffset, ListState, ParentElement, SharedString,
+    Window, div, list, prelude::*, px, relative,
 };
 use gpui_component::{
     ActiveTheme, Icon, Sizable, StyledExt,
@@ -453,6 +453,11 @@ impl VisibleRows {
     }
 }
 
+/// 块所在的可见行：块本身可见就是它那行，被折叠时落到包含它的组首行。
+fn row_for_block(indices: &[usize], block: usize) -> usize {
+    indices.partition_point(|&ix| ix <= block).saturating_sub(1)
+}
+
 /// 组摘要：步数加按首次出现顺序的各类计数，如“5 步 · 命令 3 · 思考 2”；另返回失败数。
 fn group_summary(blocks: &[Block]) -> (String, usize) {
     let mut counts: Vec<(&str, usize)> = Vec::new();
@@ -580,18 +585,37 @@ pub fn render(
         |_, _| VisibleRows::new(&blocks),
     );
     visible.update(cx, |rows, _| {
-        let changed = rows.sync(&blocks);
-        if !changed && state.item_count() != rows.indices.len() {
-            // 读完历史时列表按历史块数重置过，这时已拼上了运行中的 live 轮次。
-            state.reset(rows.indices.len());
-        }
-        if changed {
-            // ponytail: 有新内容就跟到底部；用户往上翻看时也会被拉回，
-            // 需要时改成"只在原本就停在底部时跟随"。
-            state.reset(rows.indices.len());
-            if let Some(last) = rows.indices.len().checked_sub(1) {
-                state.scroll_to_reveal_item(last);
+        // 行号会随折叠重算而变，滚动锚点按原始块下标记，sync 后再换回行号。
+        let mut anchor = state.logical_scroll_top();
+        let anchor_block = rows.indices.get(anchor.item_ix).copied();
+        // 读完历史时列表按历史块数重置过，这时可能已拼上了运行中的 live 轮次。
+        if rows.sync(&blocks) || state.item_count() != rows.indices.len() {
+            // 原本停在底部才跟随新内容；往上翻看时保持原位置。按旧行高判断，须在 reset 之前。
+            // max_offset_for_scrollbar 不含列表上下内边距，真实滚动上限要再加回来；
+            // 它为 0 时内容不足一屏（最多能滚动内边距那点距离），视为在底部。
+            let max = state.max_offset_for_scrollbar().height;
+            let at_bottom = max == px(0.)
+                || -state.scroll_px_offset_for_scrollbar().y
+                    >= max + px(EDGE_FADE_HEIGHT * 2.) - px(1.);
+            if let Some(block) = anchor_block {
+                let row = row_for_block(&rows.indices, block);
+                if rows.indices.get(row) != Some(&block) {
+                    // 锚点块被并进了组，停在组首行顶部。
+                    anchor.offset_in_item = px(0.);
+                }
+                anchor.item_ix = row;
             }
+            let count = rows.indices.len();
+            // reset 会清空行高和滚动位置；定位到末尾后，布局会从底部往上填满视口。
+            state.reset(count);
+            state.scroll_to(if at_bottom {
+                ListOffset {
+                    item_ix: count,
+                    offset_in_item: px(0.),
+                }
+            } else {
+                anchor
+            });
         }
     });
     let list_state = state.clone();
@@ -827,7 +851,7 @@ fn edge_fade(top: bool, cx: &gpui::App) -> gpui::Div {
 mod tests {
     use super::{
         BODY_LIMIT, Block, CONTEXT_KIND_KEY, VisibleRows, append, collapsed_indices, describe,
-        fence, is_binary, prepare, truncate,
+        fence, is_binary, prepare, row_for_block, truncate,
     };
     use agentdeck_protocol::{
         AgentItem, AgentItemMeta, HistoryTurn, PlanStep, PlanStepStatus, ShellStatus,
@@ -1173,6 +1197,15 @@ mod tests {
         assert_eq!(list.logical_scroll_top().item_ix, 4);
         assert_eq!(list.logical_scroll_top().offset_in_item, px(7.));
         assert!(rows.expanded_groups.is_empty());
+    }
+
+    #[test]
+    fn scroll_anchor_follows_block_across_regrouping() {
+        // 块 3 原本单独成行，重算后并进了从 2 开始的组。
+        assert_eq!(row_for_block(&[0, 1, 2, 3, 6], 3), 3);
+        assert_eq!(row_for_block(&[0, 1, 2, 6], 3), 2);
+        assert_eq!(row_for_block(&[0, 1, 2, 6], 6), 3);
+        assert_eq!(row_for_block(&[0, 4], 0), 0);
     }
 
     #[test]
