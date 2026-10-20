@@ -308,7 +308,12 @@ impl Owner {
         };
         let response = match decision.decision {
             ActionDecisionKind::Approve => {
-                let mut allow = json!({"behavior": "allow", "updatedInput": route.input});
+                let mut input = route.input;
+                // AskUserQuestion reads the user's picks from updatedInput.answers.
+                if let (Some(answers), Some(object)) = (decision.answers, input.as_object_mut()) {
+                    object.insert("answers".into(), json!(answers));
+                }
+                let mut allow = json!({"behavior": "allow", "updatedInput": input});
                 if decision.persist && route.suggestions.as_array().is_some_and(|s| !s.is_empty()) {
                     allow["updatedPermissions"] = route.suggestions;
                 }
@@ -567,6 +572,9 @@ while IFS= read -r line; do
         *) echo "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$id\",\"response\":{}}}" ;;
       esac ;;
     *'"subtype":"interrupt"'*) echo '{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"thread-x"}' ;;
+    *'"answers":{"color":"blue"}'*) echo '{"type":"assistant","session_id":"thread-x","message":{"id":"m3","content":[{"type":"text","text":"got blue"}]}}'
+      echo '{"type":"result","subtype":"success","is_error":false,"session_id":"thread-x"}' ;;
+    *ask-me*) echo '{"type":"control_request","request_id":"ask-1","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{"question":"color","options":[{"label":"blue"}]}]}}}' ;;
     *'"behavior":"allow"'*) echo '{"type":"assistant","session_id":"thread-x","message":{"id":"m2","content":[{"type":"text","text":"approved"}]}}'
       echo '{"type":"result","subtype":"success","is_error":false,"session_id":"thread-x"}' ;;
     *approve*) echo '{"type":"control_request","request_id":"perm-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"},"permission_suggestions":[]}}' ;;
@@ -653,6 +661,7 @@ done
             decision: ActionDecisionKind::Approve,
             persist: false,
             message: None,
+            answers: None,
         };
         assert_eq!(
             call(&commands, |reply| SessionCommand::Decision {
@@ -669,6 +678,7 @@ done
             decision: ActionDecisionKind::Approve,
             persist: false,
             message: None,
+            answers: None,
         };
         call(&commands, |reply| SessionCommand::Decision {
             decision: approve,
@@ -777,6 +787,56 @@ done
         assert!(matches!(
             next(&mut events).await,
             ServerEvent::Error { error, .. } if error.code == "cc-permission-mode-rejected"
+        ));
+    }
+
+    #[tokio::test]
+    async fn answers_ride_in_updated_input() {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", FAKE_CLAUDE])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let (events_tx, mut events) = mpsc::channel(64);
+        let (exit_tx, _exit_rx) = oneshot::channel();
+        let (commands, _abort) = spawn_owner(
+            command.spawn().expect("spawn fake claude"),
+            OwnerStart {
+                session_id: SessionId("s".into()),
+                thread_id: ThreadId("thread-x".into()),
+                permission_mode: ClaudeCodePermissionMode::Default,
+                initial_turn: Some((turn("t1"), "ask-me".into())),
+            },
+            events_tx,
+            exit_tx,
+        )
+        .expect("owner starts");
+        assert!(matches!(
+            next(&mut events).await,
+            ServerEvent::TurnStarted { .. }
+        ));
+        assert!(matches!(
+            next(&mut events).await,
+            ServerEvent::ActionRequest { .. }
+        ));
+        let answer = ActionDecision {
+            request_id: "ask-1".into(),
+            decision: ActionDecisionKind::Approve,
+            persist: false,
+            message: None,
+            answers: Some([("color".to_string(), "blue".to_string())].into()),
+        };
+        call(&commands, |reply| SessionCommand::Decision {
+            decision: answer,
+            reply,
+        })
+        .await
+        .expect("answer routed");
+        assert!(matches!(
+            next(&mut events).await,
+            ServerEvent::AgentItem { item: AgentItem::AssistantMessage { text, .. }, .. } if text == "got blue"
         ));
     }
 

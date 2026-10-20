@@ -105,6 +105,8 @@ pub struct LiveSession {
     pub error: Option<String>,
     /// 会话里实际生效的权限模式：开始前是本地选择，开始后只跟 daemon 的模式事件。
     pub mode: ClaudeCodePermissionMode,
+    /// 待决提问每题已选的选项标签。
+    pub picks: Vec<Vec<String>>,
 }
 
 impl LiveSession {
@@ -118,7 +120,50 @@ impl LiveSession {
             action: None,
             error: None,
             mode: ClaudeCodePermissionMode::Default,
+            picks: Vec::new(),
         }
+    }
+
+    /// 单选题点选即替换，多选题点选即切换。
+    pub fn toggle_pick(&mut self, question: usize, label: &str) {
+        let Some(asked) = self
+            .action
+            .as_ref()
+            .and_then(|action| action.questions.as_ref())
+            .and_then(|questions| questions.get(question))
+        else {
+            return;
+        };
+        let multi = asked.multi_select;
+        let Some(picks) = self.picks.get_mut(question) else {
+            return;
+        };
+        match picks.iter().position(|pick| pick == label) {
+            Some(index) if multi => {
+                picks.remove(index);
+            }
+            Some(_) => {}
+            None if multi => picks.push(label.to_string()),
+            None => *picks = vec![label.to_string()],
+        }
+    }
+
+    /// 每题都选了才能提交；多选按选项原顺序用 ", " 连接。
+    pub fn answers(&self) -> Option<std::collections::BTreeMap<String, String>> {
+        let questions = self.action.as_ref()?.questions.as_ref()?;
+        questions
+            .iter()
+            .zip(&self.picks)
+            .map(|(question, picks)| {
+                let chosen: Vec<&str> = question
+                    .options
+                    .iter()
+                    .map(|option| option.label.as_str())
+                    .filter(|label| picks.iter().any(|pick| pick == label))
+                    .collect();
+                (!chosen.is_empty()).then(|| (question.question.clone(), chosen.join(", ")))
+            })
+            .collect()
     }
 
     /// 登记一轮并返回要发给 daemon 的命令：会话没开就带 initial turn 续上原 thread。
@@ -181,6 +226,10 @@ impl LiveSession {
         persist: bool,
         message: Option<String>,
     ) -> Option<ClientCommand> {
+        let answers = if approve { self.answers() } else { None };
+        if approve && self.action.as_ref()?.questions.is_some() && answers.is_none() {
+            return None;
+        }
         let request = self.action.take()?;
         Some(ClientCommand::ActionDecision {
             session_id: self.session_id.clone()?,
@@ -193,6 +242,7 @@ impl LiveSession {
                 },
                 persist,
                 message,
+                answers,
             },
         })
     }
@@ -230,7 +280,10 @@ impl LiveSession {
                     None => turn.items.push((item_id, item)),
                 }
             }
-            ServerEvent::ActionRequest { request, .. } => self.action = Some(request),
+            ServerEvent::ActionRequest { request, .. } => {
+                self.picks = vec![Vec::new(); request.questions.as_ref().map_or(0, Vec::len)];
+                self.action = Some(request);
+            }
             ServerEvent::VendorPanelEvent {
                 payload:
                     VendorPanelPayload::ClaudeCode(ClaudeCodeVendorPanelEvent::PermissionModeChanged {
@@ -448,6 +501,64 @@ mod tests {
     }
 
     #[test]
+    fn questions_need_an_answer_each_and_join_multi_select_in_option_order() {
+        use agentdeck_protocol::{UserQuestion, UserQuestionOption};
+        let option = |label: &str| UserQuestionOption {
+            label: label.into(),
+            description: None,
+        };
+        let mut live = session();
+        live.send("hi".into(), "/repo".into());
+        live.apply(ServerEvent::ActionRequest {
+            session_id: SessionId("s".into()),
+            thread_id: ThreadId("thread".into()),
+            agent_kind: AgentKind::ClaudeCode,
+            request: ActionRequest {
+                request_id: "ask-1".into(),
+                kind: ActionKind::AnswerQuestions,
+                summary: "AskUserQuestion".into(),
+                detail: None,
+                questions: Some(vec![
+                    UserQuestion {
+                        question: "颜色".into(),
+                        header: None,
+                        options: vec![option("红"), option("蓝")],
+                        multi_select: false,
+                    },
+                    UserQuestion {
+                        question: "水果".into(),
+                        header: None,
+                        options: vec![option("苹果"), option("香蕉"), option("橙子")],
+                        multi_select: true,
+                    },
+                ]),
+                vendor: ActionRequestVendor::ClaudeCode {
+                    permission_mode_at_decision: ClaudeCodePermissionMode::Default,
+                    tool_name: "AskUserQuestion".into(),
+                    can_persist: false,
+                },
+            },
+        });
+        live.toggle_pick(0, "红");
+        live.toggle_pick(0, "蓝");
+        assert!(
+            live.decide(true, false, None).is_none(),
+            "fruit is unanswered"
+        );
+        live.toggle_pick(1, "橙子");
+        live.toggle_pick(1, "香蕉");
+        live.toggle_pick(1, "苹果");
+        live.toggle_pick(1, "香蕉");
+        let Some(ClientCommand::ActionDecision { decision, .. }) = live.decide(true, false, None)
+        else {
+            panic!("every question is answered");
+        };
+        let answers = decision.answers.unwrap();
+        assert_eq!(answers["颜色"], "蓝");
+        assert_eq!(answers["水果"], "苹果, 橙子");
+    }
+
+    #[test]
     fn record_warnings_keep_the_turn_running() {
         let mut live = session();
         live.send("hi".into(), "/repo".into());
@@ -475,6 +586,7 @@ mod tests {
                 kind: ActionKind::ExecuteCommand,
                 summary: "Bash: ls".into(),
                 detail: Some("ls".into()),
+                questions: None,
                 vendor: ActionRequestVendor::ClaudeCode {
                     permission_mode_at_decision: ClaudeCodePermissionMode::Default,
                     tool_name: "Bash".into(),

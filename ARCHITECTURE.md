@@ -131,7 +131,8 @@ agentdeck-cli（参考客户端 / E2E 驱动，与 GUI 互相独立）
 `agentdeck-protocol` crate 是 IPC 协议的唯一事实源：
 
 - `PROTOCOL_VERSION`：当前为 8。v8 为审批补 `ActionRequest.detail`、`ActionKind::ApprovePlan`、
-  `ActionDecision.message` 与 CC `canPersist`，新增 CC 面板事件 `PermissionModeChanged`（新字段均可缺省，
+  `ActionDecision.message` 与 CC `canPersist`，提问用 `ActionKind::AnswerQuestions` + `ActionRequest.questions`
+  + `ActionDecision.answers`，新增 CC 面板事件 `PermissionModeChanged`（新字段均可缺省，
   v7 形状仍可解码）。v7 增加 `AgentInstall { agentKind }`，v6 增加 `AgentUpdate { agentKind }`，通过 admin 回复返回
   安装／更新输出或错误；`Selfcheck` 回复携带 daemon 版本。桌面端确认 `protocolVersion` 与当前版本一致（v8）
   后才开放 CLI 安装／更新，旧 daemon 的只读历史继续可用，Swift Core 同步命令编解码。

@@ -132,10 +132,28 @@ desktop live 测试（开始前本地、开始后事件驱动）；经 daemon �
 
 实窗截图确认计划审批卡、跳过权限确认条和模式按钮渲染正常；点击未自动验证。
 
+## P4 AskUserQuestion（2026-10-20，仍属协议 v8）
+
+实测（claude 2.1.304）：
+- 任何权限模式下（包括 bypassPermissions），AskUserQuestion 都会走 `can_use_tool`，并带
+  `requires_user_interaction: true`。`input.questions[]` 每题有 `question`、`header`、
+  `options[{label, description}]` 和 `multiSelect`。
+- 回答方式：allow，`updatedInput` = 原 input 加上 `answers: {问题原文: 选中的 label}`，多选用 `", "` 连接。
+  模型收到的 tool_result 是 `"Your questions have been answered: "Q"="A", ..."`。
+
+实现：
+- 协议新增中立的 `ActionKind::AnswerQuestions`、`ActionRequest.questions`（`UserQuestion` / `UserQuestionOption`）
+  和 `ActionDecision.answers`，都可缺省。
+- translator 按字段取值，忽略 CC 选项里多出的字段（如 preview）；问题解析失败时退化为普通审批。
+- owner 在 approve 时把 answers 写进 updatedInput；"跳过"即 deny。
+- 桌面问题卡：单选点了就替换，多选点了就切换，每题都选了才能"提交回答"。
+
+验证：translator（真实形状、忽略多余字段）、owner（answers 写进 updatedInput）、桌面 live（每题必答、多选按选项顺序拼接）；
+经 daemon 的真实链路：模型复述"你喜欢蓝色，想要苹果和橙子"；实窗截图确认问题卡、选中态和提交按钮禁用态。
+
 ## 已知边界
 
-- `AskUserQuestion` 在 default 模式下也走 `can_use_tool`，但它需要在 `updatedInput` 里填答案；审批卡目前只能允许或拒绝，
-  允许时 CC 拿到的是空答案。
+- 问题卡不支持自由输入"其他"答案，只能从选项里选。
 
 - 桌面不发 `SessionClose`，CC 子进程随 daemon（应用退出或连接重置）回收。
 - 显式断开机器或装完 daemon 后的 `reset()` 会在 2 秒后 SIGKILL daemon；若此时 CC 正在收尾（宽限 10 秒），

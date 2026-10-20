@@ -7,6 +7,7 @@ fn codex_action_request_carries_sandbox_at_decision() {
         kind: ActionKind::ExecuteCommand,
         summary: "rm -rf node_modules".into(),
         detail: None,
+        questions: None,
         vendor: ActionRequestVendor::Codex {
             approval_policy_at_decision: CodexApprovalPolicy::OnRequest,
             sandbox_at_decision: CodexSandboxMode::WorkspaceWrite,
@@ -27,6 +28,7 @@ fn cc_action_request_carries_permission_mode() {
         kind: ActionKind::EditFiles,
         summary: "edit auth.py".into(),
         detail: Some("-a\n+b".into()),
+        questions: None,
         vendor: ActionRequestVendor::ClaudeCode {
             permission_mode_at_decision: ClaudeCodePermissionMode::AcceptEdits,
             tool_name: "Edit".into(),

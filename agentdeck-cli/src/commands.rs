@@ -454,12 +454,14 @@ pub fn resolve_action_decision(
             decision: ActionDecisionKind::Approve,
             persist: false,
             message: None,
+            answers: None,
         }),
         Some("deny") | Some("never") => Ok(ActionDecision {
             request_id: request_id.to_string(),
             decision: ActionDecisionKind::Deny,
             persist: false,
             message: None,
+            answers: None,
         }),
         _ => {
             // Interactive: prompt on stderr, read from stdin
@@ -476,12 +478,14 @@ pub fn resolve_action_decision(
                     decision: ActionDecisionKind::Approve,
                     persist: false,
                     message: None,
+                    answers: None,
                 }),
                 "deny" => Ok(ActionDecision {
                     request_id: request_id.to_string(),
                     decision: ActionDecisionKind::Deny,
                     persist: false,
                     message: None,
+                    answers: None,
                 }),
                 other => Err(CliError::Usage(format!(
                     "invalid decision '{other}', expected approve|deny"

@@ -2041,6 +2041,7 @@ mod tests {
                     decision: ActionDecisionKind::Approve,
                     persist: false,
                     message: None,
+                    answers: None,
                 },
             },
         )
