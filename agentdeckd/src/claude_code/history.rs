@@ -358,6 +358,14 @@ fn user_item(raw: &str, injected: bool) -> Option<AgentItem> {
     if text.starts_with("<local-command-caveat>") {
         return context_item("context", tag_inner(text, "local-command-caveat")?);
     }
+    if text.starts_with("<task-notification>") {
+        let body: Vec<&str> = ["summary", "result"]
+            .iter()
+            .filter_map(|tag| tag_inner(text, tag))
+            .filter(|s| !s.is_empty())
+            .collect();
+        return context_item("notification", &body.join("\n\n"));
+    }
     if injected {
         return context_item("context", text);
     }
@@ -379,14 +387,6 @@ fn user_item(raw: &str, injected: bool) -> Option<AgentItem> {
     if text.starts_with("<bash-input>") {
         return tag_inner(text, "bash-input").map(|cmd| typed(format!("! {cmd}")));
     }
-    if text.starts_with("<task-notification>") {
-        let body: Vec<&str> = ["summary", "result"]
-            .iter()
-            .filter_map(|tag| tag_inner(text, tag))
-            .filter(|s| !s.is_empty())
-            .collect();
-        return context_item("notification", &body.join("\n\n"));
-    }
     const STDOUT: [&str; 2] = ["local-command-stdout", "bash-stdout"];
     const STDERR: [&str; 2] = ["local-command-stderr", "bash-stderr"];
     let tags = || STDOUT.iter().chain(&STDERR);
@@ -405,7 +405,7 @@ fn user_item(raw: &str, injected: bool) -> Option<AgentItem> {
 }
 
 fn context_item(kind: &str, text: &str) -> Option<AgentItem> {
-    let text = text.trim();
+    let text = unwrap_tag(text.trim());
     if text.is_empty() {
         return None;
     }
@@ -428,6 +428,25 @@ fn push_user_item(item: AgentItem, current: &mut Vec<AgentItem>, turns: &mut Vec
         });
     }
     current.push(item);
+}
+
+/// `<system-reminder>…</system-reminder>` → its body, so the folded
+/// summary line shows content rather than the tag.
+fn unwrap_tag(text: &str) -> &str {
+    let Some(tag) = text
+        .strip_prefix('<')
+        .and_then(|rest| rest.split_once('>'))
+        .map(|(tag, _)| tag)
+        .filter(|tag| {
+            !tag.is_empty() && tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+    else {
+        return text;
+    };
+    match tag_inner(text, tag) {
+        Some(inner) if text.ends_with(&format!("</{tag}>")) => inner,
+        _ => text,
+    }
 }
 
 fn tag_inner<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
@@ -1367,7 +1386,8 @@ mod tests {
 {"type":"user","message":{"role":"user","content":"<local-command-stdout></local-command-stdout>"}}
 {"type":"user","message":{"role":"user","content":"<bash-input>ls</bash-input>"}}
 {"type":"user","message":{"role":"user","content":"<bash-stdout>a</bash-stdout><bash-stderr>boom</bash-stderr>"}}
-{"type":"user","message":{"role":"user","content":"<task-notification>\n<status>completed</status>\n<summary>Agent done</summary>\n</task-notification>"}}
+{"type":"user","isMeta":true,"message":{"role":"user","content":"<task-notification>\n<status>completed</status>\n<summary>Agent done</summary>\n</task-notification>"}}
+{"type":"user","isMeta":true,"message":{"role":"user","content":"<system-reminder>\nnote\n</system-reminder>"}}
 {"type":"user","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued"}}
 {"type":"user","message":{"role":"user","content":"why does <command-name> leak"}}
 {"type":"user","message":{"role":"user","content":"real question"}}
@@ -1400,6 +1420,7 @@ mod tests {
                     "! ls",
                     "[error] a\nboom",
                     "[notification] Agent done",
+                    "[context] note",
                     "[context] This session is being continued",
                 ],
                 vec!["why does <command-name> leak"],

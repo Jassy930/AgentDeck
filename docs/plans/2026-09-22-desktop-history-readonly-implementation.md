@@ -153,7 +153,9 @@ PR 评论修复后的验证：
   显示为 `! cmd`；`isMeta`/`isCompactSummary` 注入、命令输出、`<task-notification>` 仍以
   `UserMessage` 发出，但在 `meta.vendorExtensions.contextKind` 标为
   `context`/`output`/`error`/`notification`（常量 `CONTEXT_KIND_KEY`），桌面默认折叠，
-  `error` 标红；空输出丢弃，标题只取真实提问。旧客户端不认此键时退化为普通用户消息。
+  `error` 标红（折叠不展开）；空输出丢弃，标题只取真实提问。旧客户端不认此键时退化为普通用户消息。
+  iOS 只消费 live 事件流、不读 daemon 历史，暂不受影响；若接入历史，需在
+  `AgentItemReducer` 认 `contextKind`。`[Request interrupted by user]`、`[Image #1]` 仍按用户消息显示。
 - Codex 列表为空已定位为 provider 默认过滤，查询现在显式使用 `modelProviders=[]`。
   正文已适配稳定分页接口，版本与官方 schema 同步升级至 `0.155.0-alpha.16`；
   桌面正文点击已在 2026-09-23 补齐验收；升级后的真实 lifecycle E2E 尚未重跑。
