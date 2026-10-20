@@ -625,6 +625,7 @@ fn control_responses_and_other_control_requests_emit_nothing() {
     for line in [
         json!({"type": "control_response", "response": {"subtype": "success", "request_id": "agentdeck-1"}}),
         json!({"type": "control_request", "request_id": "r", "request": {"subtype": "hook_callback"}}),
+        json!({"type": "control_cancel_request", "request_id": "r"}),
     ] {
         let out = t.translate_line(&line.to_string());
         assert!(out.events.is_empty());

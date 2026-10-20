@@ -329,6 +329,12 @@ impl Owner {
         if let Some(route) = out.permission_route_hint {
             self.pending.insert(route.request_id.clone(), route);
         } else if let Ok(parsed) = serde_json::from_str::<Value>(line)
+            && parsed.get("type").and_then(Value::as_str) == Some("control_cancel_request")
+        {
+            if let Some(request_id) = parsed.get("request_id").and_then(Value::as_str) {
+                self.pending.remove(request_id);
+            }
+        } else if let Ok(parsed) = serde_json::from_str::<Value>(line)
             && parsed.get("type").and_then(Value::as_str) == Some("control_request")
         {
             // We register no hooks or SDK MCP servers, so any other

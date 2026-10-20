@@ -35,6 +35,8 @@
 //!     control `request_id`; the owner answers with a `control_response`.
 //!   - `"control_response"` — answers to the owner's own control requests
 //!     (initialize / interrupt / set_permission_mode); consumed silently.
+//!   - `"control_cancel_request"` — CC withdrew a pending `can_use_tool`
+//!     prompt; consumed silently, the owner drops the route.
 //!
 //! ## Cumulative semantics
 //!
@@ -195,7 +197,10 @@ impl ClaudeCodeTranslator {
             "user" => self.handle_user(&parsed),
             "result" => self.handle_result(&parsed),
             "control_request" => self.handle_control_request(&parsed),
-            "control_response" => TranslateOutput::default(),
+            // `control_response` answers our own requests; CC withdraws a
+            // pending `can_use_tool` with `control_cancel_request` (e.g.
+            // after an interrupt) and the owner drops its route.
+            "control_response" | "control_cancel_request" => TranslateOutput::default(),
             _ => self.raw_event(kind, trimmed),
         }
     }

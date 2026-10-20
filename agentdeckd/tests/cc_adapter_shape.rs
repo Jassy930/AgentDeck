@@ -174,10 +174,9 @@ async fn real_claude_emits_started_then_capabilities() {
     }
     // Use `which` to skip cleanly on CI / contributor machines that
     // don't have `claude` installed. The events we assert on
-    // (SessionStarted + SessionCapabilities) are emitted synchronously
-    // BEFORE spawn, so this test passes in milliseconds even when a
-    // real claude child is spawned — it does not depend on the model
-    // actually producing output.
+    // (SessionStarted + SessionCapabilities) are emitted right after
+    // spawn and before the owner reads any output, so this test does not
+    // depend on the model actually producing output.
     if which::which("claude").is_err() {
         println!(
             "SKIP real_claude_emits_started_then_capabilities: `claude` not in PATH (PATH={:?})",

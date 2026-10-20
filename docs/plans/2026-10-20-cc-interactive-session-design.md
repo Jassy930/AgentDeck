@@ -59,10 +59,13 @@ claude --print --input-format stream-json --output-format stream-json \
 | 中断 | `control_request{subtype:"interrupt"}` | `control_response success`，随后 `result{subtype:"error_during_execution", is_error:true}`，进程存活 |
 | 切权限模式 | `control_request{subtype:"set_permission_mode", mode}` | `control_response{response:{mode}}` |
 | 关闭 | 关闭 stdin | 进程以 0 退出 |
+| 撤回审批 | — | interrupt 时若有待决 `can_use_tool`，CC 发 `control_cancel_request{request_id}`；owner 丢弃路由 |
 
 - `persist=true` 的 approve 会把 `permission_suggestions` 原样作为 `updatedPermissions` 回传。
-  CC 按 suggestion 的 destination 落盘，实测会写到项目 `.claude/settings.local.json`。
+  CC 按 suggestion 的 destination 落盘；实测在项目 `.claude/settings.local.json` 写入
+  `permissions.allow`（如 `Bash(touch <path>)`）。
   这是 CC 原生语义，AgentDeck 不额外保存任何东西。
+- 审批待决时直接 `SessionClose`：实测 0.4 秒收口，该 turn 记为 canceled，会话 `closed`。
 - 用户 `settings.json` 里 allow 的工具（`source: config`）不会触发 `can_use_tool`。
 
 ## 生命周期与错误
@@ -82,9 +85,12 @@ claude --print --input-format stream-json --output-format stream-json \
 
 ## 已知边界
 
-- CLI 的 one-shot `agentdeck run` 在 `default` 权限模式下如果遇到需要审批的工具，会一直停在等待决定。
-  需要交互审批时请用 `session live`，或者显式指定 `--permission acceptEdits` / bypass。
+- **行为回退**：CLI one-shot `agentdeck run` 在 `default` 模式下，以前需要审批的工具会被自动拒绝，
+  现在会无限等待决定。交互审批请改用 `session live`，或显式指定 `--permission acceptEdits` / bypass。
 - `continue_thread`（旧 CLI 入口）仍然硬编码 `bypassPermissions`。
+- **P2 前置**：CC 历史的 cwd 是从 `~/.claude/projects` 的编码目录名还原的，路径含 `-` 时会还原错
+  （门控 E2E `e2e_cc_history_archive_then_rename` 因此 ENOENT）。桌面续聊 resume 依赖正确的 cwd，
+  需要先改为读取 JSONL 行内的 `cwd` 字段。
 - 累计快照每个 delta 都下发全文，和 Codex 的语义对齐；超长回复的带宽开销是 O(n²)。
 
 ## 验证
@@ -99,3 +105,5 @@ claude --print --input-format stream-json --output-format stream-json \
   - 会话内切 acceptEdits 后第三轮写文件无需审批 → succeeded；
   - `SessionClosed(closed)`，共 56 个 streaming 快照；
   - 另起 daemon 用 `resumeThreadId` 续聊，模型记得前文，`persist=true` 后同类 Bash 不再询问。
+  - `AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_claude_code`：9 项中 8 项通过（含 run/continue）；
+    `history_archive_then_rename` 因上述 cwd 还原问题失败，属既有问题。
