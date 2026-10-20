@@ -114,6 +114,11 @@ pub enum SessionOutcome {
     Failed,
 }
 
+/// `vendor_extensions` key on a `UserMessage` the CLI injected rather than
+/// the user typed (command output, notifications, context). Values:
+/// `output` / `error` / `notification` / `context`. Clients fold these.
+pub const CONTEXT_KIND_KEY: &str = "contextKind";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentItemMeta {

@@ -40,7 +40,7 @@ use std::time::SystemTime;
 
 use super::is_collaboration_tool_name;
 use agentdeck_protocol::{
-    AgentItem, AgentItemMeta, AgentKind, DiffFile, DiffStatus, HistoryListItem,
+    AgentItem, AgentItemMeta, AgentKind, CONTEXT_KIND_KEY, DiffFile, DiffStatus, HistoryListItem,
     HistoryReadResponse, HistoryTurn, ProtocolError, ShellStatus, ThreadId,
     effective_history_list_limit,
 };
@@ -320,20 +320,172 @@ fn scan_session(path: &Path) -> (Option<String>, Option<PathBuf>) {
                     custom = Some(t.to_string());
                 }
             }
-            "user" if first_user.is_none() => {
-                if let Some(s) = v
-                    .get("message")
-                    .and_then(|m| m.get("content"))
+            "user" if first_user.is_none() && !is_injected(&v) => {
+                let content = v.get("message").and_then(|m| m.get("content"));
+                first_user = content
                     .and_then(Value::as_str)
-                {
-                    let snippet: String = s.chars().take(80).collect();
-                    first_user = Some(snippet);
-                }
+                    .into_iter()
+                    .chain(
+                        content
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter(|block| {
+                                block.get("type").and_then(Value::as_str) == Some("text")
+                            })
+                            .filter_map(|block| block.get("text").and_then(Value::as_str)),
+                    )
+                    // Slash/bash command echoes are not a usable title.
+                    .filter(|s| {
+                        !split_command_caveat(s)
+                            .map_or(*s, |(_, rest)| rest)
+                            .trim_start()
+                            .starts_with('<')
+                    })
+                    .flat_map(|s| user_items(s, false))
+                    .find_map(|item| match item {
+                        AgentItem::UserMessage { text, meta }
+                            if !meta.vendor_extensions.contains_key(CONTEXT_KIND_KEY) =>
+                        {
+                            Some(text.chars().take(80).collect())
+                        }
+                        _ => None,
+                    });
             }
             _ => {}
         }
     }
     (custom.or(first_user), cwd)
+}
+
+/// CC marks injected user lines (command caveats, skill bodies, image
+/// captions, system reminders) with `isMeta: true` and the post-compaction
+/// recap with `isCompactSummary: true`; none is user input.
+fn is_injected(v: &Value) -> bool {
+    ["isMeta", "isCompactSummary"]
+        .iter()
+        .any(|k| v.get(*k).and_then(Value::as_bool).unwrap_or(false))
+}
+
+fn split_command_caveat(text: &str) -> Option<(&str, &str)> {
+    text.trim_start()
+        .strip_prefix("<local-command-caveat>")?
+        .split_once("</local-command-caveat>")
+}
+
+fn user_items(raw: &str, injected: bool) -> Vec<AgentItem> {
+    if let Some((caveat, rest)) = split_command_caveat(raw) {
+        return context_item("context", caveat)
+            .into_iter()
+            .chain(user_item(rest.trim(), injected))
+            .collect();
+    }
+    user_item(raw, injected).into_iter().collect()
+}
+
+/// Map a CC user line to a neutral item. What the user typed stays a plain
+/// `UserMessage` (slash commands as `/name args`, `!` shell as `! cmd`); CLI
+/// echoes and injected context carry [`CONTEXT_KIND_KEY`] so clients fold them.
+fn user_item(raw: &str, injected: bool) -> Option<AgentItem> {
+    let text = raw.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if text.starts_with("<task-notification>") {
+        let body: Vec<&str> = ["summary", "result"]
+            .iter()
+            .filter_map(|tag| tag_inner(text, tag))
+            .filter(|s| !s.is_empty())
+            .collect();
+        return context_item("notification", &body.join("\n\n"));
+    }
+    if injected {
+        return context_item("context", text);
+    }
+    let typed = |text: String| AgentItem::UserMessage {
+        text,
+        meta: AgentItemMeta::default(),
+    };
+    // Skill invocations lead with `<command-message>`; prose that merely
+    // mentions the tag must stay a plain prompt.
+    if ["<command-name>", "<command-message>"]
+        .iter()
+        .any(|tag| text.starts_with(tag))
+    {
+        let name = tag_inner(text, "command-name").unwrap_or_default();
+        let args = tag_inner(text, "command-args").unwrap_or_default();
+        let line = format!("{name} {args}").trim().to_string();
+        return (!line.is_empty()).then(|| typed(line));
+    }
+    if text.starts_with("<bash-input>") {
+        return tag_inner(text, "bash-input").map(|cmd| typed(format!("! {cmd}")));
+    }
+    const STDOUT: [&str; 2] = ["local-command-stdout", "bash-stdout"];
+    const STDERR: [&str; 2] = ["local-command-stderr", "bash-stderr"];
+    let tags = || STDOUT.iter().chain(&STDERR);
+    if tags().any(|tag| text.starts_with(&format!("<{tag}>"))) {
+        let inner = |tags: &[&str]| -> Vec<&str> {
+            tags.iter()
+                .filter_map(|tag| tag_inner(text, tag))
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        let (out, err) = (inner(&STDOUT), inner(&STDERR));
+        let kind = if err.is_empty() { "output" } else { "error" };
+        return context_item(kind, &[out, err].concat().join("\n"));
+    }
+    Some(typed(raw.to_string()))
+}
+
+fn context_item(kind: &str, text: &str) -> Option<AgentItem> {
+    let text = unwrap_tag(text.trim());
+    if text.is_empty() {
+        return None;
+    }
+    let mut meta = AgentItemMeta::default();
+    meta.vendor_extensions
+        .insert(CONTEXT_KIND_KEY.into(), Value::from(kind));
+    Some(AgentItem::UserMessage {
+        text: text.into(),
+        meta,
+    })
+}
+
+/// Typed input opens a new turn; folded context joins the current one.
+fn push_user_item(item: AgentItem, current: &mut Vec<AgentItem>, turns: &mut Vec<HistoryTurn>) {
+    let typed = matches!(&item, AgentItem::UserMessage { meta, .. }
+        if !meta.vendor_extensions.contains_key(CONTEXT_KIND_KEY));
+    if typed && !current.is_empty() {
+        turns.push(HistoryTurn {
+            items: std::mem::take(current),
+        });
+    }
+    current.push(item);
+}
+
+/// `<system-reminder>…</system-reminder>` → its body, so the folded
+/// summary line shows content rather than the tag.
+fn unwrap_tag(text: &str) -> &str {
+    let Some(tag) = text
+        .strip_prefix('<')
+        .and_then(|rest| rest.split_once('>'))
+        .map(|(tag, _)| tag)
+        .filter(|tag| {
+            !tag.is_empty() && tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+    else {
+        return text;
+    };
+    match text[tag.len() + 2..].split_once(&format!("</{tag}>")) {
+        Some((inner, "")) => inner.trim(),
+        _ => text,
+    }
+}
+
+fn tag_inner<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let start = text.find(&format!("<{tag}>"))? + tag.len() + 2;
+    let end = start + text[start..].find(&format!("</{tag}>"))?;
+    Some(text[start..end].trim())
 }
 
 fn is_memory_agent_session(path: &Path) -> bool {
@@ -452,13 +604,11 @@ pub fn parse_session_jsonl(
                 //      with `type:"tool_result"` blocks → fold into
                 //      the current turn (don't open a new one)
                 let content_val = v.get("message").and_then(|m| m.get("content"));
+                let injected = is_injected(&v);
                 if let Some(text) = content_val.and_then(Value::as_str) {
-                    // New turn boundary.
-                    flush(&mut current, &mut turns);
-                    current.push(AgentItem::UserMessage {
-                        text: text.to_string(),
-                        meta: AgentItemMeta::default(),
-                    });
+                    for item in user_items(text, injected) {
+                        push_user_item(item, &mut current, &mut turns);
+                    }
                 } else if let Some(arr) = content_val.and_then(Value::as_array) {
                     for block in arr {
                         if block.get("type").and_then(Value::as_str) == Some("tool_result") {
@@ -484,13 +634,9 @@ pub fn parse_session_jsonl(
                             }
                         } else if block.get("type").and_then(Value::as_str) == Some("text") {
                             // Plain user prompt that arrived as a block array.
-                            if let Some(t) = block.get("text").and_then(Value::as_str) {
-                                if !t.is_empty() {
-                                    flush(&mut current, &mut turns);
-                                    current.push(AgentItem::UserMessage {
-                                        text: t.to_string(),
-                                        meta: AgentItemMeta::default(),
-                                    });
+                            if let Some(text) = block.get("text").and_then(Value::as_str) {
+                                for item in user_items(text, injected) {
+                                    push_user_item(item, &mut current, &mut turns);
                                 }
                             }
                         }
@@ -1261,6 +1407,123 @@ mod tests {
         assert_eq!(resp.turns.len(), 2);
         assert_eq!(resp.turns[0].items.len(), 2);
         assert_eq!(resp.turns[1].items.len(), 2);
+    }
+
+    #[test]
+    fn parse_session_jsonl_folds_cli_context_and_keeps_typed_commands() {
+        let jsonl = r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat: x</local-command-caveat>"}}
+{"type":"user","message":{"role":"user","content":"<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args>opus</command-args>"}}
+{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set model</local-command-stdout>"}}
+{"type":"user","message":{"role":"user","content":"<local-command-stdout></local-command-stdout>"}}
+{"type":"user","message":{"role":"user","content":"<bash-input>ls</bash-input>"}}
+{"type":"user","message":{"role":"user","content":"<bash-stdout>a</bash-stdout><bash-stderr>boom</bash-stderr>"}}
+{"type":"user","isMeta":true,"message":{"role":"user","content":"<task-notification>\n<status>completed</status>\n<summary>Agent done</summary>\n</task-notification>"}}
+{"type":"user","isMeta":true,"message":{"role":"user","content":"<system-reminder>\nnote\n</system-reminder>"}}
+{"type":"user","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued"}}
+{"type":"user","message":{"role":"user","content":"why does <command-name> leak"}}
+{"type":"user","message":{"role":"user","content":"real question"}}
+"#;
+        let resp = parse_session_jsonl(jsonl, ThreadId("abc".into())).unwrap();
+        let items: Vec<_> = resp
+            .turns
+            .iter()
+            .map(|t| {
+                t.items
+                    .iter()
+                    .map(|i| match i {
+                        AgentItem::UserMessage { text, meta } => {
+                            match meta.vendor_extensions.get(CONTEXT_KIND_KEY) {
+                                Some(kind) => format!("[{}] {text}", kind.as_str().unwrap()),
+                                None => text.clone(),
+                            }
+                        }
+                        other => panic!("unexpected {other:?}"),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            items,
+            [
+                vec!["[context] Caveat: x"],
+                vec!["/model opus", "[output] Set model"],
+                vec![
+                    "! ls",
+                    "[error] a\nboom",
+                    "[notification] Agent done",
+                    "[context] note",
+                    "[context] This session is being continued",
+                ],
+                vec!["why does <command-name> leak"],
+                vec!["real question"],
+            ]
+        );
+
+        let dir = tempdir_unique();
+        let path = dir.join("s.jsonl");
+        std::fs::write(&path, jsonl).unwrap();
+        assert_eq!(
+            scan_session(&path).0.as_deref(),
+            Some("why does <command-name> leak")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mixed_caveat_keeps_context_user_text_and_title() {
+        let raw = "<local-command-caveat>Caveat: x</local-command-caveat>\n\n请继续处理剩下的问题";
+        for content in [
+            serde_json::json!(raw),
+            serde_json::json!([{ "type": "text", "text": raw }]),
+        ] {
+            let jsonl = serde_json::json!({
+                "type": "user",
+                "message": { "role": "user", "content": content },
+            })
+            .to_string();
+            let response = parse_session_jsonl(&jsonl, ThreadId("mixed".into())).unwrap();
+            let items: Vec<_> = response.turns.iter().flat_map(|turn| &turn.items).collect();
+            assert_eq!(items.len(), 2, "caveat 和真实正文都必须保留");
+            assert!(matches!(items[0], AgentItem::UserMessage { text, meta }
+                if text == "Caveat: x" && meta.vendor_extensions[CONTEXT_KIND_KEY] == "context"));
+            assert!(matches!(items[1], AgentItem::UserMessage { text, meta }
+                if text == "请继续处理剩下的问题" && !meta.vendor_extensions.contains_key(CONTEXT_KIND_KEY)));
+
+            let dir = tempdir_unique();
+            let path = dir.join("mixed.jsonl");
+            std::fs::write(&path, jsonl).unwrap();
+            assert_eq!(
+                scan_session(&path).0.as_deref(),
+                Some("请继续处理剩下的问题")
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn folded_context_and_command_output_preserve_sibling_tags() {
+        let siblings =
+            "<system-reminder>first</system-reminder>\n<system-reminder>second</system-reminder>";
+        for (raw, injected, kind) in [
+            (siblings.to_string(), true, "context"),
+            (
+                format!("<local-command-stdout>{siblings}</local-command-stdout>"),
+                false,
+                "output",
+            ),
+        ] {
+            assert!(
+                matches!(user_item(&raw, injected), Some(AgentItem::UserMessage { text, meta })
+                if text == siblings && meta.vendor_extensions[CONTEXT_KIND_KEY] == kind)
+            );
+        }
+        assert_eq!(
+            unwrap_tag("<system-reminder> note </system-reminder>"),
+            "note"
+        );
+        let nested =
+            "<system-reminder>first<system-reminder>second</system-reminder>end</system-reminder>";
+        assert_eq!(unwrap_tag(nested), nested);
     }
 
     #[test]

@@ -85,7 +85,7 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
 当前明确不包含：
 
 - vendor 控制面板。
-- 用户消息中注入上下文块（如 `<system-reminder>`）的识别与折叠、会话正文全文搜索与按项目分组。
+- 会话正文全文搜索与按项目分组。
 - daemon 网络监听和配对流程。
 - 对旧 AppKit 界面或行为的兼容层。
 
@@ -283,8 +283,9 @@ desktop 已通过 typed local client 接入 daemon 的历史读取、新建会�
 1. 桌面只读历史已落地（侧栏真实会话列表 + 会话记录），实现与坑点见
    [只读历史接入记录](docs/plans/2026-09-22-desktop-history-readonly-implementation.md)。
    Codex 列表查询包含全部 provider，正文通过稳定分页接口读取；未验证版本仅 warning。
-   升级后的真实历史读回和桌面点击验收边界见实施记录；Claude Code 的会话标题常带
-   `<local-command-caveat>` 噪声，需在 daemon 侧收敛。
+   升级后的真实历史读回和桌面点击验收边界见实施记录；Claude Code 的 CLI 命令噪声已在 daemon
+   历史解析中收敛（2026-10-20）：用户输入的命令保留，注入上下文与命令输出以 `contextKind`
+   标记、桌面默认折叠。
 2. 持久 CLI 四轮曾在 0.145.0 的临时配置覆盖环境通过，包含累计 streaming、同 PID/threadId
    复用、取消后继续、回收与记录读回；升级后的 lifecycle E2E 尚未重跑，
    证据见 [M0 CLI 实施记录](docs/plans/2026-09-21-backend-m0-cli-implementation.md)。

@@ -148,9 +148,18 @@ PR 评论修复后的验证：
 
 ## 已知缺口与后续
 
-- Claude Code 会话标题常常是 `<local-command-caveat>Caveat: …`。这是
-  `agentdeckd/src/claude_code/history.rs` 的标题抽取问题，应在 daemon 侧修，不要在
-  desktop 打补丁。
+- ~~Claude Code 会话标题常常是 `<local-command-caveat>Caveat: …`~~ 已修（2026-10-20）：
+  `agentdeckd/src/claude_code/history.rs` 把用户输入的斜杠命令显示为 `/name args`、`!` 命令
+  显示为 `! cmd`；`isMeta`/`isCompactSummary` 注入、命令输出、`<task-notification>` 仍以
+  `UserMessage` 发出，但在 `meta.vendorExtensions.contextKind` 标为
+  `context`/`output`/`error`/`notification`（常量 `CONTEXT_KIND_KEY`），桌面默认折叠，
+  `error` 标红，默认折叠且可展开；空输出丢弃，标题只取真实提问。命令 caveat 单独折叠，
+  后续真实正文保留为普通用户消息并可作为标题。只有完整包裹文本的单一外层标签才解包，
+  同名兄弟标签保留完整原文。旧客户端不认此键时退化为普通用户消息。
+  iOS 只消费 live 事件流、不读 daemon 历史，暂不受影响；若接入历史，需在
+  `AgentItemReducer` 认 `contextKind`。`[Request interrupted by user]`、`[Image #1]` 仍按用户消息显示。
+  验证：历史解析 24 项测试、完整离线门禁（含 desktop 94 项）、CLI 与 desktop selfcheck、协议快照核对、bundle verify、Swift 77 项 XCTest 与 31 项 Swift Testing 均通过。
+  隔离 fake daemon 的实窗确认普通问题与命令保持展开，输出、上下文、通知默认折叠，错误标红；展开后同名兄弟标签、反引号与末尾标记完整可见。此窗口验证只证明桌面渲染；caveat 后正文与标题保留由解析回归测试覆盖，未运行真实 vendor E2E。
 - Codex 列表为空已定位为 provider 默认过滤，查询现在显式使用 `modelProviders=[]`。
   正文已适配稳定分页接口，版本与官方 schema 同步升级至 `0.155.0-alpha.16`；
   桌面正文点击已在 2026-09-23 补齐验收；升级后的真实 lifecycle E2E 尚未重跑。

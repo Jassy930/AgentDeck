@@ -12,6 +12,7 @@ pub mod vendor;
 
 pub use capabilities::{CapabilityId, SessionCapabilities, VendorCapabilities};
 pub use trunk::AgentKind;
+pub use trunk::CONTEXT_KIND_KEY;
 pub use trunk::ClientCommand;
 pub use trunk::{
     ActionDecision, ActionDecisionKind, ActionKind, ActionRequest, ActionRequestVendor,

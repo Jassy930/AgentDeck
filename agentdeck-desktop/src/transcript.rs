@@ -9,7 +9,9 @@ use std::rc::Rc;
 
 mod markdown_fallback;
 
-use agentdeck_protocol::{AgentItem, AgentKind, HistoryTurn, PlanStepStatus, ShellStatus};
+use agentdeck_protocol::{
+    AgentItem, AgentKind, CONTEXT_KIND_KEY, HistoryTurn, PlanStepStatus, ShellStatus,
+};
 use gpui::{
     ClipboardItem, ElementId, IntoElement, ListState, ParentElement, SharedString, Window, div,
     list, prelude::*, px, relative,
@@ -97,7 +99,33 @@ impl Block {
 
 pub fn describe(item: &AgentItem) -> Block {
     match item {
-        AgentItem::UserMessage { text, .. } => Block::message("你", text, false),
+        AgentItem::UserMessage { text, meta } => {
+            match meta
+                .vendor_extensions
+                .get(CONTEXT_KIND_KEY)
+                .and_then(|kind| kind.as_str())
+            {
+                // CLI 注入的上下文、命令输出与通知不是用户输入，按过程块默认折叠。
+                Some(kind) => {
+                    let label = match kind {
+                        "output" | "error" => "命令输出",
+                        "notification" => "通知",
+                        _ => "上下文",
+                    };
+                    let summary = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+                    Block {
+                        status: (kind == "error").then(|| "错误".into()),
+                        failed: kind == "error",
+                        ..Block::detail(
+                            label,
+                            summary.to_string(),
+                            fence("", &truncate(text.trim())),
+                        )
+                    }
+                }
+                None => Block::message("你", text, false),
+            }
+        }
         AgentItem::AssistantMessage { text, .. } => Block::message("助手", text, true),
         AgentItem::Raw { raw_kind, .. } => Block {
             unsupported: true,
@@ -798,8 +826,8 @@ fn edge_fade(top: bool, cx: &gpui::App) -> gpui::Div {
 #[cfg(test)]
 mod tests {
     use super::{
-        BODY_LIMIT, Block, VisibleRows, append, collapsed_indices, describe, fence, is_binary,
-        prepare, truncate,
+        BODY_LIMIT, Block, CONTEXT_KIND_KEY, VisibleRows, append, collapsed_indices, describe,
+        fence, is_binary, prepare, truncate,
     };
     use agentdeck_protocol::{
         AgentItem, AgentItemMeta, HistoryTurn, PlanStep, PlanStepStatus, ShellStatus,
@@ -1065,6 +1093,35 @@ mod tests {
             blocks[1].group_summary,
             Some(("3 步 · 思考 1 · 命令 2".into(), 1))
         );
+    }
+
+    #[test]
+    fn cli_context_user_messages_fold_but_typed_commands_stay() {
+        let context = |kind: &str, text: &str| {
+            let mut meta = meta();
+            meta.vendor_extensions
+                .insert(CONTEXT_KIND_KEY.into(), kind.into());
+            describe(&AgentItem::UserMessage {
+                text: text.into(),
+                meta,
+            })
+        };
+        let typed = describe(&AgentItem::UserMessage {
+            text: "/model opus".into(),
+            meta: meta(),
+        });
+        assert_eq!((typed.label, typed.summary), ("你", None));
+
+        let output = context("output", "Set model\nmore");
+        assert_eq!(output.label, "命令输出");
+        assert_eq!(output.summary, Some("Set model".into()));
+        assert!(!output.failed);
+        assert!(output.body.contains("Set model\nmore"));
+
+        let error = context("error", "boom");
+        assert!(error.failed);
+        assert_eq!(context("notification", "done").label, "通知");
+        assert_eq!(context("context", "<x>y</x>").label, "上下文");
     }
 
     #[test]
