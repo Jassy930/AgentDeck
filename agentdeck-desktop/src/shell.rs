@@ -10,14 +10,14 @@ use std::time::{Duration, Instant};
 
 use agentdeck_protocol::{
     AgentKind, ClientCommand, HistoryListItem, HistoryWarning, MAX_HISTORY_LIST_LIMIT, ServerEvent,
-    ThreadId,
+    SessionCapabilities, ThreadId,
 };
 use gpui::{
     App, Context, Entity, FocusHandle, IntoElement, ListAlignment, ListState, ParentElement,
     ScrollStrategy, SharedString, UniformListScrollHandle, Window, div, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme, Colorize, Icon, InteractiveElementExt, Sizable, StyledExt,
+    ActiveTheme, Colorize, Disableable, Icon, InteractiveElementExt, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -28,6 +28,7 @@ use crate::daemon;
 use crate::live::LiveSession;
 use crate::machines;
 use crate::remotes;
+use crate::session_router::SessionRouter;
 use crate::sidebar;
 use crate::transcript;
 use crate::versions;
@@ -239,6 +240,7 @@ pub(crate) struct AgentHistory {
     pub warnings: Vec<HistoryWarning>,
     /// CLI 实际安装版本；None 表示仍在查询，查询失败记为 "unknown"。
     pub version: Option<String>,
+    capabilities: Option<Result<SessionCapabilities, String>>,
     pub operation: Option<AgentOperation>,
     /// 保留执行的操作，重查版本后仍能正确显示安装或更新结果。
     pub operation_result: Option<(AgentOperation, Result<String, String>)>,
@@ -254,6 +256,7 @@ impl AgentHistory {
             has_more: false,
             warnings: Vec::new(),
             version: None,
+            capabilities: None,
             operation: None,
             operation_result: None,
         }
@@ -763,19 +766,6 @@ impl Shell {
         let Some(host) = self.machine(machine_id).map(|machine| machine.host.clone()) else {
             return;
         };
-        if let ServerEvent::Error {
-            session_id: None,
-            error,
-        } = &event
-        {
-            if error.code == daemon::DISCONNECTED {
-                for live in self.live.iter_mut().filter(|live| live.key.0 == host) {
-                    live.disconnected("与机器的连接已断开，再发消息会重新连接");
-                }
-                self.refresh_live_view(cx);
-            }
-            return;
-        }
         let Some(session_id) = crate::live::event_session(&event).cloned() else {
             return;
         };
@@ -873,13 +863,19 @@ impl Shell {
         if text.is_empty() {
             return;
         }
+        let initial = match &self.stage {
+            Stage::Session { session, .. } => self
+                .initial_capabilities(session)
+                .and_then(|result| result.as_ref().ok())
+                .cloned(),
+            _ => None,
+        };
         let Some((live, cwd, client)) = self.current_live() else {
             return;
         };
-        if live.running.is_some() {
+        let Some(command) = live.send(text, cwd, initial.as_ref()) else {
             return;
-        }
-        let command = live.send(text, cwd);
+        };
         self.composer
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.dispatch(client, command, cx);
@@ -966,16 +962,34 @@ impl Shell {
         .detach();
     }
 
-    /// 机器页展示用；失败只影响版本显示，不影响会话读取。
+    fn initial_capabilities(
+        &self,
+        session: &Session,
+    ) -> Option<&Result<SessionCapabilities, String>> {
+        self.machines
+            .iter()
+            .find(|machine| machine.host == session.host)?
+            .agents
+            .iter()
+            .find(|agent| agent.kind == session.item.agent_kind)?
+            .capabilities
+            .as_ref()
+    }
+
+    /// 同一次能力查询供机器页显示版本和首次续聊路由；失败不影响历史读取。
     fn load_agent_version(&mut self, id: u64, kind: AgentKind, cx: &mut Context<Self>) {
-        let Some(machine) = self.machine(id) else {
+        let Some(machine) = self.machine_mut(id) else {
             return;
         };
+        if let Some(agent) = machine.agents.iter_mut().find(|agent| agent.kind == kind) {
+            agent.capabilities = None;
+        }
         let client = machine.client.clone();
+        cx.notify();
         cx.spawn(async move |this, cx| {
-            let version = cx
+            let capabilities = cx
                 .background_executor()
-                .spawn(async move { client.agent_version(kind) })
+                .spawn(async move { client.agent_capabilities(kind) })
                 .await;
             this.update(cx, |shell, cx| {
                 let agent = shell
@@ -983,7 +997,13 @@ impl Shell {
                     .and_then(|machine| machine.agents.iter_mut().find(|a| a.kind == kind));
                 if let Some(agent) = agent {
                     // 查询失败也要明示拿不到，不能留空或显示默认版本。
-                    agent.version = Some(version.unwrap_or_else(|_| "unknown".into()));
+                    agent.version = Some(
+                        capabilities
+                            .as_ref()
+                            .map(|caps| caps.agent_version.clone())
+                            .unwrap_or_else(|_| "unknown".into()),
+                    );
+                    agent.capabilities = Some(capabilities);
                     cx.notify();
                 }
             })
@@ -1141,6 +1161,7 @@ impl Shell {
                     agent.operation = None;
                     agent.operation_result = Some((operation, result));
                     agent.version = None;
+                    agent.capabilities = None;
                     shell.load_agent_version(id, kind, cx);
                     shell.load_agent_sessions(id, kind, cx);
                 }
@@ -1826,9 +1847,46 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let live = self.live.iter().find(|live| session.is(&live.key));
+        let initial_result = self.initial_capabilities(session);
+        let initial = initial_result.and_then(|result| result.as_ref().ok());
+        let router = match live {
+            Some(live) => live.router(initial),
+            None => initial.map(SessionRouter),
+        };
         let running = live.is_some_and(|live| live.running.is_some());
-        let action = live.and_then(|live| live.action.clone());
+        let can_send = live.map_or_else(
+            || {
+                router.as_ref().is_some_and(|router| {
+                    router.supports_messages() && router.start_options().is_ok()
+                })
+            },
+            |live| live.can_send(initial),
+        );
+        let can_cancel = live.is_some_and(|live| live.cancel().is_some());
+        let retry_capabilities = initial_result
+            .filter(|result| result.is_err())
+            .and_then(|_| {
+                self.machines
+                    .iter()
+                    .find(|machine| machine.host == session.host)
+            })
+            .map(|machine| (machine.id, session.item.agent_kind));
+        let action = live.and_then(|live| live.action().cloned());
         let error = live.and_then(|live| live.error.clone());
+        let notice = match &router {
+            None if live.is_some_and(|live| live.session_id.is_some()) => {
+                Some("正在建立会话…".to_string())
+            }
+            None => Some(match initial_result {
+                Some(Err(error)) => format!("无法读取会话能力：{error}"),
+                _ => "正在读取会话能力…".into(),
+            }),
+            Some(router) if !router.supports_messages() => Some("当前来源不支持流式续聊".into()),
+            Some(router) if live.is_none_or(|live| live.session_id.is_none()) => {
+                router.start_options().err()
+            }
+            _ => None,
+        };
         let theme = cx.theme();
         let (border, surface, danger, warning) =
             (theme.border, theme.secondary, theme.danger, theme.warning);
@@ -1841,6 +1899,25 @@ impl Shell {
             .pt_2()
             .pb_4()
             .gap_2()
+            .when_some(notice, |section, notice| {
+                section.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(notice),
+                )
+            })
+            .when_some(retry_capabilities, |section, (id, kind)| {
+                section.child(
+                    Button::new("retry-capabilities")
+                        .small()
+                        .outline()
+                        .label("重试读取能力")
+                        .on_click(cx.listener(move |shell, _, _, cx| {
+                            shell.load_agent_version(id, kind, cx)
+                        })),
+                )
+            })
             .when_some(action, |section, action| {
                 section.child(
                     h_flex()
@@ -1909,12 +1986,14 @@ impl Shell {
                     .child(Input::new(&self.composer).appearance(false).flex_1())
                     .child(if running {
                         Button::new("stop-turn")
+                            .disabled(!can_cancel)
                             .small()
                             .outline()
                             .label("停止")
                             .on_click(cx.listener(|shell, _, _, cx| shell.stop_turn(cx)))
                     } else {
                         Button::new("send-message")
+                            .disabled(!can_send)
                             .small()
                             .primary()
                             .label("发送")

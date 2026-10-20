@@ -63,7 +63,9 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
   完整状态、兼容性警告和读取错误；顶部是常驻的远端连接输入框。
 - 会话态底部是续聊输入框（Enter 发送、⌘Enter 换行，运行中切为“停止”）：首次发送以
   `SessionStart` 续上原 thread，之后同一 daemon 会话内 `TurnStart`；流式条目接在历史记录之后，
-  工具审批在输入框上方显示“允许 / 拒绝”，错误显示在输入框上方。空态提示“在侧栏打开会话即可续聊”。
+  按 agent 与会话声明的能力启用续聊和审批；能力尚未加载或不支持时禁用相应操作，查询失败可就地重试。
+  工具审批在输入框上方按到达顺序逐项显示“允许 / 拒绝”，断线或发送失败清除待决审批；
+  错误显示在输入框上方。空态提示“在侧栏打开会话即可续聊”。
 - 透明标题栏下为红绿灯留出顶部空间，空态与会话态顶部均按系统偏好处理双击；
   打开窗口后搜索框默认聚焦。
 - 支持通过 `Command+Q` 或 AgentDeck 菜单中的“退出 AgentDeck”退出应用。
@@ -76,7 +78,7 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
 
 当前明确不包含：
 
-- 启动会话、发送 turn、streaming、审批和 vendor 控制；也没有 composer 输入框。
+- 新建会话和 vendor 控制面板。
 - 用户消息中注入上下文块（如 `<system-reminder>`）的识别与折叠、会话正文全文搜索与按项目分组。
 - daemon 网络监听和配对流程。
 - 对旧 AppKit 界面或行为的兼容层。
@@ -96,7 +98,7 @@ diagnostics 等较宽的代码表面。Codex 路径已经落地 protocol v4 的 
 ## 仓库结构
 
 ```text
-agentdeck-desktop/       Rust/GPUI macOS 客户端（外壳 + daemon 只读历史）
+agentdeck-desktop/       Rust/GPUI macOS 客户端（历史读取 + 已有会话续聊）
 agentdeck-protocol/      AgentDeck 中立 IPC 类型与 schema 事实源
 agentdeckd/              Codex / Claude Code adapter daemon
 agentdeck-cli/           参考客户端与 E2E 驱动
