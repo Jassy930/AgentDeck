@@ -591,8 +591,12 @@ pub fn render(
         // 读完历史时列表按历史块数重置过，这时可能已拼上了运行中的 live 轮次。
         if rows.sync(&blocks) || state.item_count() != rows.indices.len() {
             // 原本停在底部才跟随新内容；往上翻看时保持原位置。按旧行高判断，须在 reset 之前。
-            let at_bottom = -state.scroll_px_offset_for_scrollbar().y
-                >= state.max_offset_for_scrollbar().height - px(1.);
+            // max_offset_for_scrollbar 不含列表上下内边距，真实滚动上限要再加回来；
+            // 它为 0 时内容不足一屏（最多能滚动内边距那点距离），视为在底部。
+            let max = state.max_offset_for_scrollbar().height;
+            let at_bottom = max == px(0.)
+                || -state.scroll_px_offset_for_scrollbar().y
+                    >= max + px(EDGE_FADE_HEIGHT * 2.) - px(1.);
             if let Some(block) = anchor_block {
                 let row = row_for_block(&rows.indices, block);
                 if rows.indices.get(row) != Some(&block) {
