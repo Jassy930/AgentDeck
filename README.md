@@ -17,8 +17,8 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
 - 初始化 `gpui-component` 并挂载 `Root`。
 - 界面固定使用深色，配色来自设计系统 SSOT 生成的 codex 颜色；警告使用与品牌橙区分的琥珀色。
 - 渲染外壳布局：全高左侧栏（品牌行 / 新建会话与搜索框 / 按日期分组的会话列表 /
-  底部页面入口图标）、空态（统计胶囊与居中标题、按已注册 agent 生成的固定列栅格过滤卡片，卡片随窗口收窄，内容过高时可纵向滚动、续聊提示胶囊），
-  会话态（thread header 与 agent / 项目 / 机器标签、用户消息右对齐气泡且每轮首条助手消息标注 agent 身份的会话记录、底部续聊输入框与审批条），以及机器管理页。
+  底部页面入口图标）、空态（统计胶囊与居中标题、按已注册 agent 生成的固定列栅格卡片，卡片主体筛选会话、右上角“＋”新建会话，卡片随窗口收窄，内容过高时可纵向滚动），
+  会话态（thread header 与 agent / 项目 / 机器标签、用户消息右对齐气泡且每轮首条助手消息标注 agent 身份的会话记录、底部消息输入框与审批条），以及机器管理页。
 - **接入本机及 SSH 远端 `agentdeckd` 的只读历史**：启动时先问各机器的 daemon 注册了哪些 agent，再按
   agent 分别拉取会话列表（首批各显示 50 条），谁先返回谁先进侧栏；侧栏提供“刷新”按钮重新读取各机器的最新会话列表，刷新期间及失败时保留已有会话与计数；固定在列表下方的
   “加载更多”为仍有更多的来源（有 agent 过滤时只为该来源）各扩展 50 条。读完或达到
@@ -61,14 +61,17 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
   远端 agentdeckd 安装期间暂不能断开该机器，安装结束后恢复，结果保留在机器卡片中。
   机器页每台机器一张卡片：状态胶囊、名称、重试 / 断开、完整连接错误，以及各 agent 的
   完整状态、兼容性警告和读取错误；顶部是常驻的远端连接输入框。
-- 会话态底部是续聊输入框（Enter 发送、⌘Enter 换行，运行中切为“停止”）：首次发送以
-  `SessionStart` 续上原 thread，之后同一 daemon 会话内 `TurnStart`；流式条目接在历史记录之后，
-  按 agent 与会话声明的能力启用续聊和审批；能力查询失败可就地重试。
+- 点击主页 agent 卡片右上角“＋”，在对应机器与 agent 上新建会话。发送首条消息前可填写工作目录绝对路径：
+  默认取该来源最近会话的目录，本机无历史时使用 HOME，远端无历史时留空待填；目录为空时不能发送。
+  首条消息发出后等待 daemon 返回真实 threadId，再将会话加入侧栏；初始标题取首条消息的首行。
+- 会话态底部是消息输入框（Enter 发送、⌘Enter 换行，运行中切为“停止”）：首次发送使用
+  `SessionStart`，已有会话携带原 threadId 续聊，新建会话不带 resumeThreadId；之后同一 daemon 会话内发 `TurnStart`。
+  流式条目接在历史记录之后，按 agent 与会话声明的能力启用发送和审批；能力查询失败可就地重试。
   工具审批按到达顺序在输入框上方显示审批卡（命令、patch、写入内容或计划全文；拒绝 / 允许 / 总是允许，计划为
   继续规划 / 开始执行，agent 提问时与 Claude Code TUI 一样一题一页、tab 切换，多题末尾有汇总提交页，支持键盘操作和“其他”自由输入，也可跳过；拒绝时输入框文字作为反馈），错误显示在输入框上方。输入框左侧是权限模式选择器
   （启动前使用 agent 能力，启动后使用会话握手能力；默认 / 接受编辑 / 计划 / 自动 / 不询问 / 跳过权限，跳过权限需二次确认），
   会话开始后的模式只跟 daemon 推送的事件变化；只有点击确认条的“确认开启”才切到跳过权限。
-  断线或发送失败清除待决审批。daemon 协议未知或不是 v8 时禁用交互，历史仍可读取；发送前会在实际连接上再次确认协议。空态提示“在侧栏打开会话即可续聊”。
+  断线或发送失败清除待决审批。daemon 协议未知或不是 v8 时禁用交互，历史仍可读取；发送前会在实际连接上再次确认协议。
 - 透明标题栏下为红绿灯留出顶部空间，空态与会话态顶部均按系统偏好处理双击；
   打开窗口后搜索框默认聚焦。
 - 支持通过 `Command+Q` 或 AgentDeck 菜单中的“退出 AgentDeck”退出应用。
@@ -81,7 +84,7 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
 
 当前明确不包含：
 
-- 新建会话和 vendor 控制面板。
+- vendor 控制面板。
 - 用户消息中注入上下文块（如 `<system-reminder>`）的识别与折叠、会话正文全文搜索与按项目分组。
 - daemon 网络监听和配对流程。
 - 对旧 AppKit 界面或行为的兼容层。
@@ -101,7 +104,7 @@ diagnostics 等较宽的代码表面。Codex 路径已经落地 protocol v4 的 
 ## 仓库结构
 
 ```text
-agentdeck-desktop/       Rust/GPUI macOS 客户端（历史读取 + 已有会话续聊）
+agentdeck-desktop/       Rust/GPUI macOS 客户端（历史读取、新建会话与续聊）
 agentdeck-protocol/      AgentDeck 中立 IPC 类型与 schema 事实源
 agentdeckd/              Codex / Claude Code adapter daemon
 agentdeck-cli/           参考客户端与 E2E 驱动
@@ -273,10 +276,9 @@ workspace，空值、`false` 和其他值跑全部 gated integration targets，�
 不存在。普通 Cargo 测试中的 E2E 提前跳过仍会显示 passed，因此该结果不等于真实
 Codex / Claude Code E2E 证据；完整边界见 [docs/QUALITY.md](docs/QUALITY.md)。
 
-## 下一条纵向切片
+## 当前桌面切片
 
-desktop 已经通过 typed local client 接入 daemon 的只读历史，下一步是把写入侧接上，
-而不是恢复旧客户端的全部功能：
+desktop 已通过 typed local client 接入 daemon 的历史读取、新建会话与续聊，相关实现与验收边界如下：
 
 1. 桌面只读历史已落地（侧栏真实会话列表 + 会话记录），实现与坑点见
    [只读历史接入记录](docs/plans/2026-09-22-desktop-history-readonly-implementation.md)。
@@ -288,9 +290,9 @@ desktop 已经通过 typed local client 接入 daemon 的只读历史，下一�
    复用、取消后继续、回收与记录读回；升级后的 lifecycle E2E 尚未重跑，
    证据见 [M0 CLI 实施记录](docs/plans/2026-09-21-backend-m0-cli-implementation.md)。
 3. Claude Code 续聊已接入（2026-10-20）：daemon 以 stream-json 双向常驻会话驱动 CC，
-   桌面接上事件流、输入框、停止与审批，见
-   [CC 交互会话设计](docs/plans/2026-10-20-cc-interactive-session-design.md)。下一步是新建会话
-   （目录选择）与 Codex 会话验收。
+   桌面接上事件流、输入框、停止与审批，并提供从主页 agent 卡片新建会话与填写工作目录的入口，见
+   [CC 交互会话设计](docs/plans/2026-10-20-cc-interactive-session-design.md)。新建入口的实现不代表真实 vendor 验收完成；
+   Codex 桌面会话仍待真实链路验收。
 
 `agentdeck session live` 的 stdin 接受现有 `ClientCommand` JSONL，stdout 连续输出协议
 事件和管理回复。客户端收到 `TurnFinished(nextState=ready)` 后可发送下一条 `TurnStart`；

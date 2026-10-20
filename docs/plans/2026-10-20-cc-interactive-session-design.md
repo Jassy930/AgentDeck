@@ -244,3 +244,17 @@ desktop live 测试（开始前本地、开始后事件驱动）；经 daemon �
   三题实际 IPC 答案精确匹配 `scroll-draft`、`选项 A, 选项 D`、`确认`，随后普通审批正常处理。
   单题无 tab，方向键移动到 D 后名称与说明可见，Enter 直接提交的唯一答案为 `选项 D`。
 - 本轮未运行真实 vendor E2E 或 iOS simulator 测试；实窗使用隔离数据目录与 fake daemon，只证明本地 IPC/UI 路径。
+
+## P4 桌面新建会话（2026-10-20）
+
+- 入口：主页每张 agent 卡片右上角的“+”（卡片本身仍是筛选），daemon 协议不支持交互时禁用。
+- 复用会话页：`Stage::Session { draft: true }`，记录为空，thread id 是 `draft-<n>` 占位，不发 history read。
+  输入栏上方显示工作目录输入框，默认取该机器该 agent 最近一次会话的 cwd，本机无历史时取 `$HOME`，远端无历史时留空必填。
+- 首发时 `LiveSession.draft` 带上侧栏条目，`SessionStart.resumeThreadId = None`；会话没起来时下次发送仍按新会话启动。
+- `SessionStarted.threadId` 到达后 `adopt_thread` 把 live key 换成真实 id，Shell 同步替换当前会话页、侧栏游标，并把条目插到侧栏顶部。
+  刷新该来源时，`replace_source_sessions` 保留历史尚未返回但仍有 `session_id` 的活动侧栏会话，按完整 `SessionKey`（机器、agent、threadId）去重，历史返回的元数据优先。
+  会话关闭或断线后不再保留本地补充项；下次刷新若历史仍无此项即移除，其他机器与 agent 的会话不受影响。
+- 协议无改动：Codex 与 CC 的 `SessionStarted` 都带 thread id。工作目录不做客户端校验，不存在时由 daemon 启动失败报错并显示在错误行。
+- 验证：desktop 93 项测试（含 draft 不带 resume、adopt 换 key、慢历史快照保留活动会话与去重）、desktop selfcheck、真实 bundle verify、Swift XCTest 77 项与 Swift Testing 31 项均通过。
+  隔离 fake daemon 的实窗验证覆盖 Codex 与 CC 从空历史新建、工作目录编辑与空值禁用、真实 threadId 入侧栏、重开后同 session 第二轮、启动失败后重试，以及刷新不重复；命令记录确认新建不带 resumeThreadId，重试使用新 sessionId。
+  作者已记录本机 CC 新会话的真实回复、侧栏条目与选中态；本轮未运行真实 vendor，fake daemon 验证不能替代真实链路。Codex 与远端新会话仍待真实链路验收。

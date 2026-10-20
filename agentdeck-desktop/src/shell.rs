@@ -6,7 +6,7 @@
 
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentdeck_protocol::{
     ActionKind, ActionRequest, ActionRequestVendor, AgentKind, ClaudeCodePermissionMode,
@@ -88,6 +88,8 @@ pub enum Stage {
         /// 会话记录的虚拟列表状态（滚动位置、已测量的块高）；每次读取完成时重置。
         list: ListState,
         read_id: u64,
+        /// 新建会话：还没发出首条消息，thread id 是占位，底部显示工作目录输入框。
+        draft: bool,
     },
     /// 机器管理页：添加远端、查看每台机器与各 agent 的连接状态。
     Machines,
@@ -314,7 +316,7 @@ impl AgentHistory {
     pub fn list_hint(&self) -> Option<&'static str> {
         if !matches!(self.result, Some(Ok(()))) {
             None
-        } else if self.loaded == MAX_HISTORY_LIST_LIMIT {
+        } else if self.limit == MAX_HISTORY_LIST_LIMIT && self.has_more {
             Some("已达 2,000 条上限")
         } else if !self.has_more {
             Some("已全部加载")
@@ -480,6 +482,42 @@ fn retain_active_machine_sessions(
     sessions.retain(|session| {
         session.host.as_ref() != host.as_ref() || active_kinds.contains(&session.item.agent_kind)
     });
+}
+
+fn replace_source_sessions(
+    sessions: &mut Vec<Session>,
+    live: &[LiveSession],
+    host: &Host,
+    kind: AgentKind,
+    items: Vec<HistoryListItem>,
+) -> usize {
+    let mut keys = std::collections::HashSet::new();
+    let mut replacement: Vec<_> = items
+        .into_iter()
+        .map(|item| Session {
+            host: host.clone(),
+            item,
+        })
+        .filter(|session| keys.insert(session.key()))
+        .collect();
+    sessions.retain(|session| {
+        if session.host.as_ref() != host.as_ref() || session.item.agent_kind != kind {
+            return true;
+        }
+        // 历史快照可能早于新会话落盘，活动会话仍须能从侧栏返回。
+        if live
+            .iter()
+            .any(|live| session.is(&live.key) && live.session_id.is_some())
+            && keys.insert(session.key())
+        {
+            replacement.push(session.clone());
+        }
+        false
+    });
+    let loaded = replacement.len();
+    sessions.extend(replacement);
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.item.last_active_ms));
+    loaded
 }
 
 /// 开发者模式的帧统计：只记录真实发生的绘制，GPUI 按需重绘，空闲时帧率本来就低。
@@ -649,6 +687,8 @@ pub struct Shell {
     live: Vec<LiveSession>,
     /// 会话页底部输入框：Enter 发送，⌘Enter 换行。
     composer: Entity<InputState>,
+    /// 新建会话的工作目录。
+    cwd_input: Entity<InputState>,
     /// 选了“跳过所有权限”，等待二次确认。
     bypass_armed: bool,
     /// 提问卡的键盘焦点；每次新提问自动聚焦一次，按键在卡片上处理。
@@ -692,8 +732,15 @@ impl Shell {
         let composer = cx.new(|cx| {
             InputState::new(window, cx)
                 .auto_grow(1, 8)
-                .placeholder("发消息续聊，Enter 发送，⌘Enter 换行")
+                .placeholder("发消息，Enter 发送，⌘Enter 换行")
         });
+        let cwd_input = cx.new(|cx| InputState::new(window, cx).placeholder("工作目录绝对路径"));
+        cx.subscribe(&cwd_input, |_, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        })
+        .detach();
         cx.subscribe_in(
             &composer,
             window,
@@ -729,6 +776,7 @@ impl Shell {
             update_armed: None,
             live: Vec::new(),
             composer,
+            cwd_input,
             bypass_armed: false,
             question_focus: cx.focus_handle(),
             question_scroll: ScrollHandle::new(),
@@ -800,7 +848,33 @@ impl Shell {
         else {
             return;
         };
-        if live.apply(event) {
+        let adopted = live.adopt_thread(&event);
+        let changed = live.apply(event);
+        if let Some((old, item)) = adopted {
+            let kind = item.agent_kind;
+            let session = Session { host, item };
+            if let Stage::Session {
+                session: current,
+                draft,
+                ..
+            } = &mut self.stage
+                && current.is(&old)
+            {
+                *current = session.clone();
+                *draft = false;
+                self.sidebar_cursor = Some(session.key());
+            }
+            self.sessions.insert(0, session);
+            if let Some(agent) = self
+                .machine_mut(machine_id)
+                .and_then(|machine| machine.agents.iter_mut().find(|agent| agent.kind == kind))
+            {
+                agent.loaded += 1;
+            }
+            self.rebuild_rows(cx);
+            cx.notify();
+        }
+        if changed {
             self.refresh_live_view(cx);
         }
     }
@@ -894,6 +968,22 @@ impl Shell {
         if text.is_empty() {
             return;
         }
+        let draft = match &mut self.stage {
+            Stage::Session {
+                session,
+                draft: true,
+                ..
+            } => {
+                let cwd = self.cwd_input.read(cx).value().trim().to_string();
+                if cwd.is_empty() {
+                    return;
+                }
+                session.item.cwd = cwd.into();
+                session.item.title = text.lines().next().map(str::to_string);
+                Some(session.item.clone())
+            }
+            _ => None,
+        };
         let initial = match &self.stage {
             Stage::Session { session, .. } => self
                 .initial_capabilities(session)
@@ -904,6 +994,9 @@ impl Shell {
         let Some((live, cwd, client)) = self.current_live() else {
             return;
         };
+        if draft.is_some() && live.session_id.is_none() {
+            live.draft = draft;
+        }
         let Some(command) = live.send(text, cwd, initial.as_ref()) else {
             return;
         };
@@ -1414,16 +1507,19 @@ impl Shell {
                     agent.complete(&mut listed);
                 }
                 if let Ok((items, _)) = listed {
-                    shell
-                        .sessions
-                        .retain(|session| session.host != host || session.item.agent_kind != kind);
-                    shell.sessions.extend(items.into_iter().map(|item| Session {
-                        host: host.clone(),
-                        item,
-                    }));
-                    shell
-                        .sessions
-                        .sort_by_key(|s| std::cmp::Reverse(s.item.last_active_ms));
+                    let loaded = replace_source_sessions(
+                        &mut shell.sessions,
+                        &shell.live,
+                        &host,
+                        kind,
+                        items,
+                    );
+                    if let Some(agent) = shell
+                        .machine_mut(id)
+                        .and_then(|machine| machine.agents.iter_mut().find(|a| a.kind == kind))
+                    {
+                        agent.loaded = loaded;
+                    }
                     shell.rebuild_rows(cx);
                 }
             })
@@ -1704,6 +1800,7 @@ impl Shell {
             transcript: Transcript::Loading,
             list: transcript_list(),
             read_id,
+            draft: false,
         };
         cx.notify();
 
@@ -1743,6 +1840,55 @@ impl Shell {
         .detach();
     }
 
+    /// 在某台机器的某个 agent 上新建会话；工作目录默认取它最近一次会话的。
+    pub fn start_draft(
+        &mut self,
+        host: Host,
+        kind: AgentKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cwd = self
+            .sessions
+            .iter()
+            .find(|session| session.host == host && session.item.agent_kind == kind)
+            .map(|session| session.item.cwd.display().to_string())
+            .or_else(|| host.is_none().then(|| std::env::var("HOME").ok()).flatten())
+            .unwrap_or_default();
+        self.cwd_input
+            .update(cx, |input, cx| input.set_value(cwd, window, cx));
+        self.composer
+            .update(cx, |input, cx| input.focus(window, cx));
+        self.next_read_id += 1;
+        let read_id = self.next_read_id;
+        self.bypass_armed = false;
+        self.sidebar_cursor = None;
+        self.reads.clear_pending();
+        let item = HistoryListItem {
+            // 占位 id 每次不同，免得两个未开始的新会话共用一个 live 状态。
+            thread_id: ThreadId(format!("draft-{read_id}")),
+            agent_kind: kind,
+            title: Some("新会话".into()),
+            cwd: Default::default(),
+            last_active_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64),
+            archived: false,
+        };
+        self.stage = Stage::Session {
+            session: Session { host, item },
+            transcript: Transcript::Ready {
+                blocks: Rc::from([]),
+                history: Rc::from([]),
+                warnings: Vec::new(),
+            },
+            list: transcript_list(),
+            read_id,
+            draft: true,
+        };
+        cx.notify();
+    }
+
     pub fn show_empty(&mut self, cx: &mut Context<Self>) {
         self.stage = Stage::Empty;
         self.reads.clear_pending();
@@ -1761,13 +1907,23 @@ impl Shell {
                     // 已加载完成时大数字已说明一切，只在读取中或失败时补一行状态。
                     let note = (!matches!(agent.result, Some(Ok(())))).then(|| agent.status());
                     let failed = matches!(agent.result, Some(Err(_)));
-                    (source, agent.loaded, note, failed, selected)
+                    let can_start = machine.supports_interaction();
+                    (source, agent.loaded, note, failed, selected, can_start)
                 })
             })
             .collect::<Vec<_>>()
             .into_iter()
-            .map(|(source, loaded, note, failed, selected)| {
-                connector_card(source, multi_machine, loaded, note, failed, selected, cx)
+            .map(|(source, loaded, note, failed, selected, can_start)| {
+                connector_card(
+                    source,
+                    multi_machine,
+                    loaded,
+                    note,
+                    failed,
+                    selected,
+                    can_start,
+                    cx,
+                )
             })
             .collect();
         // 固定列数的 grid：flex_wrap 会留下孤儿行，且高度计算不可靠。
@@ -1866,12 +2022,14 @@ impl Shell {
             )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_session(
         &self,
         session: &Session,
         transcript: &Transcript,
         list: &ListState,
         read_id: u64,
+        draft: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
@@ -1904,9 +2062,15 @@ impl Shell {
                         .on_click(cx.listener(|shell, _, _, cx| shell.retry_transcript(cx))),
                 )
                 .into_any_element(),
-            Transcript::Ready { blocks, .. } if blocks.is_empty() => {
-                placeholder("这个会话没有可显示的记录", cx).into_any_element()
-            }
+            Transcript::Ready { blocks, .. } if blocks.is_empty() => placeholder(
+                if draft {
+                    "确认工作目录，发出第一条消息开始新会话"
+                } else {
+                    "这个会话没有可显示的记录"
+                },
+                cx,
+            )
+            .into_any_element(),
             Transcript::Ready { blocks, .. } => transcript::render(
                 blocks.clone(),
                 item.agent_kind,
@@ -2053,7 +2217,7 @@ impl Shell {
             )
             .child(body)
             .when(matches!(transcript, Transcript::Ready { .. }), |section| {
-                section.child(self.render_composer(session, window, cx))
+                section.child(self.render_composer(session, draft, window, cx))
             })
     }
 
@@ -2062,6 +2226,7 @@ impl Shell {
     fn render_composer(
         &self,
         session: &Session,
+        draft: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
@@ -2098,6 +2263,10 @@ impl Shell {
                 },
                 |live| live.can_send(initial),
             );
+        // 新会话发出首条消息前可改工作目录。
+        let editing_cwd = draft && live.is_none_or(|live| live.session_id.is_none());
+        let can_send =
+            can_send && !(editing_cwd && self.cwd_input.read(cx).value().trim().is_empty());
         let can_cancel = compatible && live.is_some_and(|live| live.cancel().is_some());
         let retry_capabilities = initial_result
             .filter(|result| result.is_err())
@@ -2165,6 +2334,19 @@ impl Shell {
                         .on_click(cx.listener(move |shell, _, _, cx| {
                             shell.load_agent_version(id, kind, cx)
                         })),
+                )
+            })
+            .when(editing_cwd, |section| {
+                section.child(
+                    h_flex()
+                        .w_full()
+                        .max_w(px(760.))
+                        .gap_2()
+                        .items_center()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("工作目录")
+                        .child(Input::new(&self.cwd_input).small().flex_1()),
                 )
             })
             .when_some(action, |section, action| {
@@ -2894,7 +3076,7 @@ fn read_only_notice(cx: &App) -> impl IntoElement + use<> {
         .text_xs()
         .text_color(cx.theme().muted_foreground)
         .child(div().size(px(6.)).rounded_full().bg(cx.theme().success))
-        .child("在侧栏打开会话即可续聊 · 新建会话暂未支持")
+        .child("点击卡片上的 + 新建会话，或在侧栏打开已有会话")
 }
 
 /// 会话头部的元信息标签。
@@ -2935,6 +3117,7 @@ fn connector_card(
     note: Option<String>,
     failed: bool,
     selected: bool,
+    can_start: bool,
     cx: &mut Context<Shell>,
 ) -> impl IntoElement + use<> {
     let theme = cx.theme();
@@ -2979,9 +3162,10 @@ fn connector_card(
                 border.lighten(0.6)
             })
         })
-        .on_click(
-            cx.listener(move |shell, _, _, cx| shell.toggle_agent_filter(host.clone(), kind, cx)),
-        )
+        .on_click({
+            let host = host.clone();
+            cx.listener(move |shell, _, _, cx| shell.toggle_agent_filter(host.clone(), kind, cx))
+        })
         .child(
             h_flex()
                 .justify_between()
@@ -2999,21 +3183,46 @@ fn connector_card(
                         .border_color(gpui::white().opacity(0.06))
                         .child(sidebar::agent_icon(kind, false)),
                 )
-                .when(show_machine, |row| {
-                    row.child(
-                        div()
-                            .min_w(px(0.))
-                            .px_2()
-                            .py_0p5()
-                            .rounded_full()
-                            .border_1()
-                            .border_color(border)
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .truncate()
-                            .child(machine),
-                    )
-                }),
+                .child(
+                    h_flex()
+                        .min_w(px(0.))
+                        .gap_1()
+                        .items_center()
+                        .when(show_machine, |row| {
+                            row.child(
+                                div()
+                                    .min_w(px(0.))
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_full()
+                                    .border_1()
+                                    .border_color(border)
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .truncate()
+                                    .child(machine.clone()),
+                            )
+                        })
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "new-session-{}-{}",
+                                machine,
+                                kind.as_str()
+                            )))
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::empty().path(crate::PLUS_ICON))
+                            .tooltip("在这里新建会话")
+                            .disabled(!can_start)
+                            .on_click(cx.listener(
+                                move |shell, _, window, cx| {
+                                    // 卡片本身的点击是筛选，这里不往上传。
+                                    cx.stop_propagation();
+                                    shell.start_draft(host.clone(), kind, window, cx);
+                                },
+                            )),
+                        ),
+                ),
         )
         .child(
             v_flex()
@@ -3068,8 +3277,9 @@ impl Render for Shell {
                 transcript,
                 list,
                 read_id,
+                draft,
             } => self
-                .render_session(session, transcript, list, *read_id, window, cx)
+                .render_session(session, transcript, list, *read_id, *draft, window, cx)
                 .into_any_element(),
         };
         let selected = self.stage.key();
@@ -3153,6 +3363,7 @@ mod tests {
             transcript: Transcript::Loading,
             list: transcript_list(),
             read_id: 1,
+            draft: false,
         };
         let key = stage.key().unwrap();
         assert_eq!(key.0.as_deref().map(AsRef::as_ref), Some("dt"));
@@ -3321,6 +3532,7 @@ mod tests {
             transcript: Transcript::Loading,
             list: transcript_list(),
             read_id: 2,
+            draft: false,
         };
         assert!(!stage.finish_read(1, Ok((vec![], vec![warning()]))));
 
@@ -3329,6 +3541,7 @@ mod tests {
             transcript: Transcript::Loading,
             list: transcript_list(),
             read_id: 3,
+            draft: false,
         };
         let block = crate::transcript::describe(&agentdeck_protocol::AgentItem::AssistantMessage {
             text: "新的 A 记录".into(),
@@ -3345,6 +3558,7 @@ mod tests {
 
         if let Stage::Session {
             read_id,
+            draft: false,
             transcript,
             ..
         } = &mut stage
@@ -3640,6 +3854,99 @@ mod tests {
         machine.prepare_agents(&[AgentKind::Codex]);
         assert_eq!(machine.agents.len(), 1);
         assert_eq!(machine.agents[0].status(), "已加载 12 · 加载中…");
+    }
+
+    #[test]
+    fn history_refresh_keeps_active_sessions_until_listed_or_closed() {
+        use agentdeck_protocol::SessionId;
+
+        let new_session = local(item(Some("本地首条消息")));
+        let mut history_item = item(Some("已有历史"));
+        history_item.thread_id = ThreadId("history".into());
+        let mut stale_item = item(Some("已移除的历史"));
+        stale_item.thread_id = ThreadId("stale".into());
+        let mut other_agent = new_session.clone();
+        other_agent.item.agent_kind = AgentKind::Codex;
+        let mut sessions = vec![
+            new_session.clone(),
+            local(stale_item),
+            remote(new_session.item.clone()),
+            other_agent,
+        ];
+        let mut active = crate::live::LiveSession::new(new_session.key());
+        active.session_id = Some(SessionId("active".into()));
+        let mut live = vec![active];
+
+        let loaded = super::replace_source_sessions(
+            &mut sessions,
+            &live,
+            &None,
+            AgentKind::ClaudeCode,
+            vec![history_item.clone()],
+        );
+        assert_eq!(loaded, 2, "来源计数包含尚未出现在历史中的活动会话");
+        assert_eq!(sessions.len(), 4, "不影响其他机器或 agent 的同名 thread");
+        assert!(
+            sessions
+                .iter()
+                .any(|session| session.is(&new_session.key()))
+        );
+        assert!(
+            !sessions
+                .iter()
+                .any(|session| session.item.thread_id.0 == "stale")
+        );
+
+        let mut listed_new = new_session.item.clone();
+        listed_new.title = Some("历史更新后的标题".into());
+        let loaded = super::replace_source_sessions(
+            &mut sessions,
+            &live,
+            &None,
+            AgentKind::ClaudeCode,
+            vec![history_item.clone(), listed_new.clone(), listed_new],
+        );
+        assert_eq!(loaded, 2, "历史条目与本地条目按完整身份去重");
+        assert_eq!(
+            sessions
+                .iter()
+                .find(|session| session.is(&new_session.key()))
+                .unwrap()
+                .item
+                .title
+                .as_deref(),
+            Some("历史更新后的标题"),
+        );
+
+        live[0].disconnected("连接已关闭");
+        let loaded = super::replace_source_sessions(
+            &mut sessions,
+            &live,
+            &None,
+            AgentKind::ClaudeCode,
+            vec![history_item],
+        );
+        assert_eq!(loaded, 1);
+        assert_eq!(sessions.len(), 3);
+        assert!(
+            !sessions
+                .iter()
+                .any(|session| session.is(&new_session.key()))
+        );
+    }
+
+    #[test]
+    fn history_limit_hint_survives_extra_active_sessions() {
+        let mut source = AgentHistory::new(AgentKind::ClaudeCode);
+        source.limit = super::MAX_HISTORY_LIST_LIMIT;
+        source.complete(&mut Ok((
+            vec![item(None); super::MAX_HISTORY_LIST_LIMIT],
+            vec![],
+        )));
+        source.loaded += 1;
+
+        assert_eq!(source.list_hint(), Some("已达 2,000 条上限"));
+        assert!(!source.can_load_more());
     }
 
     #[test]
