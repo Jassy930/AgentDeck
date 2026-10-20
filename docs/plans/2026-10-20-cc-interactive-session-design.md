@@ -213,4 +213,9 @@ desktop live 测试（开始前本地、开始后事件驱动）；经 daemon �
 - 桌面 87 项离线测试通过，覆盖旧协议拒绝交互但保留只读请求、同连接协议检查、
   会话握手覆盖预查询权限模式、模式拒绝后状态不变、审批队列中 persist 与反馈的请求关联。
 - PR #43 的能力重试、多个审批、旧连接 EOF 隔离与进程组清理实现均保留。
-- 本轮真实 vendor、桌面权限按钮点击与 bundle 验证尚未执行；此前真实链路记录不替代本轮验证。
+- 完整离线门禁、当前 checkout 的 daemon/CLI selfcheck 与 diagnostics report、desktop selfcheck、真实 bundle verify 均通过。
+  Swift XCTest 76 项与 Swift Testing 31 项、iPhone 17 / iOS 26.5 fixture 测试 21 项通过。
+- 临时 fake daemon 的实窗验证通过：握手后模式列表采用会话能力；重复选择 bypass 仍只展开确认条，
+  专用确认按钮才发命令；计划拒绝反馈与后续持久允许分别写入正确 requestId。
+  160 行计划可滚到末尾标记，审批 Markdown 使用自动高度，外层保留 240px 滚动视口。
+- 本轮未重跑真实 vendor E2E；以上实窗结果只证明离线 IPC/UI 路径，此前真实链路记录不替代本轮验证。

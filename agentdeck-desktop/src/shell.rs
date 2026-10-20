@@ -2360,7 +2360,7 @@ impl Shell {
                         .w_full()
                         .max_h(px(240.))
                         .overflow_y_scroll()
-                        .child(detail),
+                        .child(detail.h_auto()),
                 )
             })
             .when(asking, |card| {
