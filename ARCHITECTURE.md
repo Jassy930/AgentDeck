@@ -137,8 +137,8 @@ agentdeck-cli（参考客户端 / E2E 驱动，与 GUI 互相独立）
   `reply` / `requestId` 等 envelope 字段，关联校验和错误识别仍由 client 负责。
   Swift Core 同步对应 Codable 类型。失败仍走 `error`。v4 的 `AgentItem` 必须携带 `turnId`、`itemId` 与
   `state`（streaming/completed），同 item 的文本是累计快照。v3 引入 caller-owned `sessionId` / `turnId`、显式
-  `TurnStart` / `TurnCancel` / `SessionClose` 和两级 terminal；`TurnComplete` 暂只保留给
-  尚未迁移的 Claude Code 路径。
+  `TurnStart` / `TurnCancel` / `SessionClose` 和两级 terminal；Codex 与 Claude Code
+  均已迁移，`TurnComplete` 仅为 wire 兼容保留、不再产生。
 - `protocol_schema()`：schemars 从 Rust 类型派生的 JSON Schema，聚合所有 v7 公共类型。
 - 快照：`protocol/agentdeck/agentdeck-protocol.schema.json`（`UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot` 重生成）。
 - 漂移测试随 `cargo test` 运行。

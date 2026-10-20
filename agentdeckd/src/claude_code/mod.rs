@@ -25,6 +25,7 @@ pub mod adapter;
 pub mod auth;
 pub mod capabilities;
 pub mod history;
+pub(crate) mod session;
 pub mod translate;
 
 pub use adapter::ClaudeCodeAdapter;
