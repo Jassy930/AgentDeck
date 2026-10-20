@@ -138,7 +138,7 @@ desktop live 测试（开始前本地、开始后事件驱动）；经 daemon �
 - 计划被拒并反馈后修改计划、批准后回到 default；
 - 总是允许后切到 acceptEdits。
 
-实窗截图确认计划审批卡、跳过权限确认条和模式按钮渲染正常；点击未自动验证。
+初始实窗截图确认计划审批卡、跳过权限确认条和模式按钮渲染正常；本轮 fake daemon 点击与长正文滚动验收见下方 PR #44 记录。
 
 ## P4 AskUserQuestion（2026-10-20，仍属协议 v8）
 
@@ -219,3 +219,14 @@ desktop live 测试（开始前本地、开始后事件驱动）；经 daemon �
   专用确认按钮才发命令；计划拒绝反馈与后续持久允许分别写入正确 requestId。
   160 行计划可滚到末尾标记，审批 Markdown 使用自动高度，外层保留 240px 滚动视口。
 - 本轮未重跑真实 vendor E2E；以上实窗结果只证明离线 IPC/UI 路径，此前真实链路记录不替代本轮验证。
+
+
+### PR #45 问答整合回归（2026-10-20）
+
+- 完整离线门禁通过，桌面 90 项测试覆盖问题作答、FIFO 排队、草稿保留、同 requestId 改题及断线清理。
+  Swift XCTest 77 项与 Swift Testing 31 项、iPhone 17 / iOS 26.5 fixture 测试 21 项通过。
+- 当前 checkout 的 daemon/CLI 构建、CLI selfcheck 与 diagnostics report、desktop selfcheck 和真实 bundle verify 均通过。
+- 临时 fake daemon 实窗验证四题单选、多选、自由文本与问题区滚动，决定按钮保持可见。
+  切换机器页再返回后选择与自由文本草稿仍在；提交命令中的四条 answers 与界面逐项一致，
+  多选按选项顺序拼接，随后显示排队的普通审批。下一轮选择已清空，点击跳过发送 deny 且不携答案，后续审批仍可处理。
+- 本轮未重跑真实 vendor E2E；上述实窗只验证本地 IPC/UI，不替代远端或真实 vendor 验收。
