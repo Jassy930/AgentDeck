@@ -324,10 +324,12 @@ fn build_vendor_options(args: &SessionRunArgs) -> Result<VendorSessionOptions, C
         })),
         AgentKindArg::ClaudeCode => {
             Ok(VendorSessionOptions::ClaudeCode(ClaudeCodeSessionOptions {
+                // The one-shot run has no approval channel; acceptEdits lets
+                // file edits through without a prompt nobody can answer.
                 permission_mode: args
                     .permission
                     .map(Into::into)
-                    .unwrap_or(ClaudeCodePermissionMode::Default),
+                    .unwrap_or(ClaudeCodePermissionMode::AcceptEdits),
                 model: args.model.clone(),
                 effort: args.effort.clone(),
                 hooks: vec![],
@@ -580,7 +582,7 @@ mod tests {
         let opts = build_vendor_options(&args).unwrap();
         match opts {
             VendorSessionOptions::ClaudeCode(cc) => {
-                assert_eq!(cc.permission_mode, ClaudeCodePermissionMode::Default);
+                assert_eq!(cc.permission_mode, ClaudeCodePermissionMode::AcceptEdits);
                 assert!(cc.model.is_none());
             }
             _ => panic!("expected ClaudeCode variant"),

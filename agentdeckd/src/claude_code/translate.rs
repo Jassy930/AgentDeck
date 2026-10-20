@@ -12,11 +12,10 @@
 //!     surface as `VendorPanelEvent::HookFired`.
 //!   - `"stream_event"` — partial delta wrapper: `event.type` ∈
 //!     {`message_start`, `content_block_start`, `content_block_delta`,
-//!     `content_block_stop`, `message_delta`, `message_stop`}. We DROP
-//!     these because the cumulative `assistant` / `user` snapshots arrive
-//!     immediately after — emitting deltas would either duplicate or
-//!     fragment the UI rendering. (Spec § 5.4 + 5.5 "cumulative
-//!     semantics" decision; matches Phase 3 lifecycle-replacement.)
+//!     `content_block_stop`, `message_delta`, `message_stop`}. Text and
+//!     thinking deltas are accumulated per content block and emitted as
+//!     `Streaming` cumulative snapshots; the later `assistant` snapshot
+//!     reuses the same itemId with `Completed`.
 //!   - `"assistant"` — final snapshot of an assistant message; its
 //!     `message.content` array is walked into AgentItem variants
 //!     (text → AssistantMessage, thinking → Reasoning, tool_use → Shell /
@@ -28,19 +27,23 @@
 //!     completion events (Shell completed / Diff finalized / ToolCall
 //!     with result).
 //!   - `"result"` — final turn summary with `usage`, `duration_ms`. We
-//!     map to `TurnComplete`.
-//!   - `"permission_request"` / `"permission"` / `"prompt"` — speculative
-//!     permission-prompt envelopes. The actual wire name is unknown until
-//!     Task 4B records a real fixture from `--permission-mode default`;
-//!     for v0.2 we accept all three candidates and surface as
-//!     `ActionRequest` with `ActionRequestVendor::ClaudeCode`.
+//!     map to `TurnFinished(nextState=ready)`; the session owner turns a
+//!     result that follows its own `interrupt` into `canceled`.
+//!   - `"control_request"` with `request.subtype="can_use_tool"` — the
+//!     `--permission-prompt-tool stdio` approval prompt (verified against
+//!     `claude` 2.1.304). Surfaces as `ActionRequest` keyed by the
+//!     control `request_id`; the owner answers with a `control_response`.
+//!   - `"control_response"` — answers to the owner's own control requests
+//!     (initialize / interrupt / set_permission_mode); consumed silently.
+//!   - `"control_cancel_request"` — CC withdrew a pending `can_use_tool`
+//!     prompt; consumed silently, the owner drops the route.
 //!
 //! ## Cumulative semantics
 //!
-//! The CC CLI emits a `"stream_event"` per partial delta AND a single
-//! `"assistant"` / `"user"` snapshot per fully-assembled message. We
-//! emit AgentItems only on the snapshots: one event per content block
-//! in the snapshot's `content` array.
+//! The CC CLI emits a `"stream_event"` per partial delta AND an
+//! `"assistant"` / `"user"` snapshot per fully-assembled content block.
+//! Text/thinking deltas become `Streaming` snapshots carrying the full
+//! text so far; the snapshot closes the same item as `Completed`.
 //!
 //! ## Tool_use → tool_result correlation
 //!
@@ -69,20 +72,29 @@ use super::is_collaboration_tool_name;
 use agentdeck_protocol::{
     ActionKind, ActionRequest, ActionRequestVendor, AgentItem, AgentItemMeta, AgentItemState,
     AgentKind, ClaudeCodePermissionMode, ClaudeCodeVendorPanelEvent, DiffFile, DiffStatus,
-    ServerEvent, SessionId, ShellStatus, ThreadId, TurnId, TurnSummary, VendorPanelPayload,
+    ProtocolError, ServerEvent, SessionId, ShellStatus, ThreadId, TurnId, TurnNextState,
+    TurnOutcome, TurnSummary, VendorPanelPayload,
 };
 
 /// One translator-output batch: 0..N ServerEvents from one input line,
-/// plus an optional permission-route hint the adapter records so it can
-/// later route an `ActionDecision` back to CC.
+/// plus an optional permission-route hint the session owner records so it
+/// can later answer the `can_use_tool` control request.
 #[derive(Debug, Default)]
 pub struct TranslateOutput {
     pub events: Vec<ServerEvent>,
-    /// If this batch contained an `ActionRequest`, the hint is the
-    /// underlying `tool_use_id` so `adapter.rs` can map
-    /// `request_id → tool_use_id` for response routing. Task 4B
-    /// implements the wire format; 4A only records the hint.
-    pub permission_route_hint: Option<String>,
+    pub permission_route_hint: Option<PermissionRoute>,
+}
+
+/// A pending `can_use_tool` prompt. `request_id` is both the CC control
+/// request id and the `ActionRequest.request_id` the client echoes back.
+#[derive(Debug, Clone)]
+pub struct PermissionRoute {
+    pub request_id: String,
+    /// Original tool input, echoed back as `updatedInput` on allow.
+    pub input: Value,
+    /// CC's `permission_suggestions`, applied as `updatedPermissions`
+    /// when the client asks to persist an approval.
+    pub suggestions: Value,
 }
 
 /// Per-session CC translator. Owns the `tool_use_id → record` map used
@@ -100,6 +112,20 @@ pub struct ClaudeCodeTranslator {
     /// Permission mode at session-start; stamped into every
     /// `ActionRequestVendor::ClaudeCode { permission_mode_at_decision }`.
     permission_mode: ClaudeCodePermissionMode,
+    /// `message.id` of the assistant message currently streaming.
+    streaming_message_id: Option<String>,
+    /// Text/thinking blocks seen in `stream_event`s whose `assistant`
+    /// snapshot has not arrived yet.
+    streaming_blocks: Vec<StreamingBlock>,
+}
+
+#[derive(Debug)]
+struct StreamingBlock {
+    message_id: String,
+    index: u64,
+    item_id: String,
+    thinking: bool,
+    text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +144,8 @@ impl ClaudeCodeTranslator {
             next_item_id: 0,
             in_flight_tools: HashMap::new(),
             permission_mode,
+            streaming_message_id: None,
+            streaming_blocks: Vec::new(),
         }
     }
 
@@ -135,6 +163,10 @@ impl ClaudeCodeTranslator {
 
     pub fn permission_mode(&self) -> ClaudeCodePermissionMode {
         self.permission_mode
+    }
+
+    pub fn set_permission_mode(&mut self, mode: ClaudeCodePermissionMode) {
+        self.permission_mode = mode;
     }
 
     /// Translate one stream-json line into 0..N ServerEvents.
@@ -160,17 +192,15 @@ impl ClaudeCodeTranslator {
         let kind = parsed.get("type").and_then(Value::as_str).unwrap_or("");
         match kind {
             "system" => self.handle_system(&parsed),
-            "stream_event" => {
-                // Cumulative semantics — drop partial deltas; snapshots
-                // arrive on the next `assistant` / `user` line.
-                TranslateOutput::default()
-            }
+            "stream_event" => self.handle_stream_event(&parsed),
             "assistant" => self.handle_assistant(&parsed),
             "user" => self.handle_user(&parsed),
             "result" => self.handle_result(&parsed),
-            // Candidate permission-prompt envelopes. Real wire name TBD
-            // when Task 4B records a `--permission-mode default` fixture.
-            "permission_request" | "permission" | "prompt" => self.handle_permission(&parsed),
+            "control_request" => self.handle_control_request(&parsed),
+            // `control_response` answers our own requests; CC withdraws a
+            // pending `can_use_tool` with `control_cancel_request` (e.g.
+            // after an interrupt) and the owner drops its route.
+            "control_response" | "control_cancel_request" => TranslateOutput::default(),
             _ => self.raw_event(kind, trimmed),
         }
     }
@@ -245,6 +275,96 @@ impl ClaudeCodeTranslator {
 
     // ── assistant snapshot ─────────────────────────────────────────────────
 
+    // ── stream_event (partial deltas) ──────────────────────────────────────
+
+    fn handle_stream_event(&mut self, parsed: &Value) -> TranslateOutput {
+        let Some(event) = parsed.get("event") else {
+            return TranslateOutput::default();
+        };
+        let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
+        match event.get("type").and_then(Value::as_str).unwrap_or("") {
+            "message_start" => {
+                self.streaming_message_id = event
+                    .get("message")
+                    .and_then(|m| m.get("id"))
+                    .and_then(Value::as_str)
+                    .map(String::from);
+                TranslateOutput::default()
+            }
+            "content_block_start" => {
+                let kind = event
+                    .get("content_block")
+                    .and_then(|b| b.get("type"))
+                    .and_then(Value::as_str);
+                if let (Some(kind @ ("text" | "thinking")), Some(message_id)) =
+                    (kind, self.streaming_message_id.clone())
+                {
+                    self.streaming_blocks.push(StreamingBlock {
+                        item_id: format!("{message_id}:{index}"),
+                        message_id,
+                        index,
+                        thinking: kind == "thinking",
+                        text: String::new(),
+                    });
+                }
+                TranslateOutput::default()
+            }
+            "content_block_delta" => {
+                let delta = event.get("delta");
+                let chunk = delta
+                    .and_then(|d| d.get("text").or_else(|| d.get("thinking")))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let message_id = self.streaming_message_id.as_deref();
+                let Some(block) = self
+                    .streaming_blocks
+                    .iter_mut()
+                    .find(|b| Some(b.message_id.as_str()) == message_id && b.index == index)
+                else {
+                    return TranslateOutput::default();
+                };
+                if chunk.is_empty() {
+                    return TranslateOutput::default();
+                }
+                block.text.push_str(chunk);
+                let text = block.text.clone();
+                let item = if block.thinking {
+                    AgentItem::Reasoning {
+                        text,
+                        meta: AgentItemMeta::default(),
+                    }
+                } else {
+                    AgentItem::AssistantMessage {
+                        text,
+                        meta: AgentItemMeta::default(),
+                    }
+                };
+                let item_id = block.item_id.clone();
+                TranslateOutput {
+                    events: vec![self.item_event(item, Some(item_id), AgentItemState::Streaming)],
+                    permission_route_hint: None,
+                }
+            }
+            _ => TranslateOutput::default(),
+        }
+    }
+
+    /// Close the oldest streaming block of `message_id` with the given
+    /// kind, returning its itemId and the text streamed so far.
+    fn take_streaming_block(
+        &mut self,
+        message_id: Option<&str>,
+        thinking: bool,
+    ) -> Option<(String, String)> {
+        let message_id = message_id?;
+        let position = self
+            .streaming_blocks
+            .iter()
+            .position(|b| b.message_id == message_id && b.thinking == thinking)?;
+        let block = self.streaming_blocks.remove(position);
+        Some((block.item_id, block.text))
+    }
+
     fn handle_assistant(&mut self, parsed: &Value) -> TranslateOutput {
         let content = parsed
             .get("message")
@@ -252,39 +372,41 @@ impl ClaudeCodeTranslator {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        let message_id = parsed
+            .get("message")
+            .and_then(|m| m.get("id"))
+            .and_then(Value::as_str)
+            .map(String::from);
 
         let mut events = Vec::new();
         for block in &content {
             let block_kind = block.get("type").and_then(Value::as_str).unwrap_or("");
             match block_kind {
-                "text" => {
-                    let text = block
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    if text.is_empty() {
-                        continue;
-                    }
-                    events.push(self.agent_item_event(AgentItem::AssistantMessage {
-                        text,
-                        meta: AgentItemMeta::default(),
-                    }));
-                }
-                "thinking" => {
-                    let text = block
-                        .get("thinking")
+                "text" | "thinking" => {
+                    let thinking = block_kind == "thinking";
+                    let mut text = block
+                        .get(block_kind)
                         .or_else(|| block.get("text"))
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string();
+                    let streamed = self.take_streaming_block(message_id.as_deref(), thinking);
+                    let item_id = streamed.map(|(item_id, streamed_text)| {
+                        if text.is_empty() {
+                            text = streamed_text;
+                        }
+                        item_id
+                    });
                     if text.is_empty() {
                         continue;
                     }
-                    events.push(self.agent_item_event(AgentItem::Reasoning {
-                        text,
-                        meta: AgentItemMeta::default(),
-                    }));
+                    let meta = AgentItemMeta::default();
+                    let item = if thinking {
+                        AgentItem::Reasoning { text, meta }
+                    } else {
+                        AgentItem::AssistantMessage { text, meta }
+                    };
+                    events.push(self.item_event(item, item_id, AgentItemState::Completed));
                 }
                 "tool_use" => {
                     if let Some(ev) = self.handle_assistant_tool_use(block) {
@@ -471,6 +593,9 @@ impl ClaudeCodeTranslator {
     // ── result (turn complete) ─────────────────────────────────────────────
 
     fn handle_result(&mut self, parsed: &Value) -> TranslateOutput {
+        // An interrupted turn never closes its open stream blocks.
+        self.streaming_blocks.clear();
+        self.streaming_message_id = None;
         let usage = parsed.get("usage");
         let summary = TurnSummary {
             total_input_tokens: usage
@@ -484,45 +609,80 @@ impl ClaudeCodeTranslator {
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
         };
+        let subtype = parsed.get("subtype").and_then(Value::as_str).unwrap_or("");
+        let is_error = parsed
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let succeeded = subtype == "success" && !is_error;
+        let error = (!succeeded).then(|| {
+            let detail = parsed
+                .get("result")
+                .and_then(Value::as_str)
+                .map(String::from)
+                .or_else(|| parsed.get("errors").map(Value::to_string))
+                .unwrap_or_default();
+            ProtocolError {
+                code: "cc-turn-failed".into(),
+                message: format!("claude result {subtype}: {detail}"),
+                diagnostic_ref: None,
+            }
+        });
         TranslateOutput {
-            events: vec![ServerEvent::TurnComplete {
+            events: vec![ServerEvent::TurnFinished {
                 session_id: self.session_id.clone(),
                 thread_id: self.resolved_thread_id(),
                 agent_kind: AgentKind::ClaudeCode,
-                summary,
+                turn_id: self.turn_id.clone(),
+                outcome: if succeeded {
+                    TurnOutcome::Succeeded
+                } else {
+                    TurnOutcome::Failed
+                },
+                next_state: TurnNextState::Ready,
+                summary: Some(summary),
+                error,
             }],
             permission_route_hint: None,
         }
     }
 
-    // ── permission request → ActionRequest ─────────────────────────────────
+    // ── control_request (can_use_tool) → ActionRequest ─────────────────────
 
-    fn handle_permission(&mut self, parsed: &Value) -> TranslateOutput {
-        let tool_use_id = parsed
-            .get("tool_use_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let tool_name = parsed
+    /// Only `can_use_tool` becomes an `ActionRequest`; the owner answers
+    /// every other inbound control subtype with an error response.
+    fn handle_control_request(&mut self, parsed: &Value) -> TranslateOutput {
+        let request = parsed.get("request").cloned().unwrap_or(Value::Null);
+        if request.get("subtype").and_then(Value::as_str) != Some("can_use_tool") {
+            return TranslateOutput::default();
+        }
+        let Some(request_id) = parsed.get("request_id").and_then(Value::as_str) else {
+            return TranslateOutput::default();
+        };
+        let tool_name = request
             .get("tool_name")
-            .or_else(|| parsed.get("tool"))
             .and_then(Value::as_str)
             .unwrap_or("Unknown")
             .to_string();
-        let summary = parsed
-            .get("summary")
-            .or_else(|| parsed.get("description"))
-            .or_else(|| parsed.get("message"))
+        let input = request.get("input").cloned().unwrap_or(json!({}));
+        let detail = input
+            .get("command")
+            .or_else(|| input.get("file_path"))
+            .or_else(|| request.get("description"))
             .and_then(Value::as_str)
-            .unwrap_or("(no summary)")
-            .to_string();
+            .unwrap_or("");
+        let summary = if detail.is_empty() {
+            tool_name.clone()
+        } else {
+            format!("{tool_name}: {detail}")
+        };
         let kind = match tool_name.as_str() {
             "Bash" => ActionKind::ExecuteCommand,
-            "Edit" | "Write" | "MultiEdit" => ActionKind::EditFiles,
+            "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => ActionKind::EditFiles,
             _ => ActionKind::GrantExtraPermission,
         };
-        let request = ActionRequest {
-            request_id: tool_use_id.clone(),
+        let action = ActionRequest {
+            request_id: request_id.to_string(),
             kind,
             summary,
             vendor: ActionRequestVendor::ClaudeCode {
@@ -535,15 +695,31 @@ impl ClaudeCodeTranslator {
                 session_id: self.session_id.clone(),
                 thread_id: self.resolved_thread_id(),
                 agent_kind: AgentKind::ClaudeCode,
-                request,
+                request: action,
             }],
-            permission_route_hint: Some(tool_use_id),
+            permission_route_hint: Some(PermissionRoute {
+                request_id: request_id.to_string(),
+                input,
+                suggestions: request
+                    .get("permission_suggestions")
+                    .cloned()
+                    .unwrap_or(json!([])),
+            }),
         }
     }
 
     // ── helpers ────────────────────────────────────────────────────────────
 
     fn agent_item_event(&mut self, item: AgentItem) -> ServerEvent {
+        self.item_event(item, None, AgentItemState::Completed)
+    }
+
+    fn item_event(
+        &mut self,
+        item: AgentItem,
+        item_id: Option<String>,
+        state: AgentItemState,
+    ) -> ServerEvent {
         self.next_item_id += 1;
         let tool_id = match &item {
             AgentItem::Shell { meta, .. }
@@ -554,8 +730,8 @@ impl ClaudeCodeTranslator {
                 .and_then(Value::as_str),
             _ => None,
         };
-        let item_id = tool_id
-            .map(str::to_string)
+        let item_id = item_id
+            .or_else(|| tool_id.map(str::to_string))
             .unwrap_or_else(|| format!("{}:{}", self.session_id.0, self.next_item_id));
         ServerEvent::AgentItem {
             session_id: self.session_id.clone(),
@@ -563,7 +739,7 @@ impl ClaudeCodeTranslator {
             agent_kind: AgentKind::ClaudeCode,
             turn_id: self.turn_id.clone(),
             item_id,
-            state: AgentItemState::Completed,
+            state,
             item,
         }
     }

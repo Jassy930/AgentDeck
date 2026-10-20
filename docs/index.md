@@ -29,6 +29,7 @@
 - `plans/2026-09-21-gpui-desktop-shell-layout-implementation.md`：向 Codex Desktop 视觉范式对齐的外壳布局骨架（侧栏 / 空态 / 会话态 / composer，全部静态占位）、gpui-component 0.5.1 坑点与目视验证方式。
 - `plans/2026-09-22-desktop-history-readonly-implementation.md`：桌面自带 typed local client 接入 `agentdeckd` 只读历史（侧栏真实会话列表 + 会话记录）、每机常驻连接、flex 滚动与 bundle 打包坑点。
 - `plans/2026-10-09-desktop-visual-polish.md`：桌面端六轮视觉打磨（主页栅格卡片、会话气泡与 agent 身份、机器页状态胶囊、侧栏健康度）的评分表、每轮改动与验证方式。
+- `plans/2026-10-20-cc-interactive-session-design.md`：Claude Code 改为 stream-json 双向常驻会话（多轮、审批、中断、会话内切权限模式、流式快照）的协议实测事实、owner 生命周期，以及桌面续聊（事件通道、live 状态机、输入框与审批条）与验证回执。
 
 此前 macOS AppKit 文档仅保留为历史事实，不再定义当前桌面实现或默认迭代顺序。
 

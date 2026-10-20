@@ -17,8 +17,8 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
 - 初始化 `gpui-component` 并挂载 `Root`。
 - 界面固定使用深色，配色来自设计系统 SSOT 生成的 codex 颜色；警告使用与品牌橙区分的琥珀色。
 - 渲染外壳布局：全高左侧栏（品牌行 / 新建会话与搜索框 / 按日期分组的会话列表 /
-  底部页面入口图标）、空态（统计胶囊与居中标题、按已注册 agent 生成的固定列栅格过滤卡片，卡片随窗口收窄，内容过高时可纵向滚动、只读提示胶囊），
-  会话态（thread header 与 agent / 项目 / 机器标签、用户消息右对齐气泡且每轮首条助手消息标注 agent 身份的会话记录、底部只读提示胶囊），以及机器管理页。
+  底部页面入口图标）、空态（统计胶囊与居中标题、按已注册 agent 生成的固定列栅格过滤卡片，卡片随窗口收窄，内容过高时可纵向滚动、续聊提示胶囊），
+  会话态（thread header 与 agent / 项目 / 机器标签、用户消息右对齐气泡且每轮首条助手消息标注 agent 身份的会话记录、底部续聊输入框与审批条），以及机器管理页。
 - **接入本机及 SSH 远端 `agentdeckd` 的只读历史**：启动时先问各机器的 daemon 注册了哪些 agent，再按
   agent 分别拉取会话列表（首批各显示 50 条），谁先返回谁先进侧栏；侧栏提供“刷新”按钮重新读取各机器的最新会话列表，刷新期间及失败时保留已有会话与计数；固定在列表下方的
   “加载更多”为仍有更多的来源（有 agent 过滤时只为该来源）各扩展 50 条。读完或达到
@@ -61,7 +61,11 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
   远端 agentdeckd 安装期间暂不能断开该机器，安装结束后恢复，结果保留在机器卡片中。
   机器页每台机器一张卡片：状态胶囊、名称、重试 / 断开、完整连接错误，以及各 agent 的
   完整状态、兼容性警告和读取错误；顶部是常驻的远端连接输入框。
-- 发送接入前不渲染输入框，空态与会话态只显示“只读历史预览 · 暂不能发送任务”。
+- 会话态底部是续聊输入框（Enter 发送、⌘Enter 换行，运行中切为“停止”）：首次发送以
+  `SessionStart` 续上原 thread，之后同一 daemon 会话内 `TurnStart`；流式条目接在历史记录之后，
+  按 agent 与会话声明的能力启用续聊和审批；能力尚未加载或不支持时禁用相应操作，查询失败可就地重试。
+  工具审批在输入框上方按到达顺序逐项显示“允许 / 拒绝”，断线或发送失败清除待决审批；
+  错误显示在输入框上方。空态提示“在侧栏打开会话即可续聊”。
 - 透明标题栏下为红绿灯留出顶部空间，空态与会话态顶部均按系统偏好处理双击；
   打开窗口后搜索框默认聚焦。
 - 支持通过 `Command+Q` 或 AgentDeck 菜单中的“退出 AgentDeck”退出应用。
@@ -74,7 +78,7 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
 
 当前明确不包含：
 
-- 启动会话、发送 turn、streaming、审批和 vendor 控制；也没有 composer 输入框。
+- 新建会话和 vendor 控制面板。
 - 用户消息中注入上下文块（如 `<system-reminder>`）的识别与折叠、会话正文全文搜索与按项目分组。
 - daemon 网络监听和配对流程。
 - 对旧 AppKit 界面或行为的兼容层。
@@ -94,7 +98,7 @@ diagnostics 等较宽的代码表面。Codex 路径已经落地 protocol v4 的 
 ## 仓库结构
 
 ```text
-agentdeck-desktop/       Rust/GPUI macOS 客户端（外壳 + daemon 只读历史）
+agentdeck-desktop/       Rust/GPUI macOS 客户端（历史读取 + 已有会话续聊）
 agentdeck-protocol/      AgentDeck 中立 IPC 类型与 schema 事实源
 agentdeckd/              Codex / Claude Code adapter daemon
 agentdeck-cli/           参考客户端与 E2E 驱动
@@ -279,8 +283,10 @@ desktop 已经通过 typed local client 接入 daemon 的只读历史，下一�
 2. 持久 CLI 四轮曾在 0.145.0 的临时配置覆盖环境通过，包含累计 streaming、同 PID/threadId
    复用、取消后继续、回收与记录读回；升级后的 lifecycle E2E 尚未重跑，
    证据见 [M0 CLI 实施记录](docs/plans/2026-09-21-backend-m0-cli-implementation.md)。
-3. 在此之上给 desktop 接入会话启动与 turn 流（每机常驻连接已就绪，需再接事件流），
-   再增加审批、Markdown 和多 agent 能力。
+3. Claude Code 续聊已接入（2026-10-20）：daemon 以 stream-json 双向常驻会话驱动 CC，
+   桌面接上事件流、输入框、停止与审批，见
+   [CC 交互会话设计](docs/plans/2026-10-20-cc-interactive-session-design.md)。下一步是新建会话
+   （目录选择）与 Codex 会话验收。
 
 `agentdeck session live` 的 stdin 接受现有 `ClientCommand` JSONL，stdout 连续输出协议
 事件和管理回复。客户端收到 `TurnFinished(nextState=ready)` 后可发送下一条 `TurnStart`；

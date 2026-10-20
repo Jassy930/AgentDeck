@@ -36,6 +36,7 @@ name = "agentdeck-desktop"
 version = "0.1.2"
 dependencies = [
  "agentdeck-protocol",
+ "async-channel 2.5.0",
  "gpui",
  "gpui-component",
  "libc",

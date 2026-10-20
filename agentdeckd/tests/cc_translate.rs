@@ -3,7 +3,8 @@
 //! translators stay symmetric (N5).
 //!
 //! Test fixtures use the shape observed by probing
-//! `claude --print --output-format stream-json` on 2.1.191 (see
+//! `claude --print --output-format stream-json` on 2.1.191 and the
+//! stream-json control protocol on 2.1.304 (see
 //! `claude_code/translate.rs` module doc for the per-type schema).
 
 use agentdeck_protocol::*;
@@ -408,11 +409,12 @@ fn unknown_tool_result_preserves_failure_status_and_duration() {
 }
 
 #[test]
-fn result_message_becomes_turn_complete_with_usage() {
+fn result_message_becomes_turn_finished_with_usage() {
     let mut t = tr();
     let line = json!({
         "type": "result",
         "subtype": "success",
+        "is_error": false,
         "session_id": "thread_1",
         "duration_ms": 5149u64,
         "usage": { "input_tokens": 3, "output_tokens": 11 }
@@ -420,17 +422,44 @@ fn result_message_becomes_turn_complete_with_usage() {
     let out = t.translate_line(&line.to_string());
     assert_eq!(out.events.len(), 1);
     match &out.events[0] {
-        ServerEvent::TurnComplete {
-            summary,
-            agent_kind,
+        ServerEvent::TurnFinished {
+            turn_id,
+            outcome: TurnOutcome::Succeeded,
+            next_state: TurnNextState::Ready,
+            summary: Some(summary),
+            error: None,
             ..
         } => {
-            assert_eq!(*agent_kind, AgentKind::ClaudeCode);
+            assert_eq!(turn_id.0, "client-turn-1");
             assert_eq!(summary.elapsed_ms, 5149);
             assert_eq!(summary.total_input_tokens, Some(3));
             assert_eq!(summary.total_output_tokens, Some(11));
         }
-        other => panic!("expected TurnComplete, got {other:?}"),
+        other => panic!("expected succeeded TurnFinished, got {other:?}"),
+    }
+}
+
+#[test]
+fn error_result_becomes_failed_turn() {
+    // Shape observed after an interrupt on claude 2.1.304; the owner maps
+    // it to canceled when it sent the interrupt itself.
+    let mut t = tr();
+    let line = json!({
+        "type": "result",
+        "subtype": "error_during_execution",
+        "is_error": true,
+        "session_id": "thread_1",
+        "duration_ms": 10u64
+    });
+    let out = t.translate_line(&line.to_string());
+    match &out.events[0] {
+        ServerEvent::TurnFinished {
+            outcome: TurnOutcome::Failed,
+            next_state: TurnNextState::Ready,
+            error: Some(error),
+            ..
+        } => assert_eq!(error.code, "cc-turn-failed"),
+        other => panic!("expected failed TurnFinished, got {other:?}"),
     }
 }
 
@@ -484,56 +513,123 @@ fn system_init_captures_session_id_silently() {
 }
 
 #[test]
-fn stream_event_partial_deltas_are_dropped() {
-    // We rely on the cumulative `assistant` snapshot for content; deltas
-    // are noise.
+fn stream_deltas_become_cumulative_snapshots_closed_by_the_assistant_message() {
     let mut t = tr();
-    let line = json!({
-        "type": "stream_event",
-        "session_id": "thread_1",
-        "event": {
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": { "type": "text_delta", "text": "Hel" }
+    let stream = |event: serde_json::Value| {
+        json!({"type": "stream_event", "session_id": "thread_1", "event": event}).to_string()
+    };
+    assert!(
+        t.translate_line(&stream(
+            json!({"type": "message_start", "message": {"id": "msg_1"}})
+        ))
+        .events
+        .is_empty()
+    );
+    t.translate_line(&stream(json!({
+        "type": "content_block_start", "index": 0,
+        "content_block": {"type": "text", "text": ""}
+    })));
+    let mut snapshots = Vec::new();
+    for chunk in ["Hel", "lo"] {
+        let out = t.translate_line(&stream(json!({
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": chunk}
+        })));
+        match &out.events[..] {
+            [
+                ServerEvent::AgentItem {
+                    item_id,
+                    state: AgentItemState::Streaming,
+                    item: AgentItem::AssistantMessage { text, .. },
+                    ..
+                },
+            ] => snapshots.push((item_id.clone(), text.clone())),
+            other => panic!("expected one streaming snapshot, got {other:?}"),
         }
-    });
-    let out = t.translate_line(&line.to_string());
-    assert!(out.events.is_empty());
+    }
+    assert_eq!(snapshots[0], ("msg_1:0".to_string(), "Hel".to_string()));
+    assert_eq!(snapshots[1], ("msg_1:0".to_string(), "Hello".to_string()));
+
+    let out = t.translate_line(
+        &json!({
+            "type": "assistant",
+            "session_id": "thread_1",
+            "message": {"id": "msg_1", "content": [{"type": "text", "text": "Hello"}]}
+        })
+        .to_string(),
+    );
+    match &out.events[..] {
+        [
+            ServerEvent::AgentItem {
+                item_id,
+                state: AgentItemState::Completed,
+                item: AgentItem::AssistantMessage { text, .. },
+                ..
+            },
+        ] => {
+            assert_eq!(item_id, "msg_1:0");
+            assert_eq!(text, "Hello");
+        }
+        other => panic!("expected the streamed item to complete, got {other:?}"),
+    }
+}
+
+/// `can_use_tool` control request as emitted by claude 2.1.304 under
+/// `--permission-prompt-tool stdio --permission-mode default`.
+fn can_use_tool(tool_name: &str, input: serde_json::Value) -> String {
+    json!({
+        "type": "control_request",
+        "request_id": "0b0682b6-fab3-46ff-b3f9-eee64eb98df7",
+        "request": {
+            "subtype": "can_use_tool",
+            "tool_name": tool_name,
+            "display_name": tool_name,
+            "input": input,
+            "description": "a.txt",
+            "permission_suggestions": [
+                {"type": "setMode", "mode": "acceptEdits", "destination": "session"}
+            ],
+            "tool_use_id": "toolu_019XANuYGNme5v49bFsnxCfi"
+        }
+    })
+    .to_string()
 }
 
 #[test]
-fn permission_request_becomes_action_request_with_cc_vendor() {
-    // The actual wire-name is unknown without a real default-mode
-    // fixture; we accept all three candidate envelopes.
-    for type_name in &["permission_request", "permission", "prompt"] {
-        let mut t = tr();
-        let line = json!({
-            "type": *type_name,
-            "session_id": "thread_1",
-            "tool_use_id": "tu_ask",
-            "tool_name": "Bash",
-            "summary": "run ls"
-        });
-        let out = t.translate_line(&line.to_string());
-        let has_action = out.events.iter().any(|e| {
-            matches!(
-                e,
-                ServerEvent::ActionRequest {
-                    agent_kind: AgentKind::ClaudeCode,
-                    request: ActionRequest {
-                        vendor: ActionRequestVendor::ClaudeCode { .. },
-                        ..
-                    },
-                    ..
-                }
-            )
-        });
-        assert!(has_action, "type {} did not yield ActionRequest", type_name);
-        assert_eq!(out.permission_route_hint.as_deref(), Some("tu_ask"));
-        // sanity: kind = ExecuteCommand for Bash
-        if let ServerEvent::ActionRequest { request, .. } = &out.events[0] {
+fn can_use_tool_becomes_action_request_with_route() {
+    let mut t = tr();
+    let out = t.translate_line(&can_use_tool("Bash", json!({"command": "ls"})));
+    match &out.events[..] {
+        [
+            ServerEvent::ActionRequest {
+                agent_kind: AgentKind::ClaudeCode,
+                request,
+                ..
+            },
+        ] => {
+            assert_eq!(request.request_id, "0b0682b6-fab3-46ff-b3f9-eee64eb98df7");
             assert!(matches!(request.kind, ActionKind::ExecuteCommand));
+            assert_eq!(request.summary, "Bash: ls");
         }
+        other => panic!("expected ActionRequest, got {other:?}"),
+    }
+    let route = out.permission_route_hint.expect("route for the owner");
+    assert_eq!(route.request_id, "0b0682b6-fab3-46ff-b3f9-eee64eb98df7");
+    assert_eq!(route.input, json!({"command": "ls"}));
+    assert_eq!(route.suggestions[0]["mode"], "acceptEdits");
+}
+
+#[test]
+fn control_responses_and_other_control_requests_emit_nothing() {
+    let mut t = tr();
+    for line in [
+        json!({"type": "control_response", "response": {"subtype": "success", "request_id": "agentdeck-1"}}),
+        json!({"type": "control_request", "request_id": "r", "request": {"subtype": "hook_callback"}}),
+        json!({"type": "control_cancel_request", "request_id": "r"}),
+    ] {
+        let out = t.translate_line(&line.to_string());
+        assert!(out.events.is_empty());
+        assert!(out.permission_route_hint.is_none());
     }
 }
 
@@ -571,14 +667,7 @@ fn permission_mode_is_stamped_on_action_request() {
         ClaudeCodePermissionMode::AcceptEdits,
     );
     t.set_thread_id(ThreadId("t".into()));
-    let line = json!({
-        "type": "permission_request",
-        "session_id": "t",
-        "tool_use_id": "tu_x",
-        "tool_name": "Edit",
-        "summary": "patch foo.rs"
-    });
-    let out = t.translate_line(&line.to_string());
+    let out = t.translate_line(&can_use_tool("Edit", json!({"file_path": "foo.rs"})));
     let ServerEvent::ActionRequest { request, .. } = &out.events[0] else {
         panic!("expected ActionRequest");
     };

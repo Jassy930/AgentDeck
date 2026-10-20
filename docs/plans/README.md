@@ -42,6 +42,7 @@
 - `2026-09-21-gpui-desktop-shell-layout-implementation.md`
 - `2026-09-22-desktop-history-readonly-implementation.md`
 - `2026-10-09-desktop-visual-polish.md`
+- `2026-10-20-cc-interactive-session-design.md`
 
 desktop 接入前的 daemon 目标事实源（已接受设计，尚未完成代码验收）：
 

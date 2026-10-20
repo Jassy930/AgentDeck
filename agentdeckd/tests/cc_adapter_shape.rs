@@ -102,7 +102,7 @@ async fn submit_vendor_control_rejects_codex_payload() {
 }
 
 #[tokio::test]
-async fn submit_vendor_control_permission_mode_requires_new_turn() {
+async fn submit_vendor_control_permission_mode_targets_a_live_session() {
     let a = ClaudeCodeAdapter::new_for_test();
     let sid = SessionId("phantom".into());
     let result = a
@@ -116,9 +116,8 @@ async fn submit_vendor_control_permission_mode_requires_new_turn() {
     assert!(result.is_err());
     assert_eq!(
         result.unwrap_err().code,
-        "cc-vendor-control-requires-new-turn",
-        "Permission mode change should return structured 'requires new turn' error \
-         (CC has no in-place mutation API)"
+        "session-not-found",
+        "permission mode changes go to the live owner via set_permission_mode"
     );
 }
 
@@ -175,10 +174,9 @@ async fn real_claude_emits_started_then_capabilities() {
     }
     // Use `which` to skip cleanly on CI / contributor machines that
     // don't have `claude` installed. The events we assert on
-    // (SessionStarted + SessionCapabilities) are emitted synchronously
-    // BEFORE spawn, so this test passes in milliseconds even when a
-    // real claude child is spawned — it does not depend on the model
-    // actually producing output.
+    // (SessionStarted + SessionCapabilities) are emitted right after
+    // spawn and before the owner reads any output, so this test does not
+    // depend on the model actually producing output.
     if which::which("claude").is_err() {
         println!(
             "SKIP real_claude_emits_started_then_capabilities: `claude` not in PATH (PATH={:?})",

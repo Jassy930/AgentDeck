@@ -180,7 +180,7 @@ fn run_cc_session(prompt: &str) -> (String, Vec<serde_json::Value>) {
             }
         }
         let ev_type = val.get("type").and_then(|t| t.as_str());
-        let is_complete = ev_type == Some("turnComplete");
+        let is_complete = ev_type == Some("turnFinished");
         let is_error = ev_type == Some("error");
         events.push(val.clone());
         if is_error {
@@ -214,10 +214,10 @@ fn run_cc_session(prompt: &str) -> (String, Vec<serde_json::Value>) {
 
     let has_complete = events
         .iter()
-        .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("turnComplete"));
+        .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("turnFinished"));
     assert!(
         has_complete,
-        "CC session must end with turnComplete; events: {events:?}"
+        "CC session must end with turnFinished; events: {events:?}"
     );
 
     assert!(
@@ -312,13 +312,13 @@ fn e2e_cc_session_continue_to_completion() {
             .and_then(|v| {
                 v.get("type")
                     .and_then(|t| t.as_str())
-                    .map(|s| s == "turnComplete")
+                    .map(|s| s == "turnFinished")
             })
             .unwrap_or(false)
     });
     assert!(
         has_complete,
-        "CC session continue must produce turnComplete\nstdout: {stdout_str}"
+        "CC session continue must produce turnFinished\nstdout: {stdout_str}"
     );
     eprintln!("CC session continue OK (thread_id={thread_id})");
 }

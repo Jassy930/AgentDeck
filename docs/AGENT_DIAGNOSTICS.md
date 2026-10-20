@@ -18,7 +18,7 @@ AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" \
 cargo run -p agentdeckd -- --diagnostics-report
 ```
 
-当前 GPUI 桌面端通过 daemon 读取 agent 列表与会话历史，尚无 profile、run record 或
+当前 GPUI 桌面端通过 daemon 读取 agent 列表与会话历史、续聊已有会话，尚无 profile、run record 或
 diagnostics report 的 UI 入口。桌面 selfcheck 不连接 daemon，成功不能证明 backend
 或 vendor CLI 健康。
 
@@ -35,8 +35,8 @@ diagnostics report 的 UI 入口。桌面 selfcheck 不连接 daemon，成功不
 同一个 `runId` 内用 `eventSeq` 排序。
 没有 `runId` 的诊断只作为进程级问题处理。
 
-生产会话使用 `runId=sessionId`；Codex 的同一个 run record 包含多轮事件、
-`SessionClosed` 和一个 footer。CC 仍使用 one-shot `TurnComplete` 收尾；启动失败或
+生产会话使用 `runId=sessionId`；Codex 与 Claude Code 的同一个 run record 都包含多轮事件、
+`SessionClosed` 和一个 footer；启动失败或
 legacy EOF/cancel 缺少终态时，writer 排空全部事件后补 footer，连接保持期间暂不关闭记录。`diagnosticRef` 为 `runId:eventSeq`，按这两个字段可在 `diagnostic.log`
 定位实际条目；report 默认只返回最近 20 条，较早引用需读取日志文件。
 `codex_child_spawned` / `codex_turn_started` 的 detail JSON 包含 `childPid`，
@@ -183,7 +183,7 @@ CLI 与桌面 client 都为每次历史请求生成唯一 `requestId`。daemon �
 `rawKind` 只保留最长 64 字节的安全方法/类型标识，`rawPayload` 固定为
 `[vendor payload withheld]`，不携带 vendor 原始 JSON。GPUI 历史正文对 raw 显示
 “暂不支持的内容”、类型与检查更新提示，不显示占位 payload，其余条目仍可阅读。
-GPUI 尚未接入会话 runtime，该路径仍通过 CLI、测试和 record 排查。
+GPUI 续聊条目使用同一正文渲染路径；进一步定位可通过 CLI、测试和 record 排查。
 
 daemon 写入失败等非致命问题会发出 `warning` 事件。当前选中的 runtime 应显示
 自己的 warning；没有选中 runtime 时才回退显示 legacy session warning。
@@ -199,9 +199,11 @@ CC `stream-json` 中 `system.subtype=init` 只用于抓取原生 `session_id`。
 
 ## Approval 卡住排查
 
-Codex 的命令执行、文件变更和额外权限审批会先在 daemon adapter 层映射为中立
-`actionRequest`。GPUI 当前没有审批 UI；涉及审批的 turn 只允许通过 backend 测试或
-CLI harness 验证，不能把桌面壳当成可用审批客户端。
+GPUI 仅在当前 `SessionCapabilities` 包含 `Approval` 时显示“允许 / 拒绝”。Claude Code 的
+`can_use_tool` 映射为中立 `ActionRequest`，桌面按 requestId 排队处理；一项决定不应覆盖其他待决请求。
+断线、发送失败或本轮结束会清空队列。卡住时先核对会话能力、当前 requestId 和写回的
+`ActionDecision`；旧连接的 `daemon-disconnected` 只影响该连接启动的会话。
+Codex 当前 M0 固定 `approvalPolicy=never` 且不声明 `Approval`，不提供交互审批。
 
 ## Claude Code Adapter Failure Codes（v0.2 新增）
 
@@ -216,7 +218,11 @@ CLI harness 验证，不能把桌面壳当成可用审批客户端。
 | `cc-archive-not-supported` | 对普通 CC session 调用 `claude rm`（仅 background-agent 支持） | 普通 session 不支持 archive；历史会保留在原路径，可用 `--resume` 继续 |
 | `cc-archive-failed` | `claude rm` 执行失败（非 0 退出） | 按结构化 code 与 exit status 复现 `claude rm`；AgentDeck 不保留 vendor stderr 正文 |
 | `cc-rename-failed` | `claude --resume <id> --name <title>` 执行失败 | 确认 session_id 存在且 `claude` 版本支持 `--name` 参数；AgentDeck 不保留 vendor stderr 正文 |
-| `cc-vendor-control-requires-new-turn` | CC 的 permission mode 等 vendor 控件变更需通过新 turn 生效，不支持会话内即时切换 | 下次启动新 session 或新 turn 时携带更新后的 `ClaudeCodeSessionOptions` |
+| `cc-turn-failed` | CC 本轮 `result` 不是 success（非 AgentDeck 自己发起的中断） | 查看 message 中的 result subtype 与 errors；常见于 API 错误或达到 max turns |
+| `cc-process-exited` | 常驻 `claude` 子进程意外退出或关闭 stdout | message 附带退出状态和 stderr 尾部；按其复现，必要时重开会话 |
+| `cc-stdin-write-failed` | 向 `claude` stdin 写 user 行或 control 消息失败 | 子进程大概率已退出，见随后的 `cc-process-exited` |
+| `cc-cleanup-failed` | 无法确认 direct child 已 wait 或其保存的进程组已消失 | daemon 会 poison；检查残留 `claude` 及同组工具进程，不能仅凭主进程退出判断清理成功 |
+| `cc-decision-no-route` | ActionDecision 的 requestId 没有对应的待决 `can_use_tool` | 该请求已被决定，或所在 turn 已结束 |
 | `cc-vendor-control-not-supported` | 收到不支持的 ClaudeCodeVendorControl variant | 检查 client 与 daemon 协议版本是否匹配（v4）；升级 client 到最新版 |
 
 ## v0.2 双 adapter 探测
