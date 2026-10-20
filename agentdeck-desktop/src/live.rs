@@ -3,18 +3,18 @@
 //! 纯数据结构，不依赖 GPUI；Shell 负责把 daemon 事件按 sessionId 交给对应会话，
 //! 再把 `turns()` 渲染在历史记录之后。
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentdeck_protocol::{
-    ActionDecision, ActionDecisionKind, ActionRequest, AgentItem, AgentItemMeta, AgentKind,
-    ClaudeCodePermissionMode, ClaudeCodeSessionOptions, ClaudeCodeVendorControl,
-    ClaudeCodeVendorPanelEvent, ClientCommand, CodexApprovalPolicy, CodexReasoningEffort,
-    CodexSandboxMode, CodexSessionOptions, HistoryTurn, InitialTurn, ServerEvent, SessionId,
-    SessionStart, TurnId, TurnOutcome, VendorControlPayload, VendorPanelPayload,
-    VendorSessionOptions,
+    ActionDecision, ActionDecisionKind, ActionRequest, AgentItem, AgentItemMeta,
+    ClaudeCodePermissionMode, ClaudeCodeVendorPanelEvent, ClientCommand, HistoryTurn, InitialTurn,
+    ServerEvent, SessionCapabilities, SessionId, SessionStart, TurnId, TurnOutcome,
+    VendorPanelPayload,
 };
 
+use crate::session_router::SessionRouter;
 use crate::shell::SessionKey;
 
 /// caller-owned 的 sessionId / turnId：进程内递增，再带 pid 和启动毫秒避免跨进程撞号。
@@ -29,34 +29,6 @@ fn next_id(prefix: &str) -> String {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     )
-}
-
-/// 桌面发起会话的启动选项。Claude Code 按界面选择的权限模式启动；
-/// Codex 只接受 daemon 固定的 M0 选项。
-fn vendor_options(kind: AgentKind, mode: ClaudeCodePermissionMode) -> VendorSessionOptions {
-    match kind {
-        AgentKind::Codex => VendorSessionOptions::Codex(CodexSessionOptions {
-            approval_policy: CodexApprovalPolicy::Never,
-            sandbox: CodexSandboxMode::ReadOnly,
-            persist_approval: false,
-            reasoning_effort: CodexReasoningEffort::Medium,
-            mcp_overrides: vec![],
-        }),
-        AgentKind::ClaudeCode => VendorSessionOptions::ClaudeCode(ClaudeCodeSessionOptions {
-            permission_mode: mode,
-            model: None,
-            effort: None,
-            hooks: vec![],
-            output_style: None,
-            allowed_tools: None,
-            disallowed_tools: None,
-            mcp_config_path: None,
-            plugin_dirs: vec![],
-            worktree: None,
-            session_name: None,
-            session_id: None,
-        }),
-    }
 }
 
 /// 事件所属的 sessionId；连接级错误没有。
@@ -101,9 +73,9 @@ pub struct LiveSession {
     started: bool,
     pub running: Option<TurnId>,
     turns: Vec<LiveTurn>,
-    pub action: Option<ActionRequest>,
+    actions: VecDeque<ActionRequest>,
+    capabilities: Option<SessionCapabilities>,
     pub error: Option<String>,
-    /// 会话里实际生效的权限模式：开始前是本地选择，开始后只跟 daemon 的模式事件。
     pub mode: ClaudeCodePermissionMode,
     /// 待决提问每题已选的选项标签。
     pub picks: Vec<Vec<String>>,
@@ -111,6 +83,8 @@ pub struct LiveSession {
     pub others: Vec<bool>,
     /// 草稿随会话保留，切走再回来时重建输入框。
     pub other_texts: Vec<String>,
+    /// 同 requestId 的题目变化时也重建输入框，避免恢复旧题草稿。
+    pub question_revision: u64,
 }
 
 impl LiveSession {
@@ -121,29 +95,36 @@ impl LiveSession {
             started: false,
             running: None,
             turns: Vec::new(),
-            action: None,
+            actions: VecDeque::new(),
+            capabilities: None,
             error: None,
             mode: ClaudeCodePermissionMode::Default,
             picks: Vec::new(),
             others: Vec::new(),
             other_texts: Vec::new(),
+            question_revision: 0,
         }
     }
 
     fn question_is_multi(&self, question: usize) -> Option<bool> {
-        self.action
-            .as_ref()?
+        self.action()?
             .questions
             .as_ref()?
             .get(question)
             .map(|asked| asked.multi_select)
     }
 
-    pub fn set_other_text(&mut self, request_id: &str, question: usize, text: String) {
-        if self
-            .action
-            .as_ref()
-            .is_some_and(|action| action.request_id == request_id)
+    pub fn set_other_text(
+        &mut self,
+        request_id: &str,
+        revision: u64,
+        question: usize,
+        text: String,
+    ) {
+        if revision == self.question_revision
+            && self
+                .action()
+                .is_some_and(|action| action.request_id == request_id)
             && let Some(saved) = self.other_texts.get_mut(question)
         {
             *saved = text;
@@ -179,8 +160,7 @@ impl LiveSession {
     /// 单选题点选即替换，多选题点选即切换。
     pub fn toggle_pick(&mut self, question: usize, label: &str) {
         let Some(asked) = self
-            .action
-            .as_ref()
+            .action()
             .and_then(|action| action.questions.as_ref())
             .and_then(|questions| questions.get(question))
         else {
@@ -209,7 +189,7 @@ impl LiveSession {
     /// 有题没答或“其他”没填时返回给用户看的提示。
     pub fn answer(&mut self) -> Result<ClientCommand, String> {
         let session_id = self.session_id.clone().ok_or("会话已结束")?;
-        let action = self.action.as_ref().ok_or("没有待回答的问题")?;
+        let action = self.action().ok_or("没有待回答的问题")?;
         let questions = action.questions.as_ref().ok_or("没有待回答的问题")?;
         let mut answers = std::collections::BTreeMap::new();
         for (ix, question) in questions.iter().enumerate() {
@@ -236,8 +216,8 @@ impl LiveSession {
             }
             answers.insert(question.question.clone(), chosen.join(", "));
         }
-        let request = self.action.take().expect("checked above");
-        self.clear_questions();
+        let request = self.actions.pop_front().expect("checked above");
+        self.reset_questions();
         Ok(ClientCommand::ActionDecision {
             session_id,
             decision: ActionDecision {
@@ -250,8 +230,40 @@ impl LiveSession {
         })
     }
 
+    pub fn router<'a>(
+        &'a self,
+        initial: Option<&'a SessionCapabilities>,
+    ) -> Option<SessionRouter<'a>> {
+        if self.session_id.is_some() {
+            self.capabilities.as_ref().map(SessionRouter)
+        } else {
+            initial.map(SessionRouter)
+        }
+    }
+
+    pub fn can_send(&self, initial: Option<&SessionCapabilities>) -> bool {
+        self.running.is_none()
+            && self.router(initial).is_some_and(|router| {
+                router.supports_messages()
+                    && (self.session_id.is_some() || router.start_options(self.mode).is_ok())
+            })
+    }
+
     /// 登记一轮并返回要发给 daemon 的命令：会话没开就带 initial turn 续上原 thread。
-    pub fn send(&mut self, prompt: String, cwd: std::path::PathBuf) -> ClientCommand {
+    pub fn send(
+        &mut self,
+        prompt: String,
+        cwd: std::path::PathBuf,
+        initial: Option<&SessionCapabilities>,
+    ) -> Option<ClientCommand> {
+        if !self.can_send(initial) {
+            return None;
+        }
+        let options = if self.session_id.is_none() {
+            Some(self.router(initial)?.start_options(self.mode).ok()?)
+        } else {
+            None
+        };
         let turn_id = TurnId(next_id("turn"));
         self.running = Some(turn_id.clone());
         self.error = None;
@@ -261,47 +273,51 @@ impl LiveSession {
             finished: false,
         });
         if let Some(session_id) = &self.session_id {
-            return ClientCommand::TurnStart {
+            return Some(ClientCommand::TurnStart {
                 session_id: session_id.clone(),
                 turn_id,
                 prompt,
-            };
+            });
         }
         let session_id = SessionId(next_id("session"));
         self.session_id = Some(session_id.clone());
         self.started = false;
         let (_, kind, thread_id) = &self.key;
-        ClientCommand::SessionStart(SessionStart {
+        self.capabilities = None;
+        Some(ClientCommand::SessionStart(SessionStart {
             session_id,
             agent_kind: *kind,
             cwd,
             resume_thread_id: Some(thread_id.clone()),
             initial_turn: Some(InitialTurn { turn_id, prompt }),
-            vendor_options: vendor_options(*kind, self.mode),
+            vendor_options: options?,
             runtime_options: Default::default(),
-        })
+        }))
     }
 
     pub fn cancel(&self) -> Option<ClientCommand> {
+        self.capabilities.as_ref()?;
         Some(ClientCommand::TurnCancel {
             session_id: self.session_id.clone()?,
             turn_id: self.running.clone()?,
         })
     }
 
-    /// 会话没开始时只改本地选择，下次 SessionStart 带上；开始后交给 daemon，
-    /// 显示等 `PermissionModeChanged`（CC 可能拒绝）。
-    pub fn set_mode(&mut self, mode: ClaudeCodePermissionMode) -> Option<ClientCommand> {
-        let Some(session_id) = self.session_id.clone() else {
-            self.mode = mode;
+    pub fn set_mode(
+        &mut self,
+        mode: ClaudeCodePermissionMode,
+        initial: Option<&SessionCapabilities>,
+    ) -> Option<ClientCommand> {
+        let router = self.router(initial)?;
+        if !router.permission_modes().contains(&mode) {
             return None;
-        };
-        Some(ClientCommand::VendorControl {
-            session_id,
-            payload: VendorControlPayload::ClaudeCode(
-                ClaudeCodeVendorControl::UpdatePermissionMode(mode),
-            ),
-        })
+        }
+        if let Some(session_id) = self.session_id.clone() {
+            router.permission_mode_command(session_id, mode)
+        } else {
+            self.mode = mode;
+            None
+        }
     }
 
     pub fn decide(
@@ -310,14 +326,15 @@ impl LiveSession {
         persist: bool,
         message: Option<String>,
     ) -> Option<ClientCommand> {
-        // 提问的“提交”走 `answer`，这里只处理批准/拒绝和跳过提问。
-        if approve && self.action.as_ref()?.questions.is_some() {
+        let request = self.action()?;
+        if approve && request.questions.is_some() {
             return None;
         }
-        let request = self.action.take()?;
-        self.clear_questions();
+        let session_id = self.session_id.clone()?;
+        let request = self.actions.pop_front()?;
+        self.reset_questions();
         Some(ClientCommand::ActionDecision {
-            session_id: self.session_id.clone()?,
+            session_id,
             decision: ActionDecision {
                 request_id: request.request_id,
                 decision: if approve {
@@ -332,22 +349,31 @@ impl LiveSession {
         })
     }
 
+    pub fn action(&self) -> Option<&ActionRequest> {
+        self.router(None)
+            .filter(|router| router.supports_approval())?;
+        self.actions.front()
+    }
+
     /// 发送失败（写不进 daemon）：这一轮不会有任何事件回来。
     pub fn send_failed(&mut self, message: String) {
-        self.session_id = None;
-        self.running = None;
+        self.disconnected(&message);
         self.error = Some(message);
     }
 
     pub fn disconnected(&mut self, message: &str) {
+        let interrupted = self.running.is_some() || !self.actions.is_empty();
+        self.finish_turn();
         self.session_id = None;
-        if self.running.take().is_some() || self.action.take().is_some() {
+        self.started = false;
+        self.capabilities = None;
+        if interrupted {
             self.error = Some(message.to_string());
         }
     }
 
     /// 重新读历史时调用：已完成的轮次已经写进 vendor 历史，只留还在跑的那轮。
-    /// ponytail: 进行中的轮次可能和历史里已落盘的半截重复，轮次结束后重开会话即可。
+    /// shortcut: 进行中的轮次可能与已落盘历史重复，接入历史/live item 去重时移除此限制。
     pub fn forget_finished(&mut self) {
         self.turns.retain(|turn| !turn.finished);
     }
@@ -356,6 +382,9 @@ impl LiveSession {
     pub fn apply(&mut self, event: ServerEvent) -> bool {
         match event {
             ServerEvent::SessionStarted { .. } => self.started = true,
+            ServerEvent::SessionCapabilities { capabilities, .. } => {
+                self.capabilities = Some(capabilities);
+            }
             ServerEvent::AgentItem { item_id, item, .. } => {
                 let Some(turn) = self.turns.last_mut() else {
                     return false;
@@ -366,11 +395,22 @@ impl LiveSession {
                 }
             }
             ServerEvent::ActionRequest { request, .. } => {
-                let count = request.questions.as_ref().map_or(0, Vec::len);
-                self.picks = vec![Vec::new(); count];
-                self.others = vec![false; count];
-                self.other_texts = vec![String::new(); count];
-                self.action = Some(request);
+                let reset = if let Some(index) = self
+                    .actions
+                    .iter()
+                    .position(|action| action.request_id == request.request_id)
+                {
+                    let changed = index == 0 && self.actions[index].questions != request.questions;
+                    self.actions[index] = request;
+                    changed
+                } else {
+                    let first = self.actions.is_empty();
+                    self.actions.push_back(request);
+                    first
+                };
+                if reset {
+                    self.reset_questions();
+                }
             }
             ServerEvent::VendorPanelEvent {
                 payload:
@@ -390,11 +430,16 @@ impl LiveSession {
             ServerEvent::SessionClosed { error, .. } => {
                 self.finish_turn();
                 self.session_id = None;
+                self.capabilities = None;
                 if let Some(error) = error {
                     self.error = Some(error.message);
                 }
             }
             ServerEvent::Error { error, .. } => {
+                if error.code == crate::daemon::DISCONNECTED {
+                    self.disconnected(&error.message);
+                    return true;
+                }
                 // 记录写失败和审批路由错误不影响正在跑的轮次。
                 if !NON_TERMINAL_ERRORS.contains(&error.code.as_str()) {
                     self.finish_turn();
@@ -402,6 +447,7 @@ impl LiveSession {
                 // 没起来的会话和 daemon 已不认识的会话，下次发送重新 SessionStart。
                 if !self.started || error.code == "session-not-found" {
                     self.session_id = None;
+                    self.capabilities = None;
                 }
                 self.error = Some(format!("{}（{}）", error.message, error.code));
             }
@@ -412,23 +458,29 @@ impl LiveSession {
 
     fn finish_turn(&mut self) {
         self.running = None;
-        self.action = None;
-        self.clear_questions();
+        self.actions.clear();
+        self.reset_questions();
         if let Some(turn) = self.turns.last_mut() {
             turn.finished = true;
         }
     }
 
-    fn clear_questions(&mut self) {
-        self.picks.clear();
-        self.others.clear();
-        self.other_texts.clear();
+    fn reset_questions(&mut self) {
+        let count = self
+            .actions
+            .front()
+            .and_then(|action| action.questions.as_ref())
+            .map_or(0, Vec::len);
+        self.picks = vec![Vec::new(); count];
+        self.others = vec![false; count];
+        self.other_texts = vec![String::new(); count];
+        self.question_revision += 1;
     }
 
     /// 本轮已发出但 agent 还没有任何输出，也没有待决审批。
     pub fn waiting(&self) -> bool {
         self.running.is_some()
-            && self.action.is_none()
+            && self.actions.is_empty()
             && self.turns.last().is_some_and(|turn| turn.items.is_empty())
     }
 
@@ -451,11 +503,73 @@ impl LiveSession {
 mod tests {
     use super::*;
     use agentdeck_protocol::{
-        ActionKind, ActionRequestVendor, AgentItemState, ProtocolError, ThreadId, TurnNextState,
+        ActionKind, ActionRequestVendor, AgentItemState, AgentKind, CapabilityId,
+        ClaudeCodePermissionMode, ProtocolError, ThreadId, TurnNextState,
     };
 
     fn session() -> LiveSession {
         LiveSession::new((None, AgentKind::ClaudeCode, ThreadId("thread".into())))
+    }
+
+    fn capabilities_event(capabilities: SessionCapabilities) -> ServerEvent {
+        ServerEvent::SessionCapabilities {
+            session_id: SessionId("s".into()),
+            agent_kind: capabilities.agent_kind,
+            capabilities,
+        }
+    }
+
+    fn send(live: &mut LiveSession, prompt: &str) -> ClientCommand {
+        let caps = crate::session_router::test_capabilities(AgentKind::ClaudeCode);
+        let command = live
+            .send(prompt.into(), "/repo".into(), Some(&caps))
+            .unwrap();
+        live.apply(capabilities_event(caps));
+        command
+    }
+
+    fn approval(id: &str) -> ServerEvent {
+        ServerEvent::ActionRequest {
+            session_id: SessionId("s".into()),
+            thread_id: ThreadId("thread".into()),
+            agent_kind: AgentKind::ClaudeCode,
+            request: ActionRequest {
+                request_id: id.into(),
+                kind: ActionKind::ExecuteCommand,
+                summary: "Bash: ls".into(),
+                detail: Some("ls".into()),
+                questions: None,
+                vendor: ActionRequestVendor::ClaudeCode {
+                    permission_mode_at_decision: ClaudeCodePermissionMode::Default,
+                    tool_name: "Bash".into(),
+                    can_persist: true,
+                },
+            },
+        }
+    }
+
+    fn question(id: &str, multi: bool) -> ServerEvent {
+        let ServerEvent::ActionRequest { mut request, .. } = approval(id) else {
+            unreachable!()
+        };
+        request.kind = ActionKind::AnswerQuestions;
+        request.questions = Some(vec![agentdeck_protocol::UserQuestion {
+            question: "选择".into(),
+            header: None,
+            options: ["A", "B"]
+                .map(|label| agentdeck_protocol::UserQuestionOption {
+                    label: label.into(),
+                    description: None,
+                })
+                .into(),
+            multi_select: multi,
+        }]);
+        ServerEvent::ActionRequest {
+            session_id: SessionId("s".into()),
+            thread_id: ThreadId("thread".into()),
+            agent_kind: AgentKind::ClaudeCode,
+            request,
+        }
     }
 
     fn message(id: &str, text: &str) -> ServerEvent {
@@ -500,13 +614,12 @@ mod tests {
     #[test]
     fn first_send_resumes_the_thread_and_later_sends_reuse_the_session() {
         let mut live = session();
-        let ClientCommand::SessionStart(start) = live.send("hi".into(), "/repo".into()) else {
+        let ClientCommand::SessionStart(start) = send(&mut live, "hi") else {
             panic!("first send must start a session");
         };
         assert_eq!(start.resume_thread_id, Some(ThreadId("thread".into())));
         assert_eq!(start.initial_turn.map(|t| t.prompt).as_deref(), Some("hi"));
         assert!(live.running.is_some());
-        assert!(live.waiting());
 
         live.apply(ServerEvent::SessionStarted {
             session_id: start.session_id.clone(),
@@ -516,7 +629,7 @@ mod tests {
         live.apply(finished(TurnOutcome::Succeeded));
         assert!(live.running.is_none());
         assert!(matches!(
-            live.send("again".into(), "/repo".into()),
+            send(&mut live, "again"),
             ClientCommand::TurnStart { session_id, .. } if session_id == start.session_id
         ));
     }
@@ -524,7 +637,7 @@ mod tests {
     #[test]
     fn streaming_snapshots_upsert_by_item_id() {
         let mut live = session();
-        live.send("hi".into(), "/repo".into());
+        send(&mut live, "hi");
         live.apply(message("m:0", "Hel"));
         live.apply(message("m:0", "Hello"));
         live.apply(message("m:1", "next"));
@@ -538,7 +651,7 @@ mod tests {
     #[test]
     fn startup_errors_stop_the_spinner_and_force_a_fresh_start() {
         let mut live = session();
-        live.send("hi".into(), "/repo".into());
+        send(&mut live, "hi");
         assert!(live.apply(error("cc-not-authenticated")));
         assert!(live.running.is_none());
         assert!(live.session_id.is_none());
@@ -549,40 +662,62 @@ mod tests {
                 .contains("cc-not-authenticated")
         );
         assert!(matches!(
-            live.send("retry".into(), "/repo".into()),
+            send(&mut live, "retry"),
             ClientCommand::SessionStart(_)
         ));
     }
 
     #[test]
-    fn permission_mode_is_local_before_start_and_event_driven_after() {
+    fn permission_modes_follow_session_handshake_and_confirmed_events() {
+        use agentdeck_protocol::{VendorCapabilities, VendorSessionOptions};
         let mut live = session();
-        assert!(live.set_mode(ClaudeCodePermissionMode::Plan).is_none());
-        let ClientCommand::SessionStart(start) = live.send("hi".into(), "/repo".into()) else {
-            panic!("first send must start a session");
+        let caps = crate::session_router::test_capabilities(AgentKind::ClaudeCode);
+        assert!(
+            live.set_mode(ClaudeCodePermissionMode::Plan, Some(&caps))
+                .is_none()
+        );
+        let ClientCommand::SessionStart(start) = live
+            .send("plan".into(), "/repo".into(), Some(&caps))
+            .unwrap()
+        else {
+            panic!("expected session start");
         };
+        assert!(
+            matches!(start.vendor_options, VendorSessionOptions::ClaudeCode(options) if options.permission_mode == ClaudeCodePermissionMode::Plan)
+        );
+        assert!(live.waiting());
+        assert!(
+            live.set_mode(ClaudeCodePermissionMode::BypassPermissions, Some(&caps))
+                .is_none(),
+            "wait for the session handshake"
+        );
+        let mut session_caps = caps.clone();
+        let VendorCapabilities::ClaudeCode(vendor) = &mut session_caps.vendor else {
+            unreachable!()
+        };
+        vendor.permission_modes = vec![
+            ClaudeCodePermissionMode::Plan,
+            ClaudeCodePermissionMode::AcceptEdits,
+        ];
+        live.apply(capabilities_event(session_caps));
+        assert!(
+            live.set_mode(ClaudeCodePermissionMode::BypassPermissions, Some(&caps))
+                .is_none(),
+            "machine capability cannot override session capability"
+        );
         assert!(matches!(
-            start.vendor_options,
-            VendorSessionOptions::ClaudeCode(ClaudeCodeSessionOptions {
-                permission_mode: ClaudeCodePermissionMode::Plan,
-                ..
-            })
-        ));
-
-        assert!(matches!(
-            live.set_mode(ClaudeCodePermissionMode::BypassPermissions),
+            live.set_mode(ClaudeCodePermissionMode::AcceptEdits, None),
             Some(ClientCommand::VendorControl { .. })
         ));
-        assert_eq!(
-            live.mode,
-            ClaudeCodePermissionMode::Plan,
-            "waits for the event"
-        );
+        assert_eq!(live.mode, ClaudeCodePermissionMode::Plan);
+        live.apply(ServerEvent::SessionStarted {
+            session_id: start.session_id,
+            thread_id: None,
+            agent_kind: AgentKind::ClaudeCode,
+        });
         live.apply(error("cc-permission-mode-rejected"));
-        assert!(
-            live.running.is_some(),
-            "a rejected switch keeps the turn running"
-        );
+        assert!(live.running.is_some());
+        assert_eq!(live.mode, ClaudeCodePermissionMode::Plan);
         live.apply(ServerEvent::VendorPanelEvent {
             session_id: SessionId("s".into()),
             agent_kind: AgentKind::ClaudeCode,
@@ -603,7 +738,7 @@ mod tests {
             description: None,
         };
         let mut live = session();
-        live.send("hi".into(), "/repo".into());
+        send(&mut live, "hi");
         live.apply(ServerEvent::ActionRequest {
             session_id: SessionId("s".into()),
             thread_id: ThreadId("thread".into()),
@@ -655,27 +790,32 @@ mod tests {
             live.answer().unwrap_err().contains("其他"),
             "an empty other is rejected"
         );
-        live.set_other_text("ask-1", 1, " 芒果 ".into());
+        live.set_other_text("ask-1", live.question_revision, 1, " 芒果 ".into());
         live.forget_finished();
         assert_eq!(
             live.other_texts[1], " 芒果 ",
             "reopening keeps the answer draft"
         );
-        live.set_other_text("old-request", 1, "stale input".into());
+        live.set_other_text(
+            "old-request",
+            live.question_revision,
+            1,
+            "stale input".into(),
+        );
         let Ok(ClientCommand::ActionDecision { decision, .. }) = live.answer() else {
             panic!("every question is answered");
         };
         let answers = decision.answers.unwrap();
         assert_eq!(answers["颜色"], "蓝");
         assert_eq!(answers["水果"], "苹果, 橙子, 芒果");
-        assert!(live.action.is_none());
+        assert!(live.action().is_none());
         assert!(live.other_texts.is_empty());
     }
 
     #[test]
     fn record_warnings_keep_the_turn_running() {
         let mut live = session();
-        live.send("hi".into(), "/repo".into());
+        send(&mut live, "hi");
         live.apply(ServerEvent::SessionStarted {
             session_id: SessionId("s".into()),
             thread_id: None,
@@ -690,7 +830,7 @@ mod tests {
     #[test]
     fn approvals_and_disconnects_clear_pending_state() {
         let mut live = session();
-        live.send("hi".into(), "/repo".into());
+        send(&mut live, "hi");
         live.apply(ServerEvent::ActionRequest {
             session_id: SessionId("s".into()),
             thread_id: ThreadId("thread".into()),
@@ -709,13 +849,11 @@ mod tests {
             },
         });
         assert!(matches!(
-            live.decide(false, false, Some("换个做法".into())),
+            live.decide(true, false, None),
             Some(ClientCommand::ActionDecision { decision, .. })
-                if decision.request_id == "perm-1"
-                    && decision.decision == ActionDecisionKind::Deny
-                    && decision.message.as_deref() == Some("换个做法")
+                if decision.request_id == "perm-1" && decision.decision == ActionDecisionKind::Approve
         ));
-        assert!(live.action.is_none());
+        assert!(live.action().is_none());
 
         live.disconnected("连接已断开");
         assert!(live.running.is_none() && live.session_id.is_none());
@@ -723,11 +861,169 @@ mod tests {
     }
 
     #[test]
+    fn pending_approvals_are_answered_in_order_without_losing_requests() {
+        let mut live = session();
+        send(&mut live, "hi");
+        live.apply(approval("first"));
+        live.apply(approval("second"));
+        live.apply(approval("first"));
+        assert_eq!(live.actions.len(), 2);
+        for (id, approve) in [("first", true), ("second", false)] {
+            assert_eq!(live.action().unwrap().request_id, id);
+            let Some(ClientCommand::ActionDecision { decision, .. }) =
+                live.decide(approve, approve, (!approve).then(|| "修改计划".into()))
+            else {
+                panic!("pending request must remain answerable");
+            };
+            assert_eq!(decision.request_id, id);
+            assert_eq!(decision.persist, approve);
+            assert_eq!(
+                decision.message.as_deref(),
+                (!approve).then_some("修改计划")
+            );
+            assert_eq!(
+                decision.decision,
+                if approve {
+                    ActionDecisionKind::Approve
+                } else {
+                    ActionDecisionKind::Deny
+                }
+            );
+        }
+        assert!(live.decide(true, false, None).is_none());
+        assert!(live.running.is_some());
+    }
+
+    #[test]
+    fn queued_questions_and_approvals_preserve_the_current_answer() {
+        let mut live = session();
+        send(&mut live, "hi");
+        live.apply(question("q1", true));
+        let revision = live.question_revision;
+        live.toggle_pick(0, "A");
+        live.toggle_other(0);
+        live.set_other_text("q1", revision, 0, "自定义".into());
+        live.apply(question("q2", false));
+        live.apply(approval("tool"));
+        live.apply(question("q1", true));
+        assert_eq!(live.question_revision, revision);
+        assert_eq!(live.picks, vec![vec!["A"]]);
+        assert_eq!(live.others, vec![true]);
+        assert_eq!(live.other_texts, vec!["自定义"]);
+        let ClientCommand::ActionDecision { decision, .. } = live.answer().unwrap() else {
+            panic!("expected answer");
+        };
+        assert_eq!(decision.request_id, "q1");
+        assert_eq!(decision.answers.unwrap()["选择"], "A, 自定义");
+        assert_eq!(live.action().unwrap().request_id, "q2");
+        assert!(!live.answered());
+        assert_eq!(live.other_texts, vec![""]);
+        assert!(live.decide(true, false, None).is_none());
+        live.toggle_pick(0, "B");
+        let ClientCommand::ActionDecision { decision, .. } = live.answer().unwrap() else {
+            panic!("expected second answer");
+        };
+        assert_eq!(decision.request_id, "q2");
+        assert_eq!(decision.answers.unwrap()["选择"], "B");
+        assert!(
+            matches!(live.decide(true, true, None), Some(ClientCommand::ActionDecision { decision, .. }) if decision.request_id == "tool" && decision.persist)
+        );
+        live.apply(question("skip", false));
+        assert!(
+            matches!(live.decide(false, false, None), Some(ClientCommand::ActionDecision { decision, .. }) if decision.request_id == "skip" && decision.decision == ActionDecisionKind::Deny)
+        );
+        assert!(live.actions.is_empty() && live.other_texts.is_empty());
+    }
+
+    #[test]
+    fn changed_questions_and_disconnect_discard_old_drafts() {
+        let mut live = session();
+        send(&mut live, "hi");
+        live.apply(question("q1", true));
+        let revision = live.question_revision;
+        live.toggle_pick(0, "A");
+        live.toggle_other(0);
+        live.set_other_text("q1", revision, 0, "旧草稿".into());
+        live.apply(question("q1", false));
+        assert_ne!(live.question_revision, revision);
+        assert_eq!(live.picks, vec![Vec::<String>::new()]);
+        assert_eq!(live.others, vec![false]);
+        live.set_other_text("q1", revision, 0, "迟到的旧输入".into());
+        assert_eq!(live.other_texts, vec![""]);
+        live.toggle_other(0);
+        live.set_other_text("q1", live.question_revision, 0, "新草稿".into());
+        live.apply(question("q2", true));
+        live.disconnected("断线");
+        assert!(live.actions.is_empty());
+        assert!(live.picks.is_empty() && live.others.is_empty() && live.other_texts.is_empty());
+        assert!(live.answer().is_err());
+    }
+
+    #[test]
+    fn disconnect_and_write_failure_clear_running_and_all_approvals() {
+        for write_failure in [false, true] {
+            let mut live = session();
+            send(&mut live, "hi");
+            live.apply(approval("first"));
+            live.apply(approval("second"));
+            if write_failure {
+                live.send_failed("断线".into());
+            } else {
+                live.apply(error(crate::daemon::DISCONNECTED));
+            }
+            assert!(live.running.is_none() && live.session_id.is_none());
+            assert!(live.actions.is_empty());
+            assert!(live.capabilities.is_none());
+            assert!(live.error.is_some());
+            send(&mut live, "retry");
+            assert!(
+                live.decide(true, false, None).is_none(),
+                "old requests must not reach the new session"
+            );
+        }
+    }
+
+    #[test]
+    fn session_handshake_controls_sending_cancellation_and_approval() {
+        let mut live = session();
+        let mut caps = crate::session_router::test_capabilities(AgentKind::ClaudeCode);
+        assert!(live.send("hi".into(), "/repo".into(), None).is_none());
+        assert!(live.turns.is_empty());
+        assert!(
+            live.send("hi".into(), "/repo".into(), Some(&caps))
+                .is_some()
+        );
+        assert!(
+            live.router(Some(&caps)).is_none(),
+            "wait for the session handshake"
+        );
+        assert!(live.cancel().is_none());
+        caps.features.remove(&CapabilityId::Approval);
+        live.apply(capabilities_event(caps.clone()));
+        live.apply(approval("unsupported"));
+        assert!(live.decide(true, false, None).is_none());
+        assert!(live.action().is_none());
+        assert!(live.cancel().is_some());
+        live.apply(finished(TurnOutcome::Succeeded));
+        caps.features.remove(&CapabilityId::StreamingMessages);
+        live.apply(capabilities_event(caps));
+        let initial = crate::session_router::test_capabilities(AgentKind::ClaudeCode);
+        assert!(
+            !live.can_send(Some(&initial)),
+            "session capabilities override preflight"
+        );
+        assert!(
+            live.send("next".into(), "/repo".into(), Some(&initial))
+                .is_none()
+        );
+    }
+
+    #[test]
     fn reopening_keeps_only_the_running_turn() {
         let mut live = session();
-        live.send("one".into(), "/repo".into());
+        send(&mut live, "one");
         live.apply(finished(TurnOutcome::Canceled));
-        live.send("two".into(), "/repo".into());
+        send(&mut live, "two");
         live.forget_finished();
         let turns = live.turns();
         assert_eq!(turns.len(), 1);

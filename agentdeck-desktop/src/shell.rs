@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use agentdeck_protocol::{
     ActionKind, ActionRequest, ActionRequestVendor, AgentKind, ClaudeCodePermissionMode,
-    ClientCommand, HistoryListItem, HistoryWarning, MAX_HISTORY_LIST_LIMIT, ServerEvent, ThreadId,
-    VendorCapabilities,
+    ClientCommand, HistoryListItem, HistoryWarning, MAX_HISTORY_LIST_LIMIT, ServerEvent,
+    SessionCapabilities, ThreadId,
 };
 use gpui::{
     App, Context, Entity, FocusHandle, IntoElement, ListAlignment, ListState, ParentElement,
@@ -30,6 +30,7 @@ use crate::daemon;
 use crate::live::LiveSession;
 use crate::machines;
 use crate::remotes;
+use crate::session_router::SessionRouter;
 use crate::sidebar;
 use crate::transcript;
 use crate::versions;
@@ -241,11 +242,10 @@ pub(crate) struct AgentHistory {
     pub warnings: Vec<HistoryWarning>,
     /// CLI 实际安装版本；None 表示仍在查询，查询失败记为 "unknown"。
     pub version: Option<String>,
+    capabilities: Option<Result<SessionCapabilities, String>>,
     pub operation: Option<AgentOperation>,
     /// 保留执行的操作，重查版本后仍能正确显示安装或更新结果。
     pub operation_result: Option<(AgentOperation, Result<String, String>)>,
-    /// agent 的 vendor 能力块；会话页按它决定显示哪些权限模式。
-    pub vendor: Option<VendorCapabilities>,
 }
 
 impl AgentHistory {
@@ -258,17 +258,9 @@ impl AgentHistory {
             has_more: false,
             warnings: Vec::new(),
             version: None,
+            capabilities: None,
             operation: None,
             operation_result: None,
-            vendor: None,
-        }
-    }
-
-    /// 能力块里声明的权限模式；没有声明的 agent 不显示选择器。
-    pub fn permission_modes(&self) -> Vec<ClaudeCodePermissionMode> {
-        match &self.vendor {
-            Some(VendorCapabilities::ClaudeCode(caps)) => caps.permission_modes.clone(),
-            _ => Vec::new(),
         }
     }
 
@@ -405,6 +397,10 @@ impl Machine {
                 ..AgentHistory::new(kind)
             })
             .collect();
+    }
+
+    fn supports_interaction(&self) -> bool {
+        self.daemon_protocol == Some(u64::from(agentdeck_protocol::PROTOCOL_VERSION))
     }
 
     pub fn can_update_agents(&self) -> bool {
@@ -779,19 +775,6 @@ impl Shell {
         let Some(host) = self.machine(machine_id).map(|machine| machine.host.clone()) else {
             return;
         };
-        if let ServerEvent::Error {
-            session_id: None,
-            error,
-        } = &event
-        {
-            if error.code == daemon::DISCONNECTED {
-                for live in self.live.iter_mut().filter(|live| live.key.0 == host) {
-                    live.disconnected("与机器的连接已断开，再发消息会重新连接");
-                }
-                self.refresh_live_view(cx);
-            }
-            return;
-        }
         let Some(session_id) = crate::live::event_session(&event).cloned() else {
             return;
         };
@@ -843,6 +826,13 @@ impl Shell {
         };
         let key = session.key();
         let cwd = session.item.cwd.clone();
+        if !self
+            .machines
+            .iter()
+            .any(|machine| machine.host == key.0 && machine.supports_interaction())
+        {
+            return None;
+        }
         let client = self
             .machines
             .iter()
@@ -889,13 +879,19 @@ impl Shell {
         if text.is_empty() {
             return;
         }
+        let initial = match &self.stage {
+            Stage::Session { session, .. } => self
+                .initial_capabilities(session)
+                .and_then(|result| result.as_ref().ok())
+                .cloned(),
+            _ => None,
+        };
         let Some((live, cwd, client)) = self.current_live() else {
             return;
         };
-        if live.running.is_some() {
+        let Some(command) = live.send(text, cwd, initial.as_ref()) else {
             return;
-        }
-        let command = live.send(text, cwd);
+        };
         self.composer
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.dispatch(client, command, cx);
@@ -936,16 +932,33 @@ impl Shell {
 
     /// 跳过权限要再确认一次；其余模式直接生效。
     pub fn choose_mode(&mut self, mode: ClaudeCodePermissionMode, cx: &mut Context<Self>) {
-        if mode == ClaudeCodePermissionMode::BypassPermissions && !self.bypass_armed {
+        if mode == ClaudeCodePermissionMode::BypassPermissions {
             self.bypass_armed = true;
             cx.notify();
             return;
         }
+        self.apply_mode(mode, cx);
+    }
+
+    fn confirm_bypass(&mut self, cx: &mut Context<Self>) {
+        if self.bypass_armed {
+            self.apply_mode(ClaudeCodePermissionMode::BypassPermissions, cx);
+        }
+    }
+
+    fn apply_mode(&mut self, mode: ClaudeCodePermissionMode, cx: &mut Context<Self>) {
         self.bypass_armed = false;
+        let initial = match &self.stage {
+            Stage::Session { session, .. } => self
+                .initial_capabilities(session)
+                .and_then(|result| result.as_ref().ok())
+                .cloned(),
+            _ => None,
+        };
         let Some((live, _, client)) = self.current_live() else {
             return;
         };
-        if let Some(command) = live.set_mode(mode) {
+        if let Some(command) = live.set_mode(mode, initial.as_ref()) {
             self.dispatch(client, command, cx);
         }
         cx.notify();
@@ -982,21 +995,6 @@ impl Shell {
     pub fn cancel_bypass(&mut self, cx: &mut Context<Self>) {
         self.bypass_armed = false;
         cx.notify();
-    }
-
-    /// 当前会话所在机器上该 agent 声明的权限模式。
-    fn permission_modes(&self, session: &Session) -> Vec<ClaudeCodePermissionMode> {
-        self.machines
-            .iter()
-            .find(|machine| machine.host == session.host)
-            .and_then(|machine| {
-                machine
-                    .agents
-                    .iter()
-                    .find(|agent| agent.kind == session.item.agent_kind)
-            })
-            .map(AgentHistory::permission_modes)
-            .unwrap_or_default()
     }
 
     /// 先问 daemon 注册了哪些 agent，再按 agent 分别拉历史：谁先返回谁先进侧栏，
@@ -1060,14 +1058,32 @@ impl Shell {
         .detach();
     }
 
-    /// 机器页展示用；失败只影响版本显示，不影响会话读取。
+    fn initial_capabilities(
+        &self,
+        session: &Session,
+    ) -> Option<&Result<SessionCapabilities, String>> {
+        self.machines
+            .iter()
+            .find(|machine| machine.host == session.host)?
+            .agents
+            .iter()
+            .find(|agent| agent.kind == session.item.agent_kind)?
+            .capabilities
+            .as_ref()
+    }
+
+    /// 同一次能力查询供机器页显示版本和首次续聊路由；失败不影响历史读取。
     fn load_agent_version(&mut self, id: u64, kind: AgentKind, cx: &mut Context<Self>) {
-        let Some(machine) = self.machine(id) else {
+        let Some(machine) = self.machine_mut(id) else {
             return;
         };
+        if let Some(agent) = machine.agents.iter_mut().find(|agent| agent.kind == kind) {
+            agent.capabilities = None;
+        }
         let client = machine.client.clone();
+        cx.notify();
         cx.spawn(async move |this, cx| {
-            let version = cx
+            let capabilities = cx
                 .background_executor()
                 .spawn(async move { client.agent_capabilities(kind) })
                 .await;
@@ -1077,9 +1093,13 @@ impl Shell {
                     .and_then(|machine| machine.agents.iter_mut().find(|a| a.kind == kind));
                 if let Some(agent) = agent {
                     // 查询失败也要明示拿不到，不能留空或显示默认版本。
-                    let (version, vendor) = version.unwrap_or_else(|_| ("unknown".into(), None));
-                    agent.version = Some(version);
-                    agent.vendor = vendor;
+                    agent.version = Some(
+                        capabilities
+                            .as_ref()
+                            .map(|caps| caps.agent_version.clone())
+                            .unwrap_or_else(|_| "unknown".into()),
+                    );
+                    agent.capabilities = Some(capabilities);
                     cx.notify();
                 }
             })
@@ -1237,6 +1257,7 @@ impl Shell {
                     agent.operation = None;
                     agent.operation_result = Some((operation, result));
                     agent.version = None;
+                    agent.capabilities = None;
                     shell.load_agent_version(id, kind, cx);
                     shell.load_agent_sessions(id, kind, cx);
                 }
@@ -1925,13 +1946,77 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let live = self.live.iter().find(|live| session.is(&live.key));
+        let initial_result = self.initial_capabilities(session);
+        let initial = initial_result.and_then(|result| result.as_ref().ok());
+        let router = match live {
+            Some(live) => live.router(initial),
+            None => initial.map(SessionRouter),
+        };
+        let machine = self
+            .machines
+            .iter()
+            .find(|machine| machine.host == session.host);
+        let compatible = machine.is_some_and(Machine::supports_interaction);
         let running = live.is_some_and(|live| live.running.is_some());
         let waiting = live.is_some_and(LiveSession::waiting);
-        let action = live.and_then(|live| live.action.clone());
-        let error = live.and_then(|live| live.error.clone());
         let mode = live.map_or(ClaudeCodePermissionMode::Default, |live| live.mode);
-        let modes = self.permission_modes(session);
+        let modes = if compatible {
+            router
+                .as_ref()
+                .map(|router| router.permission_modes().to_vec())
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
         let shell = cx.entity().downgrade();
+        let can_send = compatible
+            && live.map_or_else(
+                || {
+                    router.as_ref().is_some_and(|router| {
+                        router.supports_messages() && router.start_options(mode).is_ok()
+                    })
+                },
+                |live| live.can_send(initial),
+            );
+        let can_cancel = compatible && live.is_some_and(|live| live.cancel().is_some());
+        let retry_capabilities = initial_result
+            .filter(|result| result.is_err())
+            .and_then(|_| {
+                self.machines
+                    .iter()
+                    .find(|machine| machine.host == session.host)
+            })
+            .map(|machine| (machine.id, session.item.agent_kind));
+        let action = live
+            .filter(|_| compatible)
+            .and_then(|live| live.action().cloned());
+        let error = live.and_then(|live| live.error.clone());
+        let notice = if !compatible {
+            Some(
+                if machine.is_some_and(|machine| machine.daemon_protocol.is_some()) {
+                    "daemon 协议不支持会话交互，请在机器页更新或重装 daemon".to_string()
+                } else {
+                    "正在确认 daemon 协议；检查失败可在机器页重试".to_string()
+                },
+            )
+        } else {
+            match &router {
+                None if live.is_some_and(|live| live.session_id.is_some()) => {
+                    Some("正在建立会话…".to_string())
+                }
+                None => Some(match initial_result {
+                    Some(Err(error)) => format!("无法读取会话能力：{error}"),
+                    _ => "正在读取会话能力…".into(),
+                }),
+                Some(router) if !router.supports_messages() => {
+                    Some("当前来源不支持流式续聊".into())
+                }
+                Some(router) if live.is_none_or(|live| live.session_id.is_none()) => {
+                    router.start_options(mode).err()
+                }
+                _ => None,
+            }
+        };
         let theme = cx.theme();
         let (border, surface, danger) = (theme.border, theme.secondary, theme.danger);
 
@@ -1943,6 +2028,25 @@ impl Shell {
             .pt_2()
             .pb_4()
             .gap_2()
+            .when_some(notice, |section, notice| {
+                section.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(notice),
+                )
+            })
+            .when_some(retry_capabilities, |section, (id, kind)| {
+                section.child(
+                    Button::new("retry-capabilities")
+                        .small()
+                        .outline()
+                        .label("重试读取能力")
+                        .on_click(cx.listener(move |shell, _, _, cx| {
+                            shell.load_agent_version(id, kind, cx)
+                        })),
+                )
+            })
             .when_some(action, |section, action| {
                 section.child(self.render_approval(session, &action, window, cx))
             })
@@ -1975,12 +2079,7 @@ impl Shell {
                                 .small()
                                 .danger()
                                 .label("确认开启")
-                                .on_click(cx.listener(|shell, _, _, cx| {
-                                    shell.choose_mode(
-                                        ClaudeCodePermissionMode::BypassPermissions,
-                                        cx,
-                                    )
-                                })),
+                                .on_click(cx.listener(|shell, _, _, cx| shell.confirm_bypass(cx))),
                         ),
                 )
             })
@@ -2049,12 +2148,14 @@ impl Shell {
                     .child(Input::new(&self.composer).appearance(false).flex_1())
                     .child(if running {
                         Button::new("stop-turn")
+                            .disabled(!can_cancel)
                             .small()
                             .outline()
                             .label("停止")
                             .on_click(cx.listener(|shell, _, _, cx| shell.stop_turn(cx)))
                     } else {
                         Button::new("send-message")
+                            .disabled(!can_send)
                             .small()
                             .primary()
                             .label("发送")
@@ -2079,13 +2180,12 @@ impl Shell {
             | ActionRequestVendor::ClaudeCode { can_persist, .. } => *can_persist,
         };
         let detail = action.detail.as_deref().map(|detail| {
-            let detail = transcript::truncate(detail);
             let markdown = match action.kind {
-                ActionKind::ApprovePlan => detail,
-                ActionKind::ExecuteCommand => transcript::fence("bash", &detail),
-                ActionKind::EditFiles => transcript::fence("diff", &detail),
+                ActionKind::ApprovePlan => detail.to_string(),
+                ActionKind::ExecuteCommand => transcript::fence("bash", detail),
+                ActionKind::EditFiles => transcript::fence("diff", detail),
                 ActionKind::GrantExtraPermission | ActionKind::AnswerQuestions => {
-                    transcript::fence("json", &detail)
+                    transcript::fence("json", detail)
                 }
             };
             transcript::markdown(
@@ -2101,6 +2201,7 @@ impl Shell {
         let picks = live.map(|live| live.picks.clone()).unwrap_or_default();
         let others = live.map(|live| live.others.clone()).unwrap_or_default();
         let answered = live.is_some_and(LiveSession::answered);
+        let revision = live.map_or(0, |live| live.question_revision);
         let saved_texts = live
             .map(|live| live.other_texts.as_slice())
             .unwrap_or_default();
@@ -2111,7 +2212,9 @@ impl Shell {
                 let shell = cx.entity().downgrade();
                 let text = saved_texts.get(ix).cloned().unwrap_or_default();
                 window.use_keyed_state(
-                    SharedString::from(format!("question-other-{key:?}-{request_id}-{ix}")),
+                    SharedString::from(format!(
+                        "question-other-{key:?}-{request_id}-{revision}-{ix}"
+                    )),
                     cx,
                     |window, cx| {
                         let mut input = InputState::new(window, cx).placeholder("输入你的答案");
@@ -2123,7 +2226,7 @@ impl Shell {
                                     if let Some(live) =
                                         shell.live.iter_mut().find(|live| live.key == key)
                                     {
-                                        live.set_other_text(&request_id, ix, text);
+                                        live.set_other_text(&request_id, revision, ix, text);
                                     }
                                 });
                             }

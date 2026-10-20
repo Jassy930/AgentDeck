@@ -2,6 +2,7 @@ mod daemon;
 mod live;
 mod machines;
 mod remotes;
+mod session_router;
 mod shell;
 mod sidebar;
 mod theme;
