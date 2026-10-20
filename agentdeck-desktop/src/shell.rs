@@ -2216,7 +2216,7 @@ impl Shell {
                     .max_w(px(760.))
                     .gap_2()
                     .p_2()
-                    .items_end()
+                    .items_center()
                     .rounded_xl()
                     .border_1()
                     .border_color(border)
@@ -2541,6 +2541,8 @@ impl Shell {
                             .id(SharedString::from(format!("question-summary-{ix}")))
                             .gap_2()
                             .px_2()
+                            .border_1()
+                            .border_color(gpui::transparent_black())
                             .py_1p5()
                             .rounded_md()
                             .items_center()
@@ -2597,17 +2599,25 @@ impl Shell {
                         .when(cursor == index, |row| row.bg(hover))
                         .cursor_pointer()
                         .hover(|row| row.bg(hover))
+                        // 序号和标记贴着标题首行，说明再长也不往中间漂。
+                        .items_start()
                         .text_sm()
                         .child(
-                            div()
-                                .w(px(16.))
+                            h_flex()
+                                .w(px(OPTION_INDEX_WIDTH))
+                                .h(px(OPTION_LINE_HEIGHT))
                                 .flex_shrink_0()
+                                .items_center()
                                 .text_color(muted)
                                 .child(format!("{}", index + 1)),
                         )
                         .child(
-                            div()
+                            h_flex()
+                                .w(px(OPTION_MARKER_WIDTH))
+                                .h(px(OPTION_LINE_HEIGHT))
                                 .flex_shrink_0()
+                                .items_center()
+                                .justify_center()
                                 .text_color(if selected { primary } else { muted })
                                 .child(marker),
                         )
@@ -2615,7 +2625,12 @@ impl Shell {
                             v_flex()
                                 .flex_1()
                                 .min_w(px(0.))
-                                .child(div().when(selected, |d| d.font_semibold()).child(label))
+                                .child(
+                                    div()
+                                        .line_height(px(OPTION_LINE_HEIGHT))
+                                        .when(selected, |d| d.font_semibold())
+                                        .child(label),
+                                )
                                 .when_some(description, |col, description| {
                                     col.child(div().text_xs().text_color(muted).child(description))
                                 }),
@@ -2630,6 +2645,8 @@ impl Shell {
                         let option_count = question.options.len();
                         page.child(
                             h_flex()
+                                // 与选项行的边框 + 内边距对齐，题目文字和序号列齐平。
+                                .px(px(OPTION_ROW_INSET))
                                 .gap_2()
                                 .items_center()
                                 .text_sm()
@@ -2668,7 +2685,7 @@ impl Shell {
                             other_inputs.get(tab).filter(|_| other_on).cloned(),
                             |page, input| {
                                 page.child(
-                                    div().w_full().pl(px(40.)).child(
+                                    div().w_full().pl(px(OPTION_TEXT_INSET)).child(
                                         div()
                                             .w_full()
                                             .px_2()
@@ -2773,6 +2790,16 @@ impl Shell {
             .into_any_element()
     }
 }
+
+/// 提问卡选项行的列宽：序号列、标记列和标题行高，“其他”输入框按同一组数对齐文字列。
+const OPTION_LINE_HEIGHT: f32 = 20.;
+const OPTION_INDEX_WIDTH: f32 = 16.;
+const OPTION_MARKER_WIDTH: f32 = 16.;
+/// 选项行边框(1) + 内边距 px_2(8)。
+const OPTION_ROW_INSET: f32 = 1. + 8.;
+/// 行内缩进 + 序号列 + gap_2(8) + 标记列 + gap_2(8)。
+const OPTION_TEXT_INSET: f32 =
+    OPTION_ROW_INSET + OPTION_INDEX_WIDTH + 8. + OPTION_MARKER_WIDTH + 8.;
 
 fn action_label(kind: &ActionKind) -> &'static str {
     match kind {
