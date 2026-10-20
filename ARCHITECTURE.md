@@ -28,9 +28,10 @@ AgentDeckMobileCore + ios/
 
 唯一允许的本机桌面通路是
 `agentdeck-desktop → typed local client → agentdeckd`。该通路已落地，覆盖历史读取
-（agent list / history list / history read）与续聊：生命周期命令先在同一连接检查协议版本，再写入命令而不等待运行回复，daemon
-推回的 `ServerEvent` 进每台机器的事件通道，桌面按 sessionId 交给 live 会话；新建会话
-尚未接入，selfcheck 也不走这条通路。每台机器一条常驻连接，history 按 requestId
+（agent list / history list / history read）、新建会话与续聊：生命周期命令先在同一连接检查协议版本，再写入命令而不等待运行回复，daemon
+推回的 `ServerEvent` 进每台机器的事件通道，桌面按 sessionId 交给 live 会话。新建会话先以本地 draft key 展示空记录与工作目录输入，
+首条 `SessionStart` 不带 resumeThreadId；收到 `SessionStarted` 的真实 threadId 后替换 draft key 并加入侧栏，后续轮次复用原 session。
+selfcheck 不走这条通路。每台机器一条常驻连接，history 按 requestId
 多路复用，进程退出后下次请求重连。每条连接记录自己的 sessionId，EOF 只向这些会话发
 `daemon-disconnected`，旧连接的迟到通知不会中断新连接上的会话。每个机器实例持有独立 client，异步请求在调度时
 捕获该实例；显式断开取消其请求并回收子进程，旧实例不能自动重连或借用后来重新添加的
@@ -51,7 +52,7 @@ poison 并退出 daemon。protocol v4 增加累计消息的 item identity/state/
 
 ## 分层边界
 
-- `agentdeck-desktop/`：macOS GPUI executable。负责窗口、组件根节点、外壳布局（侧栏 / 空态 / 会话态 / 机器管理页）和桌面 selfcheck。`daemon.rs` 是唯一的数据入口：发送 `AgentList`、`AgentCapabilities`（同次读取 CLI 版本与完整 typed 能力）、`AgentInstall` / `AgentUpdate`（机器页安装／更新 CLI，命令由各 adapter 提供）、`Selfcheck`、`ProtocolVersion`、`History`，以及续聊的 `SessionStart` / `TurnStart` / `TurnCancel` / `ActionDecision` / `VendorControl`；消费 typed reply 与 `ServerEvent`，不解析 vendor JSON。`session_router.rs` 依据 typed `VendorCapabilities` 构造受支持的默认启动选项，以 `StreamingMessages` / `Approval` / `ClaudeCodePermissionMode` 控制续聊、审批与权限模式命令；会话握手后的 `SessionCapabilities` 取代启动前缓存的能力。侧栏与空态卡片按 daemon 返回的 `AgentKind` 迭代生成，来源图标仅用它标识 agent，不按 vendor 分支路由会话操作。阻塞 IPC 一律走 GPUI background executor，UI 线程不等 daemon。机器页另在本机 `curl` 查 npm registry 的 CLI 最新版本（`versions.rs`），并能把与桌面端同版本的预编译 agentdeckd 从 GitHub Release 经 ssh 装到远端 `~/.local/bin`（`remotes.rs`）。
+- `agentdeck-desktop/`：macOS GPUI executable。负责窗口、组件根节点、外壳布局（侧栏 / 空态 / 会话态 / 机器管理页）和桌面 selfcheck。`daemon.rs` 是唯一的数据入口：发送 `AgentList`、`AgentCapabilities`（同次读取 CLI 版本与完整 typed 能力）、`AgentInstall` / `AgentUpdate`（机器页安装／更新 CLI，命令由各 adapter 提供）、`Selfcheck`、`ProtocolVersion`、`History`，以及新建与续聊的 `SessionStart` / `TurnStart` / `TurnCancel` / `ActionDecision` / `VendorControl`；消费 typed reply 与 `ServerEvent`，不解析 vendor JSON。`session_router.rs` 依据 typed `VendorCapabilities` 构造受支持的默认启动选项，以 `StreamingMessages` / `Approval` / `ClaudeCodePermissionMode` 控制消息、审批与权限模式命令；新建与续聊共用此路由，会话握手后的 `SessionCapabilities` 取代启动前缓存的能力。侧栏与空态卡片按 daemon 返回的 `AgentKind` 迭代生成，来源图标仅用它标识 agent，不按 vendor 分支路由会话操作。阻塞 IPC 一律走 GPUI background executor，UI 线程不等 daemon。机器页另在本机 `curl` 查 npm registry 的 CLI 最新版本（`versions.rs`），并能把与桌面端同版本的预编译 agentdeckd 从 GitHub Release 经 ssh 装到远端 `~/.local/bin`（`remotes.rs`）。
 - `Sources/AgentDeckMobileCore/`：iOS 使用的平台无关 Swift 模型，禁止 import AppKit/UIKit。
 - `agentdeck-protocol/`：本地 IPC 协议事实源 crate。分 trunk / capabilities / vendor 三个模块，`PROTOCOL_VERSION` = 8，`protocol_schema()` 聚合本地 v8 类型。
 - `agentdeckd/src/ipc.rs`：re-export `agentdeck-protocol::*` 壳，保持 daemon 内 `crate::ipc::X` 引用不变。
