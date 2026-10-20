@@ -60,6 +60,7 @@ claude --print --input-format stream-json --output-format stream-json \
 | 切权限模式 | `control_request{subtype:"set_permission_mode", mode}` | `control_response{response:{mode}}` |
 | 关闭 | 关闭 stdin | 进程以 0 退出 |
 | 撤回审批 | — | interrupt 时若有待决 `can_use_tool`，CC 发 `control_cancel_request{request_id}`；owner 丢弃路由 |
+| 工具心跳 | — | 工具运行期间约每 30 秒一次 `tool_progress{parent_tool_use_id, elapsed_time_seconds}`；translator 以原 toolUseId 重发运行中快照刷新耗时 |
 
 - `persist=true` 的 approve 会把 `permission_suggestions` 原样作为 `updatedPermissions` 回传。
   CC 按 suggestion 的 destination 落盘；实测在项目 `.claude/settings.local.json` 写入

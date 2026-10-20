@@ -19,6 +19,7 @@ use gpui_component::{
     v_flex,
 };
 
+use crate::live::Activity;
 use crate::shell::{
     Session, SessionKey, Shell, SidebarRow, Stage, machine_label, project_name, session_title,
 };
@@ -105,6 +106,7 @@ pub fn render(
                             row_div.pb_1().child(session_row(
                                 session,
                                 time.clone(),
+                                shell.session_activity(session),
                                 is_selected,
                                 cursor == Some(start + offset),
                                 window,
@@ -330,6 +332,7 @@ fn section_label(text: &str, cx: &Context<Shell>) -> impl IntoElement {
 fn session_row(
     session: &Session,
     time: SharedString,
+    activity: Option<Activity>,
     selected: bool,
     keyboard_cursor: bool,
     window: &Window,
@@ -407,15 +410,22 @@ fn session_row(
                     .child(host),
             )
         })
-        .child(
+        .child({
+            // 工作中的会话用状态替换时间，切走后也能看出哪个还在跑。
+            let (text, color) = match activity {
+                Some(Activity::Working) => ("工作中".into(), cx.theme().success),
+                Some(Activity::AwaitingUser) => ("待确认".into(), cx.theme().warning),
+                None => (time, cx.theme().muted_foreground),
+            };
             div()
                 .w(px(time_width))
                 .flex_shrink_0()
+                .whitespace_nowrap()
                 .text_right()
                 .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(time),
-        )
+                .text_color(color)
+                .child(text)
+        })
         .on_click(cx.listener(move |shell, _, window, cx| {
             shell.sidebar_focus.focus(window);
             shell.open_session(payload.clone(), cx);

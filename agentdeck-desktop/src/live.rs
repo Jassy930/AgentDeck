@@ -58,6 +58,13 @@ const NON_TERMINAL_ERRORS: &[&str] = &[
     "cc-vendor-control-requires-new-turn",
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activity {
+    Working,
+    /// 有待决审批或提问。
+    AwaitingUser,
+}
+
 pub struct LiveTurn {
     prompt: String,
     /// 按 itemId upsert：流式快照和工具开始/完成共用同一个 id。
@@ -555,6 +562,15 @@ impl LiveSession {
         self.question_cursor = 0;
     }
 
+    /// 侧栏用的工作状态：等用户确认优先于工作中；空闲为 `None`。
+    pub fn activity(&self) -> Option<Activity> {
+        if self.action().is_some() {
+            Some(Activity::AwaitingUser)
+        } else {
+            self.running.is_some().then_some(Activity::Working)
+        }
+    }
+
     /// 本轮已发出但 agent 还没有任何输出，也没有待决审批。
     pub fn waiting(&self) -> bool {
         self.running.is_some()
@@ -738,6 +754,18 @@ mod tests {
             send(&mut live, "again"),
             ClientCommand::TurnStart { session_id, .. } if session_id == start.session_id
         ));
+    }
+
+    #[test]
+    fn activity_follows_running_turn() {
+        let mut live = session();
+        assert_eq!(live.activity(), None);
+        send(&mut live, "hi");
+        assert_eq!(live.activity(), Some(super::Activity::Working));
+        live.apply(approval("a"));
+        assert_eq!(live.activity(), Some(super::Activity::AwaitingUser));
+        live.apply(error("cc-not-authenticated"));
+        assert_eq!(live.activity(), None);
     }
 
     #[test]

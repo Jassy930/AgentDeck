@@ -202,6 +202,48 @@ fn tool_progress_refreshes_running_shell_elapsed_time() {
         other => panic!("expected Shell(Running), got {other:?}"),
     }
 
+    // Non-Bash tools refresh their ToolCall card the same way.
+    let agent = json!({
+        "type": "assistant",
+        "session_id": "thread_1",
+        "message": { "content": [{
+            "type": "tool_use",
+            "id": "tu_a1",
+            "name": "WebFetch",
+            "input": { "url": "https://example.com" }
+        }] }
+    });
+    let _ = t.translate_line(&agent.to_string());
+    let progress = json!({
+        "type": "tool_progress",
+        "tool_use_id": "tu_a1-heartbeat-0",
+        "tool_name": "WebFetch",
+        "parent_tool_use_id": "tu_a1",
+        "elapsed_time_seconds": 60
+    });
+    let out = t.translate_line(&progress.to_string());
+    match &out.events[..] {
+        [
+            ServerEvent::AgentItem {
+                item_id,
+                state,
+                item:
+                    AgentItem::ToolCall {
+                        name, meta, result, ..
+                    },
+                ..
+            },
+        ] => {
+            assert_eq!(item_id, "tu_a1");
+            assert_eq!(*state, AgentItemState::Streaming);
+            assert_eq!(name, "WebFetch");
+            assert!(result.is_none());
+            assert_eq!(meta.vendor_extensions["status"], json!("inProgress"));
+            assert_eq!(meta.vendor_extensions["durationMs"], json!(60_000));
+        }
+        other => panic!("expected ToolCall(inProgress), got {other:?}"),
+    }
+
     // Unknown or already-finished parent: consumed, never a Raw card.
     let orphan = json!({
         "type": "tool_progress",

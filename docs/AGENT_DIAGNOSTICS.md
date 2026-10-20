@@ -197,9 +197,10 @@ CC `stream-json` 中 `system.subtype=init` 只用于抓取原生 `session_id`。
 `attempt`、`error`、`errorStatus`、`maxRetries` 和 `retryDelayMs`，不进入
 中立 `AgentItem` 主干，也不透传原始 vendor JSON。
 
-顶层 `tool_progress` 是工具运行期间约每 30 秒一次的心跳。仍在运行的 Bash
-会以原 `toolUseId` 重发 `Shell{running}` 快照并带上 `durationMs`（桌面显示
-“运行中 · 30.0s”）；其他工具或已结束工具的心跳直接丢弃，不再显示为
+顶层 `tool_progress` 是工具运行期间约每 30 秒一次的心跳。仍在运行的工具
+会以原 `toolUseId` 重发运行中快照：Bash 为 `Shell{running}` 带 `durationMs`，
+其他工具为 `ToolCall` 带 `status=inProgress` 与 `durationMs`（桌面显示
+“运行中 · 30.0s”）；Edit/Write 类工具和已结束工具的心跳直接丢弃，不再显示为
 “暂不支持的内容”。
 
 ## Approval 卡住排查
