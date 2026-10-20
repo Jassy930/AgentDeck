@@ -85,6 +85,10 @@ pub struct LiveSession {
     pub other_texts: Vec<String>,
     /// 同 requestId 的题目变化时也重建输入框，避免恢复旧题草稿。
     pub question_revision: u64,
+    /// 提问卡当前页：0..题数为各题，多题时最后一页是汇总提交页。
+    pub question_tab: usize,
+    /// 当前页键盘光标：0..选项数为各选项，等于选项数时是“其他”。
+    pub question_cursor: usize,
 }
 
 impl LiveSession {
@@ -103,7 +107,81 @@ impl LiveSession {
             others: Vec::new(),
             other_texts: Vec::new(),
             question_revision: 0,
+            question_tab: 0,
+            question_cursor: 0,
         }
+    }
+
+    fn question_count(&self) -> usize {
+        self.action()
+            .and_then(|action| action.questions.as_ref())
+            .map_or(0, Vec::len)
+    }
+
+    /// 页数：一题时没有汇总页，和 Claude Code TUI 一致。
+    pub fn tab_count(&self) -> usize {
+        match self.question_count() {
+            0 | 1 => self.question_count(),
+            count => count + 1,
+        }
+    }
+
+    pub fn on_summary_tab(&self) -> bool {
+        self.tab_count() > self.question_count() && self.question_tab == self.question_count()
+    }
+
+    pub fn set_tab(&mut self, tab: usize) {
+        if tab < self.tab_count() {
+            self.question_tab = tab;
+            self.question_cursor = 0;
+        }
+    }
+
+    /// 左右切页，不循环。
+    pub fn step_tab(&mut self, forward: bool) {
+        let tab = if forward {
+            self.question_tab + 1
+        } else {
+            self.question_tab.saturating_sub(1)
+        };
+        self.set_tab(tab);
+    }
+
+    /// 上下移动光标，范围含末尾的“其他”。
+    pub fn move_cursor(&mut self, down: bool) {
+        let Some(options) = self
+            .action()
+            .and_then(|action| action.questions.as_ref())
+            .and_then(|questions| questions.get(self.question_tab))
+            .map(|question| question.options.len())
+        else {
+            return;
+        };
+        self.question_cursor = if down {
+            (self.question_cursor + 1).min(options)
+        } else {
+            self.question_cursor.saturating_sub(1)
+        };
+    }
+
+    /// 某题的答案：选项按原顺序，加上“其他”的草稿，用 ", " 连接。没答或“其他”留空为 None。
+    pub fn answer_text(&self, question: usize) -> Option<String> {
+        let asked = self.action()?.questions.as_ref()?.get(question)?;
+        let picks = self.picks.get(question)?;
+        let mut chosen: Vec<&str> = asked
+            .options
+            .iter()
+            .filter(|option| picks.contains(&option.label))
+            .map(|option| option.label.as_str())
+            .collect();
+        if self.others.get(question).copied().unwrap_or(false) {
+            let other = self.other_texts.get(question).map(|text| text.trim())?;
+            if other.is_empty() {
+                return None;
+            }
+            chosen.push(other);
+        }
+        (!chosen.is_empty()).then(|| chosen.join(", "))
     }
 
     fn question_is_multi(&self, question: usize) -> Option<bool> {
@@ -149,14 +227,6 @@ impl LiveSession {
         }
     }
 
-    /// 每题都有选择（选项或“其他”）才算答完。
-    pub fn answered(&self) -> bool {
-        self.picks
-            .iter()
-            .zip(&self.others)
-            .all(|(picks, other)| !picks.is_empty() || *other)
-    }
-
     /// 单选题点选即替换，多选题点选即切换。
     pub fn toggle_pick(&mut self, question: usize, label: &str) {
         let Some(asked) = self
@@ -185,36 +255,24 @@ impl LiveSession {
         }
     }
 
-    /// 作答：每题的选项按原顺序，加上“其他”里填的文字，用 ", " 连接。
-    /// 有题没答或“其他”没填时返回给用户看的提示。
+    /// 作答。有题没答或“其他”留空时停到那题，并返回给用户看的提示。
     pub fn answer(&mut self) -> Result<ClientCommand, String> {
         let session_id = self.session_id.clone().ok_or("会话已结束")?;
-        let action = self.action().ok_or("没有待回答的问题")?;
-        let questions = action.questions.as_ref().ok_or("没有待回答的问题")?;
+        let questions = self
+            .action()
+            .and_then(|action| action.questions.clone())
+            .ok_or("没有待回答的问题")?;
         let mut answers = std::collections::BTreeMap::new();
         for (ix, question) in questions.iter().enumerate() {
-            let picks = self.picks.get(ix).map(Vec::as_slice).unwrap_or_default();
-            let mut chosen: Vec<String> = question
-                .options
-                .iter()
-                .filter(|option| picks.contains(&option.label))
-                .map(|option| option.label.clone())
-                .collect();
-            if self.others.get(ix).copied().unwrap_or(false) {
-                let text = self
-                    .other_texts
-                    .get(ix)
-                    .map(|text| text.trim())
-                    .unwrap_or_default();
-                if text.is_empty() {
-                    return Err(format!("“{}”选了其他，请填写内容", question.question));
-                }
-                chosen.push(text.to_string());
-            }
-            if chosen.is_empty() {
-                return Err(format!("还没回答“{}”", question.question));
-            }
-            answers.insert(question.question.clone(), chosen.join(", "));
+            let Some(text) = self.answer_text(ix) else {
+                self.set_tab(ix);
+                return Err(if self.others.get(ix).copied().unwrap_or(false) {
+                    format!("“{}”选了其他，请填写内容", question.question)
+                } else {
+                    format!("还没回答“{}”", question.question)
+                });
+            };
+            answers.insert(question.question.clone(), text);
         }
         let request = self.actions.pop_front().expect("checked above");
         self.reset_questions();
@@ -475,6 +533,8 @@ impl LiveSession {
         self.others = vec![false; count];
         self.other_texts = vec![String::new(); count];
         self.question_revision += 1;
+        self.question_tab = 0;
+        self.question_cursor = 0;
     }
 
     /// 本轮已发出但 agent 还没有任何输出，也没有待决审批。
@@ -769,6 +829,18 @@ mod tests {
                 },
             },
         });
+        assert_eq!(live.tab_count(), 3, "two questions plus the summary");
+        live.move_cursor(true);
+        live.move_cursor(true);
+        live.move_cursor(true);
+        assert_eq!(live.question_cursor, 2, "two options plus 其他");
+        live.step_tab(true);
+        assert_eq!((live.question_tab, live.question_cursor), (1, 0));
+        live.step_tab(true);
+        assert!(live.on_summary_tab());
+        live.step_tab(true);
+        assert!(live.on_summary_tab(), "no wrap past the summary");
+
         live.toggle_pick(0, "红");
         live.toggle_other(0);
         assert!(
@@ -777,15 +849,20 @@ mod tests {
         );
         live.toggle_pick(0, "蓝");
         assert!(!live.others[0], "single select: an option replaces other");
-        assert!(!live.answered());
+        assert_eq!(live.answer_text(0).as_deref(), Some("蓝"));
+        assert_eq!(live.answer_text(1), None);
         assert!(live.answer().unwrap_err().contains("水果"));
+        assert_eq!(
+            live.question_tab, 1,
+            "a blocked submit jumps to the question"
+        );
 
         live.toggle_pick(1, "橙子");
         live.toggle_pick(1, "香蕉");
         live.toggle_pick(1, "苹果");
         live.toggle_pick(1, "香蕉");
         live.toggle_other(1);
-        assert!(live.answered());
+        assert_eq!(live.answer_text(1), None, "an empty other is no answer");
         assert!(
             live.answer().unwrap_err().contains("其他"),
             "an empty other is rejected"
@@ -916,7 +993,8 @@ mod tests {
         assert_eq!(decision.request_id, "q1");
         assert_eq!(decision.answers.unwrap()["选择"], "A, 自定义");
         assert_eq!(live.action().unwrap().request_id, "q2");
-        assert!(!live.answered());
+        assert_eq!(live.answer_text(0), None);
+        assert_eq!(live.tab_count(), 1, "one question has no summary tab");
         assert_eq!(live.other_texts, vec![""]);
         assert!(live.decide(true, false, None).is_none());
         live.toggle_pick(0, "B");
