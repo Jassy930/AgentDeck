@@ -220,7 +220,8 @@ CLI harness 验证，不能把桌面壳当成可用审批客户端。
 | `cc-process-exited` | 常驻 `claude` 子进程意外退出或关闭 stdout | message 附带退出状态和 stderr 尾部；按其复现，必要时重开会话 |
 | `cc-stdin-write-failed` | 向 `claude` stdin 写 user 行或 control 消息失败 | 子进程大概率已退出，见随后的 `cc-process-exited` |
 | `cc-cleanup-failed` | 关闭会话时子进程未能在宽限期内退出且无法回收 | daemon 会 poison；检查残留 `claude` 进程 |
-| `cc-decision-no-route` | ActionDecision 的 requestId 没有对应的待决 `can_use_tool` | 该请求已被决定，或所在 turn 已结束 |
+| `cc-decision-no-route` | ActionDecision 的 requestId 没有对应的待决 `can_use_tool` | 该请求已被决定、被 CC 撤回（`control_cancel_request`），或所在 turn 已结束 |
+| `cc-permission-mode-rejected` | CC 拒绝 `set_permission_mode`（会话不中断，模式保持不变） | 按 message 处理；旧 daemon 启动的会话没带 `--allow-dangerously-skip-permissions`，切到 bypass 会被拒，重开会话即可 |
 | `cc-vendor-control-not-supported` | 收到不支持的 ClaudeCodeVendorControl variant | 检查 client 与 daemon 协议版本是否匹配（v4）；升级 client 到最新版 |
 
 ## v0.2 双 adapter 探测

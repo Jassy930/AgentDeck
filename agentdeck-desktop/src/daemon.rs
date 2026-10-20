@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use agentdeck_protocol::{
     AgentKind, ClientCommand, HistoryListItem, HistoryReply, HistoryRequest, HistoryResponse,
-    HistoryTurn, HistoryWarning, ProtocolError, ServerEvent, ThreadId,
+    HistoryTurn, HistoryWarning, ProtocolError, ServerEvent, ThreadId, VendorCapabilities,
 };
 
 /// 连接断开时推给事件消费者的错误码：该机器上所有 live 会话都随 daemon 结束。
@@ -610,15 +610,22 @@ impl Client {
     }
 
     /// 该机器上 agent CLI 的实际安装版本。
-    pub fn agent_version(&self, agent_kind: AgentKind) -> Result<String> {
+    /// CLI 实际版本，以及 vendor 能力块（如 Claude Code 支持的权限模式）。
+    /// 能力块解析不了只丢能力，不影响版本显示。
+    pub fn agent_capabilities(
+        &self,
+        agent_kind: AgentKind,
+    ) -> Result<(String, Option<VendorCapabilities>)> {
         let reply = self.round_trip(
             &ClientCommand::AgentCapabilities { agent_kind },
             "agentCapabilities",
         )?;
-        reply["capabilities"]["agentVersion"]
+        let version = reply["capabilities"]["agentVersion"]
             .as_str()
             .map(str::to_owned)
-            .ok_or_else(|| "agentCapabilities 回复缺少 agentVersion".to_string())
+            .ok_or_else(|| "agentCapabilities 回复缺少 agentVersion".to_string())?;
+        let vendor = serde_json::from_value(reply["capabilities"]["vendor"].clone()).ok();
+        Ok((version, vendor))
     }
 
     /// 旧 daemon 没有自身版本字段，但 selfcheck 仍提供协议版本。
@@ -1133,7 +1140,7 @@ mod tests {
             .into_iter()
             .map(|kind| {
                 let client = std::sync::Arc::clone(&client);
-                std::thread::spawn(move || (kind, client.agent_version(kind).unwrap()))
+                std::thread::spawn(move || (kind, client.agent_capabilities(kind).unwrap().0))
             })
             .collect();
         for handle in handles {

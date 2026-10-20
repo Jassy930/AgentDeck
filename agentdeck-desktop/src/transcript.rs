@@ -285,7 +285,7 @@ fn is_binary(text: &str) -> bool {
 }
 
 /// 用比正文里最长反引号串更长的围栏包住代码，避免正文自带 ``` 提前闭合。
-fn fence(lang: &str, code: &str) -> String {
+pub(crate) fn fence(lang: &str, code: &str) -> String {
     let mut longest = 0;
     let mut run = 0;
     for c in code.chars() {
@@ -309,7 +309,7 @@ fn one_line(text: &str) -> String {
     }
 }
 
-fn truncate(body: &str) -> String {
+pub(crate) fn truncate(body: &str) -> String {
     if body.chars().count() <= BODY_LIMIT {
         return body.to_string();
     }
@@ -506,7 +506,7 @@ fn summary_row(
         })
 }
 
-fn markdown(
+pub(crate) fn markdown(
     id: ElementId,
     body: &SharedString,
     window: &mut Window,

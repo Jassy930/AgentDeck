@@ -9,8 +9,9 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use agentdeck_protocol::{
-    AgentKind, ClientCommand, HistoryListItem, HistoryWarning, MAX_HISTORY_LIST_LIMIT, ServerEvent,
-    ThreadId,
+    ActionKind, ActionRequest, ActionRequestVendor, AgentKind, ClaudeCodePermissionMode,
+    ClientCommand, HistoryListItem, HistoryWarning, MAX_HISTORY_LIST_LIMIT, ServerEvent, ThreadId,
+    VendorCapabilities,
 };
 use gpui::{
     App, Context, Entity, FocusHandle, IntoElement, ListAlignment, ListState, ParentElement,
@@ -21,6 +22,7 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     h_flex,
     input::{Input, InputEvent, InputState},
+    menu::{DropdownMenu, PopupMenuItem},
     v_flex,
 };
 
@@ -242,6 +244,8 @@ pub(crate) struct AgentHistory {
     pub operation: Option<AgentOperation>,
     /// 保留执行的操作，重查版本后仍能正确显示安装或更新结果。
     pub operation_result: Option<(AgentOperation, Result<String, String>)>,
+    /// agent 的 vendor 能力块；会话页按它决定显示哪些权限模式。
+    pub vendor: Option<VendorCapabilities>,
 }
 
 impl AgentHistory {
@@ -256,6 +260,15 @@ impl AgentHistory {
             version: None,
             operation: None,
             operation_result: None,
+            vendor: None,
+        }
+    }
+
+    /// 能力块里声明的权限模式；没有声明的 agent 不显示选择器。
+    pub fn permission_modes(&self) -> Vec<ClaudeCodePermissionMode> {
+        match &self.vendor {
+            Some(VendorCapabilities::ClaudeCode(caps)) => caps.permission_modes.clone(),
+            _ => Vec::new(),
         }
     }
 
@@ -636,6 +649,8 @@ pub struct Shell {
     live: Vec<LiveSession>,
     /// 会话页底部输入框：Enter 发送，⌘Enter 换行。
     composer: Entity<InputState>,
+    /// 选了“跳过所有权限”，等待二次确认。
+    bypass_armed: bool,
 }
 
 impl Shell {
@@ -707,6 +722,7 @@ impl Shell {
             update_armed: None,
             live: Vec::new(),
             composer,
+            bypass_armed: false,
         };
         if connect_daemon {
             shell.add_machine(None, cx);
@@ -895,14 +911,64 @@ impl Shell {
         }
     }
 
-    pub fn decide(&mut self, approve: bool, cx: &mut Context<Self>) {
+    /// 拒绝时输入框里的文字作为反馈交给 agent（计划审批靠它改计划）。
+    pub fn decide(
+        &mut self,
+        approve: bool,
+        persist: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let feedback = self.composer.read(cx).value().trim().to_string();
+        let message = (!approve && !feedback.is_empty()).then_some(feedback);
         let Some((live, _, client)) = self.current_live() else {
             return;
         };
-        if let Some(command) = live.decide(approve) {
+        if let Some(command) = live.decide(approve, persist, message.clone()) {
+            self.dispatch(client, command, cx);
+            if message.is_some() {
+                self.composer
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+            }
+        }
+        cx.notify();
+    }
+
+    /// 跳过权限要再确认一次；其余模式直接生效。
+    pub fn choose_mode(&mut self, mode: ClaudeCodePermissionMode, cx: &mut Context<Self>) {
+        if mode == ClaudeCodePermissionMode::BypassPermissions && !self.bypass_armed {
+            self.bypass_armed = true;
+            cx.notify();
+            return;
+        }
+        self.bypass_armed = false;
+        let Some((live, _, client)) = self.current_live() else {
+            return;
+        };
+        if let Some(command) = live.set_mode(mode) {
             self.dispatch(client, command, cx);
         }
         cx.notify();
+    }
+
+    pub fn cancel_bypass(&mut self, cx: &mut Context<Self>) {
+        self.bypass_armed = false;
+        cx.notify();
+    }
+
+    /// 当前会话所在机器上该 agent 声明的权限模式。
+    fn permission_modes(&self, session: &Session) -> Vec<ClaudeCodePermissionMode> {
+        self.machines
+            .iter()
+            .find(|machine| machine.host == session.host)
+            .and_then(|machine| {
+                machine
+                    .agents
+                    .iter()
+                    .find(|agent| agent.kind == session.item.agent_kind)
+            })
+            .map(AgentHistory::permission_modes)
+            .unwrap_or_default()
     }
 
     /// 先问 daemon 注册了哪些 agent，再按 agent 分别拉历史：谁先返回谁先进侧栏，
@@ -975,7 +1041,7 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             let version = cx
                 .background_executor()
-                .spawn(async move { client.agent_version(kind) })
+                .spawn(async move { client.agent_capabilities(kind) })
                 .await;
             this.update(cx, |shell, cx| {
                 let agent = shell
@@ -983,7 +1049,9 @@ impl Shell {
                     .and_then(|machine| machine.agents.iter_mut().find(|a| a.kind == kind));
                 if let Some(agent) = agent {
                     // 查询失败也要明示拿不到，不能留空或显示默认版本。
-                    agent.version = Some(version.unwrap_or_else(|_| "unknown".into()));
+                    let (version, vendor) = version.unwrap_or_else(|_| ("unknown".into(), None));
+                    agent.version = Some(version);
+                    agent.vendor = vendor;
                     cx.notify();
                 }
             })
@@ -1458,6 +1526,7 @@ impl Shell {
         if let Some(live) = self.live.iter_mut().find(|live| session.is(&live.key)) {
             live.forget_finished();
         }
+        self.bypass_armed = false;
         self.sidebar_cursor = Some(session.key());
         self.next_read_id += 1;
         let read_id = self.next_read_id;
@@ -1815,23 +1884,28 @@ impl Shell {
             )
             .child(body)
             .when(matches!(transcript, Transcript::Ready { .. }), |section| {
-                section.child(self.render_composer(session, cx))
+                section.child(self.render_composer(session, window, cx))
             })
     }
 
-    /// 底部续聊区：待决审批、最近错误、输入框和发送/停止按钮；固定高度，不被记录挤压。
+    /// 底部续聊区：待决审批、跳过权限确认、最近错误、权限模式、输入框和发送/停止按钮；
+    /// 固定高度，不被记录挤压。
     fn render_composer(
         &self,
         session: &Session,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let live = self.live.iter().find(|live| session.is(&live.key));
         let running = live.is_some_and(|live| live.running.is_some());
+        let waiting = live.is_some_and(LiveSession::waiting);
         let action = live.and_then(|live| live.action.clone());
         let error = live.and_then(|live| live.error.clone());
+        let mode = live.map_or(ClaudeCodePermissionMode::Default, |live| live.mode);
+        let modes = self.permission_modes(session);
+        let shell = cx.entity().downgrade();
         let theme = cx.theme();
-        let (border, surface, danger, warning) =
-            (theme.border, theme.secondary, theme.danger, theme.warning);
+        let (border, surface, danger) = (theme.border, theme.secondary, theme.danger);
 
         v_flex()
             .w_full()
@@ -1842,6 +1916,9 @@ impl Shell {
             .pb_4()
             .gap_2()
             .when_some(action, |section, action| {
+                section.child(self.render_approval(&action, window, cx))
+            })
+            .when(self.bypass_armed, |section| {
                 section.child(
                     h_flex()
                         .w_full()
@@ -1852,36 +1929,42 @@ impl Shell {
                         .items_center()
                         .rounded_lg()
                         .border_1()
-                        .border_color(warning.opacity(0.5))
-                        .bg(warning.opacity(0.08))
+                        .border_color(danger.opacity(0.5))
+                        .bg(danger.opacity(0.08))
+                        .text_sm()
+                        .child(div().flex_1().min_w(px(0.)).child(
+                            "跳过所有权限后，agent 执行命令、改动文件都不再询问。确定开启？",
+                        ))
                         .child(
-                            Icon::empty()
-                                .xsmall()
-                                .path(crate::ALERT_ICON)
-                                .text_color(warning),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .text_sm()
-                                .line_clamp(2)
-                                .child(format!("请求授权：{}", action.summary)),
-                        )
-                        .child(
-                            Button::new("deny-action")
+                            Button::new("cancel-bypass")
                                 .small()
                                 .outline()
-                                .label("拒绝")
-                                .on_click(cx.listener(|shell, _, _, cx| shell.decide(false, cx))),
+                                .label("取消")
+                                .on_click(cx.listener(|shell, _, _, cx| shell.cancel_bypass(cx))),
                         )
                         .child(
-                            Button::new("approve-action")
+                            Button::new("confirm-bypass")
                                 .small()
-                                .primary()
-                                .label("允许")
-                                .on_click(cx.listener(|shell, _, _, cx| shell.decide(true, cx))),
+                                .danger()
+                                .label("确认开启")
+                                .on_click(cx.listener(|shell, _, _, cx| {
+                                    shell.choose_mode(
+                                        ClaudeCodePermissionMode::BypassPermissions,
+                                        cx,
+                                    )
+                                })),
                         ),
+                )
+            })
+            .when(waiting, |section| {
+                // CC 启动时要先跑用户配置的 hook，首个输出可能要等一会儿。
+                section.child(
+                    div()
+                        .w_full()
+                        .max_w(px(760.))
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("等待 agent 响应…"),
                 )
             })
             .when_some(error, |section, error| {
@@ -1906,6 +1989,35 @@ impl Shell {
                     .border_1()
                     .border_color(border)
                     .bg(surface)
+                    .when(!modes.is_empty(), |row| {
+                        row.child(
+                            Button::new("permission-mode")
+                                .small()
+                                .ghost()
+                                .label(mode_label(mode))
+                                .child(Icon::empty().xsmall().path(crate::CHEVRON_DOWN_ICON))
+                                .when(mode == ClaudeCodePermissionMode::BypassPermissions, |b| {
+                                    b.text_color(danger)
+                                })
+                                .dropdown_menu_with_anchor(
+                                    gpui::Corner::BottomLeft,
+                                    move |menu, _, _| {
+                                        modes.iter().fold(menu, |menu, &option| {
+                                            let shell = shell.clone();
+                                            menu.item(
+                                                PopupMenuItem::new(mode_menu_label(option))
+                                                    .checked(option == mode)
+                                                    .on_click(move |_, _, cx| {
+                                                        let _ = shell.update(cx, |shell, cx| {
+                                                            shell.choose_mode(option, cx)
+                                                        });
+                                                    }),
+                                            )
+                                        })
+                                    },
+                                ),
+                        )
+                    })
                     .child(Input::new(&self.composer).appearance(false).flex_1())
                     .child(if running {
                         Button::new("stop-turn")
@@ -1923,6 +2035,161 @@ impl Shell {
                             )
                     }),
             )
+    }
+
+    /// 审批卡：类型、摘要、可滚动的完整内容和决定按钮。计划审批的“拒绝”是继续规划。
+    fn render_approval(
+        &self,
+        action: &ActionRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let plan = matches!(action.kind, ActionKind::ApprovePlan);
+        let can_persist = match &action.vendor {
+            ActionRequestVendor::Codex { can_persist, .. }
+            | ActionRequestVendor::ClaudeCode { can_persist, .. } => *can_persist,
+        };
+        let detail = action.detail.as_deref().map(|detail| {
+            let detail = transcript::truncate(detail);
+            let markdown = match action.kind {
+                ActionKind::ApprovePlan => detail,
+                ActionKind::ExecuteCommand => transcript::fence("bash", &detail),
+                ActionKind::EditFiles => transcript::fence("diff", &detail),
+                ActionKind::GrantExtraPermission => transcript::fence("json", &detail),
+            };
+            transcript::markdown(
+                SharedString::from(format!("approval-{}", action.request_id)).into(),
+                &markdown.into(),
+                window,
+                cx,
+            )
+        });
+        let theme = cx.theme();
+        let (warning, muted) = (theme.warning, theme.muted_foreground);
+
+        v_flex()
+            .w_full()
+            .max_w(px(760.))
+            .gap_2()
+            .px_3()
+            .py_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(warning.opacity(0.5))
+            .bg(warning.opacity(0.08))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .text_sm()
+                    .child(
+                        Icon::empty()
+                            .xsmall()
+                            .path(crate::ALERT_ICON)
+                            .text_color(warning),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .font_semibold()
+                            .child(action_label(&action.kind)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_color(muted)
+                            .child(action.summary.clone()),
+                    ),
+            )
+            .when_some(detail, |card, detail| {
+                card.child(
+                    div()
+                        .id("approval-detail")
+                        .w_full()
+                        .max_h(px(240.))
+                        .overflow_y_scroll()
+                        .child(detail),
+                )
+            })
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_xs()
+                            .text_color(muted)
+                            .child(if plan {
+                                "输入框里的文字会作为修改意见随“继续规划”发出"
+                            } else {
+                                "拒绝时输入框里的文字会作为理由发给 agent"
+                            }),
+                    )
+                    .child(
+                        Button::new("deny-action")
+                            .small()
+                            .outline()
+                            .label(if plan { "继续规划" } else { "拒绝" })
+                            .on_click(cx.listener(|shell, _, window, cx| {
+                                shell.decide(false, false, window, cx)
+                            })),
+                    )
+                    .when(can_persist, |row| {
+                        row.child(
+                            Button::new("always-allow-action")
+                                .small()
+                                .outline()
+                                .label("总是允许")
+                                .on_click(cx.listener(|shell, _, window, cx| {
+                                    shell.decide(true, true, window, cx)
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("approve-action")
+                            .small()
+                            .primary()
+                            .label(if plan { "开始执行" } else { "允许" })
+                            .on_click(cx.listener(|shell, _, window, cx| {
+                                shell.decide(true, false, window, cx)
+                            })),
+                    ),
+            )
+    }
+}
+
+fn action_label(kind: &ActionKind) -> &'static str {
+    match kind {
+        ActionKind::ExecuteCommand => "执行命令",
+        ActionKind::EditFiles => "编辑文件",
+        ActionKind::GrantExtraPermission => "使用工具",
+        ActionKind::ApprovePlan => "批准计划",
+    }
+}
+
+fn mode_label(mode: ClaudeCodePermissionMode) -> &'static str {
+    match mode {
+        ClaudeCodePermissionMode::Default => "默认",
+        ClaudeCodePermissionMode::AcceptEdits => "接受编辑",
+        ClaudeCodePermissionMode::Plan => "计划",
+        ClaudeCodePermissionMode::Auto => "自动",
+        ClaudeCodePermissionMode::DontAsk => "不询问",
+        ClaudeCodePermissionMode::BypassPermissions => "跳过权限",
+    }
+}
+
+fn mode_menu_label(mode: ClaudeCodePermissionMode) -> &'static str {
+    match mode {
+        ClaudeCodePermissionMode::Default => "默认 · 逐项询问",
+        ClaudeCodePermissionMode::AcceptEdits => "接受编辑 · 文件改动不再询问",
+        ClaudeCodePermissionMode::Plan => "计划 · 只规划，批准后执行",
+        ClaudeCodePermissionMode::Auto => "自动 · 由模型判断是否需要询问",
+        ClaudeCodePermissionMode::DontAsk => "不询问 · 未预授权的工具一律拒绝",
+        ClaudeCodePermissionMode::BypassPermissions => "跳过权限 · 全部放行（危险）",
     }
 }
 

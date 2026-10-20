@@ -8,9 +8,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentdeck_protocol::{
     ActionDecision, ActionDecisionKind, ActionRequest, AgentItem, AgentItemMeta, AgentKind,
-    ClaudeCodePermissionMode, ClaudeCodeSessionOptions, ClientCommand, CodexApprovalPolicy,
-    CodexReasoningEffort, CodexSandboxMode, CodexSessionOptions, HistoryTurn, InitialTurn,
-    ServerEvent, SessionId, SessionStart, TurnId, TurnOutcome, VendorSessionOptions,
+    ClaudeCodePermissionMode, ClaudeCodeSessionOptions, ClaudeCodeVendorControl,
+    ClaudeCodeVendorPanelEvent, ClientCommand, CodexApprovalPolicy, CodexReasoningEffort,
+    CodexSandboxMode, CodexSessionOptions, HistoryTurn, InitialTurn, ServerEvent, SessionId,
+    SessionStart, TurnId, TurnOutcome, VendorControlPayload, VendorPanelPayload,
+    VendorSessionOptions,
 };
 
 use crate::shell::SessionKey;
@@ -29,9 +31,9 @@ fn next_id(prefix: &str) -> String {
     )
 }
 
-/// 桌面发起会话的默认启动选项。Claude Code 用 default 权限模式，工具调用走界面审批；
+/// 桌面发起会话的启动选项。Claude Code 按界面选择的权限模式启动；
 /// Codex 只接受 daemon 固定的 M0 选项。
-fn vendor_options(kind: AgentKind) -> VendorSessionOptions {
+fn vendor_options(kind: AgentKind, mode: ClaudeCodePermissionMode) -> VendorSessionOptions {
     match kind {
         AgentKind::Codex => VendorSessionOptions::Codex(CodexSessionOptions {
             approval_policy: CodexApprovalPolicy::Never,
@@ -41,7 +43,7 @@ fn vendor_options(kind: AgentKind) -> VendorSessionOptions {
             mcp_overrides: vec![],
         }),
         AgentKind::ClaudeCode => VendorSessionOptions::ClaudeCode(ClaudeCodeSessionOptions {
-            permission_mode: ClaudeCodePermissionMode::Default,
+            permission_mode: mode,
             model: None,
             effort: None,
             hooks: vec![],
@@ -79,6 +81,9 @@ const NON_TERMINAL_ERRORS: &[&str] = &[
     "record_write_failed",
     "cc-decision-no-route",
     "action-decision-not-supported",
+    "cc-permission-mode-rejected",
+    "cc-vendor-control-not-supported",
+    "cc-vendor-control-requires-new-turn",
 ];
 
 pub struct LiveTurn {
@@ -98,6 +103,8 @@ pub struct LiveSession {
     turns: Vec<LiveTurn>,
     pub action: Option<ActionRequest>,
     pub error: Option<String>,
+    /// 会话里实际生效的权限模式：开始前是本地选择，开始后只跟 daemon 的模式事件。
+    pub mode: ClaudeCodePermissionMode,
 }
 
 impl LiveSession {
@@ -110,6 +117,7 @@ impl LiveSession {
             turns: Vec::new(),
             action: None,
             error: None,
+            mode: ClaudeCodePermissionMode::Default,
         }
     }
 
@@ -140,7 +148,7 @@ impl LiveSession {
             cwd,
             resume_thread_id: Some(thread_id.clone()),
             initial_turn: Some(InitialTurn { turn_id, prompt }),
-            vendor_options: vendor_options(*kind),
+            vendor_options: vendor_options(*kind, self.mode),
             runtime_options: Default::default(),
         })
     }
@@ -152,7 +160,27 @@ impl LiveSession {
         })
     }
 
-    pub fn decide(&mut self, approve: bool) -> Option<ClientCommand> {
+    /// 会话没开始时只改本地选择，下次 SessionStart 带上；开始后交给 daemon，
+    /// 显示等 `PermissionModeChanged`（CC 可能拒绝）。
+    pub fn set_mode(&mut self, mode: ClaudeCodePermissionMode) -> Option<ClientCommand> {
+        let Some(session_id) = self.session_id.clone() else {
+            self.mode = mode;
+            return None;
+        };
+        Some(ClientCommand::VendorControl {
+            session_id,
+            payload: VendorControlPayload::ClaudeCode(
+                ClaudeCodeVendorControl::UpdatePermissionMode(mode),
+            ),
+        })
+    }
+
+    pub fn decide(
+        &mut self,
+        approve: bool,
+        persist: bool,
+        message: Option<String>,
+    ) -> Option<ClientCommand> {
         let request = self.action.take()?;
         Some(ClientCommand::ActionDecision {
             session_id: self.session_id.clone()?,
@@ -163,8 +191,8 @@ impl LiveSession {
                 } else {
                     ActionDecisionKind::Deny
                 },
-                persist: false,
-                message: None,
+                persist,
+                message,
             },
         })
     }
@@ -203,6 +231,13 @@ impl LiveSession {
                 }
             }
             ServerEvent::ActionRequest { request, .. } => self.action = Some(request),
+            ServerEvent::VendorPanelEvent {
+                payload:
+                    VendorPanelPayload::ClaudeCode(ClaudeCodeVendorPanelEvent::PermissionModeChanged {
+                        mode,
+                    }),
+                ..
+            } => self.mode = mode,
             ServerEvent::TurnFinished { outcome, error, .. } => {
                 self.finish_turn();
                 if outcome == TurnOutcome::Failed {
@@ -240,6 +275,13 @@ impl LiveSession {
         if let Some(turn) = self.turns.last_mut() {
             turn.finished = true;
         }
+    }
+
+    /// 本轮已发出但 agent 还没有任何输出，也没有待决审批。
+    pub fn waiting(&self) -> bool {
+        self.running.is_some()
+            && self.action.is_none()
+            && self.turns.last().is_some_and(|turn| turn.items.is_empty())
     }
 
     pub fn turns(&self) -> Vec<HistoryTurn> {
@@ -316,6 +358,7 @@ mod tests {
         assert_eq!(start.resume_thread_id, Some(ThreadId("thread".into())));
         assert_eq!(start.initial_turn.map(|t| t.prompt).as_deref(), Some("hi"));
         assert!(live.running.is_some());
+        assert!(live.waiting());
 
         live.apply(ServerEvent::SessionStarted {
             session_id: start.session_id.clone(),
@@ -364,6 +407,47 @@ mod tests {
     }
 
     #[test]
+    fn permission_mode_is_local_before_start_and_event_driven_after() {
+        let mut live = session();
+        assert!(live.set_mode(ClaudeCodePermissionMode::Plan).is_none());
+        let ClientCommand::SessionStart(start) = live.send("hi".into(), "/repo".into()) else {
+            panic!("first send must start a session");
+        };
+        assert!(matches!(
+            start.vendor_options,
+            VendorSessionOptions::ClaudeCode(ClaudeCodeSessionOptions {
+                permission_mode: ClaudeCodePermissionMode::Plan,
+                ..
+            })
+        ));
+
+        assert!(matches!(
+            live.set_mode(ClaudeCodePermissionMode::BypassPermissions),
+            Some(ClientCommand::VendorControl { .. })
+        ));
+        assert_eq!(
+            live.mode,
+            ClaudeCodePermissionMode::Plan,
+            "waits for the event"
+        );
+        live.apply(error("cc-permission-mode-rejected"));
+        assert!(
+            live.running.is_some(),
+            "a rejected switch keeps the turn running"
+        );
+        live.apply(ServerEvent::VendorPanelEvent {
+            session_id: SessionId("s".into()),
+            agent_kind: AgentKind::ClaudeCode,
+            payload: VendorPanelPayload::ClaudeCode(
+                ClaudeCodeVendorPanelEvent::PermissionModeChanged {
+                    mode: ClaudeCodePermissionMode::AcceptEdits,
+                },
+            ),
+        });
+        assert_eq!(live.mode, ClaudeCodePermissionMode::AcceptEdits);
+    }
+
+    #[test]
     fn record_warnings_keep_the_turn_running() {
         let mut live = session();
         live.send("hi".into(), "/repo".into());
@@ -399,9 +483,11 @@ mod tests {
             },
         });
         assert!(matches!(
-            live.decide(true),
+            live.decide(false, false, Some("换个做法".into())),
             Some(ClientCommand::ActionDecision { decision, .. })
-                if decision.request_id == "perm-1" && decision.decision == ActionDecisionKind::Approve
+                if decision.request_id == "perm-1"
+                    && decision.decision == ActionDecisionKind::Deny
+                    && decision.message.as_deref() == Some("换个做法")
         ));
         assert!(live.action.is_none());
 
