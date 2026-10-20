@@ -7,6 +7,17 @@ import XCTest
 /// `serde_json` output, Swift decodes via `JSONDecoder`; both must agree
 /// on field names, tag discriminators, and enum value renames.
 final class ProtocolV2DecodingTests: XCTestCase {
+    func testQuestionMultiSelectDefaultsToFalseAndPreservesExplicitTrue() throws {
+        let json = #"[{"question":"颜色","options":[{"label":"蓝"}]},{"question":"水果","options":[{"label":"苹果"}],"multiSelect":true}]"#
+        let questions = try JSONDecoder().decode([UserQuestion].self, from: Data(json.utf8))
+        XCTAssertFalse(questions[0].multiSelect)
+        XCTAssertTrue(questions[1].multiSelect)
+        XCTAssertEqual(
+            try JSONDecoder().decode([UserQuestion].self, from: JSONEncoder().encode(questions)),
+            questions
+        )
+    }
+
     private func decodeServerEvent(_ json: String) throws -> ServerEvent {
         try JSONDecoder().decode(ServerEvent.self, from: Data(json.utf8))
     }

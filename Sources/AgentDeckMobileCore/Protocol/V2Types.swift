@@ -514,6 +514,18 @@ public struct UserQuestion: Codable, Sendable, Equatable {
     public let header: String?
     public let options: [UserQuestionOption]
     public let multiSelect: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case question, header, options, multiSelect
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        question = try c.decode(String.self, forKey: .question)
+        header = try c.decodeIfPresent(String.self, forKey: .header)
+        options = try c.decode([UserQuestionOption].self, forKey: .options)
+        multiSelect = try c.decodeIfPresent(Bool.self, forKey: .multiSelect) ?? false
+    }
 }
 
 public struct UserQuestionOption: Codable, Sendable, Equatable {

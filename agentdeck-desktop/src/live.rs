@@ -109,6 +109,8 @@ pub struct LiveSession {
     pub picks: Vec<Vec<String>>,
     /// 待决提问每题是否选了“其他”（自由输入）。
     pub others: Vec<bool>,
+    /// 草稿随会话保留，切走再回来时重建输入框。
+    pub other_texts: Vec<String>,
 }
 
 impl LiveSession {
@@ -124,6 +126,7 @@ impl LiveSession {
             mode: ClaudeCodePermissionMode::Default,
             picks: Vec::new(),
             others: Vec::new(),
+            other_texts: Vec::new(),
         }
     }
 
@@ -134,6 +137,17 @@ impl LiveSession {
             .as_ref()?
             .get(question)
             .map(|asked| asked.multi_select)
+    }
+
+    pub fn set_other_text(&mut self, request_id: &str, question: usize, text: String) {
+        if self
+            .action
+            .as_ref()
+            .is_some_and(|action| action.request_id == request_id)
+            && let Some(saved) = self.other_texts.get_mut(question)
+        {
+            *saved = text;
+        }
     }
 
     /// 单选题选“其他”会清掉已选选项；多选题与选项并存。
@@ -192,8 +206,8 @@ impl LiveSession {
     }
 
     /// 作答：每题的选项按原顺序，加上“其他”里填的文字，用 ", " 连接。
-    /// `others` 是各题“其他”输入框的内容；有题没答或“其他”没填时返回给用户看的提示。
-    pub fn answer(&mut self, others: &[String]) -> Result<ClientCommand, String> {
+    /// 有题没答或“其他”没填时返回给用户看的提示。
+    pub fn answer(&mut self) -> Result<ClientCommand, String> {
         let session_id = self.session_id.clone().ok_or("会话已结束")?;
         let action = self.action.as_ref().ok_or("没有待回答的问题")?;
         let questions = action.questions.as_ref().ok_or("没有待回答的问题")?;
@@ -207,7 +221,11 @@ impl LiveSession {
                 .map(|option| option.label.clone())
                 .collect();
             if self.others.get(ix).copied().unwrap_or(false) {
-                let text = others.get(ix).map(|text| text.trim()).unwrap_or_default();
+                let text = self
+                    .other_texts
+                    .get(ix)
+                    .map(|text| text.trim())
+                    .unwrap_or_default();
                 if text.is_empty() {
                     return Err(format!("“{}”选了其他，请填写内容", question.question));
                 }
@@ -219,6 +237,7 @@ impl LiveSession {
             answers.insert(question.question.clone(), chosen.join(", "));
         }
         let request = self.action.take().expect("checked above");
+        self.clear_questions();
         Ok(ClientCommand::ActionDecision {
             session_id,
             decision: ActionDecision {
@@ -296,6 +315,7 @@ impl LiveSession {
             return None;
         }
         let request = self.action.take()?;
+        self.clear_questions();
         Some(ClientCommand::ActionDecision {
             session_id: self.session_id.clone()?,
             decision: ActionDecision {
@@ -349,6 +369,7 @@ impl LiveSession {
                 let count = request.questions.as_ref().map_or(0, Vec::len);
                 self.picks = vec![Vec::new(); count];
                 self.others = vec![false; count];
+                self.other_texts = vec![String::new(); count];
                 self.action = Some(request);
             }
             ServerEvent::VendorPanelEvent {
@@ -392,9 +413,16 @@ impl LiveSession {
     fn finish_turn(&mut self) {
         self.running = None;
         self.action = None;
+        self.clear_questions();
         if let Some(turn) = self.turns.last_mut() {
             turn.finished = true;
         }
+    }
+
+    fn clear_questions(&mut self) {
+        self.picks.clear();
+        self.others.clear();
+        self.other_texts.clear();
     }
 
     /// 本轮已发出但 agent 还没有任何输出，也没有待决审批。
@@ -615,7 +643,7 @@ mod tests {
         live.toggle_pick(0, "蓝");
         assert!(!live.others[0], "single select: an option replaces other");
         assert!(!live.answered());
-        assert!(live.answer(&[]).unwrap_err().contains("水果"));
+        assert!(live.answer().unwrap_err().contains("水果"));
 
         live.toggle_pick(1, "橙子");
         live.toggle_pick(1, "香蕉");
@@ -624,20 +652,24 @@ mod tests {
         live.toggle_other(1);
         assert!(live.answered());
         assert!(
-            live.answer(&["".into(), "  ".into()])
-                .unwrap_err()
-                .contains("其他"),
+            live.answer().unwrap_err().contains("其他"),
             "an empty other is rejected"
         );
-        let Ok(ClientCommand::ActionDecision { decision, .. }) =
-            live.answer(&["".into(), " 芒果 ".into()])
-        else {
+        live.set_other_text("ask-1", 1, " 芒果 ".into());
+        live.forget_finished();
+        assert_eq!(
+            live.other_texts[1], " 芒果 ",
+            "reopening keeps the answer draft"
+        );
+        live.set_other_text("old-request", 1, "stale input".into());
+        let Ok(ClientCommand::ActionDecision { decision, .. }) = live.answer() else {
             panic!("every question is answered");
         };
         let answers = decision.answers.unwrap();
         assert_eq!(answers["颜色"], "蓝");
         assert_eq!(answers["水果"], "苹果, 橙子, 芒果");
         assert!(live.action.is_none());
+        assert!(live.other_texts.is_empty());
     }
 
     #[test]

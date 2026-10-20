@@ -965,12 +965,11 @@ impl Shell {
         cx.notify();
     }
 
-    /// 提交提问的回答；`others` 是各题“其他”输入框的内容。
-    pub fn submit_answers(&mut self, others: Vec<String>, cx: &mut Context<Self>) {
+    pub fn submit_answers(&mut self, cx: &mut Context<Self>) {
         let Some((live, _, client)) = self.current_live() else {
             return;
         };
-        match live.answer(&others) {
+        match live.answer() {
             Ok(command) => {
                 live.error = None;
                 self.dispatch(client, command, cx);
@@ -1945,7 +1944,7 @@ impl Shell {
             .pb_4()
             .gap_2()
             .when_some(action, |section, action| {
-                section.child(self.render_approval(&action, window, cx))
+                section.child(self.render_approval(session, &action, window, cx))
             })
             .when(self.bypass_armed, |section| {
                 section.child(
@@ -2069,6 +2068,7 @@ impl Shell {
     /// 审批卡：类型、摘要、可滚动的完整内容和决定按钮。计划审批的“拒绝”是继续规划。
     fn render_approval(
         &self,
+        session: &Session,
         action: &ActionRequest,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2097,20 +2097,40 @@ impl Shell {
         });
         let questions = action.questions.clone().unwrap_or_default();
         let asking = !questions.is_empty();
-        let live = self
-            .live
-            .iter()
-            .find(|live| live.action.as_ref().map(|a| &a.request_id) == Some(&action.request_id));
+        let live = self.live.iter().find(|live| session.is(&live.key));
         let picks = live.map(|live| live.picks.clone()).unwrap_or_default();
         let others = live.map(|live| live.others.clone()).unwrap_or_default();
         let answered = live.is_some_and(LiveSession::answered);
-        // “其他”输入框跟着这次提问走，换一次提问就是新的输入框。
+        let saved_texts = live
+            .map(|live| live.other_texts.as_slice())
+            .unwrap_or_default();
         let other_inputs: Vec<Entity<InputState>> = (0..questions.len())
             .map(|ix| {
+                let key = session.key();
+                let request_id = action.request_id.clone();
+                let shell = cx.entity().downgrade();
+                let text = saved_texts.get(ix).cloned().unwrap_or_default();
                 window.use_keyed_state(
-                    SharedString::from(format!("question-other-{}-{ix}", action.request_id)),
+                    SharedString::from(format!("question-other-{key:?}-{request_id}-{ix}")),
                     cx,
-                    |window, cx| InputState::new(window, cx).placeholder("输入你的答案"),
+                    |window, cx| {
+                        let mut input = InputState::new(window, cx).placeholder("输入你的答案");
+                        input.set_value(text, window, cx);
+                        cx.subscribe(&cx.entity(), move |input, _, event: &InputEvent, cx| {
+                            if matches!(event, InputEvent::Change) {
+                                let text = input.value().to_string();
+                                let _ = shell.update(cx, |shell, _| {
+                                    if let Some(live) =
+                                        shell.live.iter_mut().find(|live| live.key == key)
+                                    {
+                                        live.set_other_text(&request_id, ix, text);
+                                    }
+                                });
+                            }
+                        })
+                        .detach();
+                        input
+                    },
                 )
             })
             .collect();
@@ -2240,9 +2260,19 @@ impl Shell {
                         .child(detail),
                 )
             })
-            .children(question_rows)
+            .when(asking, |card| {
+                card.child(
+                    div()
+                        .id("approval-questions")
+                        .w_full()
+                        .max_h(px(240.))
+                        .overflow_y_scroll()
+                        .child(v_flex().gap_2().children(question_rows)),
+                )
+            })
             .child(
                 h_flex()
+                    .flex_shrink_0()
                     .gap_2()
                     .items_center()
                     .child(
@@ -2299,11 +2329,7 @@ impl Shell {
                             .disabled(asking && !answered)
                             .on_click(cx.listener(move |shell, _, window, cx| {
                                 if asking {
-                                    let texts = other_inputs
-                                        .iter()
-                                        .map(|input| input.read(cx).value().to_string())
-                                        .collect();
-                                    shell.submit_answers(texts, cx);
+                                    shell.submit_answers(cx);
                                 } else {
                                     shell.decide(true, false, window, cx);
                                 }
