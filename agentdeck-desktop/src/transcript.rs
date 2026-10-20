@@ -97,6 +97,15 @@ impl Block {
     }
 }
 
+/// 过程块行尾状态：“运行中 · 30.0s”“失败 · 退出码 1 · 2.0s”。
+fn status_tail(state: Option<String>, duration_ms: Option<u64>) -> Option<SharedString> {
+    let tail: Vec<String> = state
+        .into_iter()
+        .chain(duration_ms.map(|ms| format!("{:.1}s", ms as f64 / 1000.)))
+        .collect();
+    (!tail.is_empty()).then(|| tail.join(" · ").into())
+}
+
 pub fn describe(item: &AgentItem) -> Block {
     match item {
         AgentItem::UserMessage { text, meta } => {
@@ -163,20 +172,30 @@ pub fn describe(item: &AgentItem) -> Block {
                 }),
                 ShellStatus::Canceled => Some("已取消".to_string()),
             };
-            let tail: Vec<String> = state
-                .into_iter()
-                .chain(duration_ms.map(|ms| format!("{:.1}s", ms as f64 / 1000.)))
-                .collect();
             let body = fence("sh", &truncate(command.trim()));
             Block {
-                status: (!tail.is_empty()).then(|| tail.join(" · ").into()),
+                status: status_tail(state, *duration_ms),
                 failed: matches!(status, ShellStatus::Failed),
                 ..Block::detail("命令", summary, body)
             }
         }
         AgentItem::ToolCall {
-            name, args, result, ..
+            name,
+            args,
+            result,
+            meta,
         } => {
+            // Codex 与 CC 都把工具状态与耗时放在这两个扩展键里。
+            let ext = &meta.vendor_extensions;
+            let status = ext.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            let failed = status == "failed";
+            let state = match status {
+                "inProgress" => Some("运行中".to_string()),
+                "failed" => Some("失败".to_string()),
+                "declined" => Some("已拒绝".to_string()),
+                _ => None,
+            };
+            let duration_ms = ext.get("durationMs").and_then(|v| v.as_u64());
             let summary = match arg_hint(args) {
                 Some(hint) => format!("{name}  {hint}"),
                 None => name.clone(),
@@ -204,7 +223,11 @@ pub fn describe(item: &AgentItem) -> Block {
                     ));
                 }
             }
-            Block::detail("工具", summary, body)
+            Block {
+                status: status_tail(state, duration_ms),
+                failed,
+                ..Block::detail("工具", summary, body)
+            }
         }
         AgentItem::Diff { files, .. } => {
             let paths: Vec<String> = files
@@ -991,6 +1014,35 @@ mod tests {
         assert!(long.summary.as_ref().unwrap().ends_with('…'));
         assert!(long.body.contains(&command));
         assert_eq!(long.status, shell.status);
+    }
+
+    #[test]
+    fn tool_shows_status_and_duration_from_extensions() {
+        let tool = |status: &str, duration: serde_json::Value| {
+            let mut meta = meta();
+            meta.vendor_extensions
+                .insert("status".into(), status.into());
+            meta.vendor_extensions.insert("durationMs".into(), duration);
+            describe(&AgentItem::ToolCall {
+                name: "WebFetch".into(),
+                args: serde_json::json!({}),
+                result: None,
+                meta,
+            })
+        };
+        let running = tool("inProgress", 30_000.into());
+        assert_eq!(
+            running.status.as_ref().map(|s| s.as_str()),
+            Some("运行中 · 30.0s")
+        );
+        assert!(!running.failed);
+        let failed = tool("failed", 1500.into());
+        assert_eq!(
+            failed.status.as_ref().map(|s| s.as_str()),
+            Some("失败 · 1.5s")
+        );
+        assert!(failed.failed);
+        assert_eq!(tool("completed", serde_json::Value::Null).status, None);
     }
 
     #[test]

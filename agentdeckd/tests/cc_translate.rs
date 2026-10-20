@@ -155,6 +155,107 @@ fn tool_result_after_bash_emits_shell_completion() {
 }
 
 #[test]
+fn tool_progress_refreshes_running_shell_elapsed_time() {
+    let mut t = tr();
+    let tu = json!({
+        "type": "assistant",
+        "session_id": "thread_1",
+        "message": { "content": [{
+            "type": "tool_use",
+            "id": "tu_b1",
+            "name": "Bash",
+            "input": { "command": "sleep 60" }
+        }] }
+    });
+    let _ = t.translate_line(&tu.to_string());
+    // Shape observed from claude: heartbeat id is derived, parent is the tool.
+    let progress = json!({
+        "type": "tool_progress",
+        "tool_use_id": "tu_b1-heartbeat-0",
+        "tool_name": "Bash",
+        "parent_tool_use_id": "tu_b1",
+        "elapsed_time_seconds": 30,
+        "heartbeat": true,
+        "session_id": "thread_1"
+    });
+    let out = t.translate_line(&progress.to_string());
+    assert_eq!(out.events.len(), 1);
+    match &out.events[0] {
+        ServerEvent::AgentItem {
+            item_id,
+            state,
+            item:
+                AgentItem::Shell {
+                    command,
+                    status,
+                    duration_ms,
+                    ..
+                },
+            ..
+        } => {
+            assert_eq!(item_id, "tu_b1");
+            assert_eq!(*state, AgentItemState::Streaming);
+            assert_eq!(command, "sleep 60");
+            assert!(matches!(status, ShellStatus::Running));
+            assert_eq!(*duration_ms, Some(30_000));
+        }
+        other => panic!("expected Shell(Running), got {other:?}"),
+    }
+
+    // Non-Bash tools refresh their ToolCall card the same way.
+    let agent = json!({
+        "type": "assistant",
+        "session_id": "thread_1",
+        "message": { "content": [{
+            "type": "tool_use",
+            "id": "tu_a1",
+            "name": "WebFetch",
+            "input": { "url": "https://example.com" }
+        }] }
+    });
+    let _ = t.translate_line(&agent.to_string());
+    let progress = json!({
+        "type": "tool_progress",
+        "tool_use_id": "tu_a1-heartbeat-0",
+        "tool_name": "WebFetch",
+        "parent_tool_use_id": "tu_a1",
+        "elapsed_time_seconds": 60
+    });
+    let out = t.translate_line(&progress.to_string());
+    match &out.events[..] {
+        [
+            ServerEvent::AgentItem {
+                item_id,
+                state,
+                item:
+                    AgentItem::ToolCall {
+                        name, meta, result, ..
+                    },
+                ..
+            },
+        ] => {
+            assert_eq!(item_id, "tu_a1");
+            assert_eq!(*state, AgentItemState::Streaming);
+            assert_eq!(name, "WebFetch");
+            assert!(result.is_none());
+            assert_eq!(meta.vendor_extensions["status"], json!("inProgress"));
+            assert_eq!(meta.vendor_extensions["durationMs"], json!(60_000));
+        }
+        other => panic!("expected ToolCall(inProgress), got {other:?}"),
+    }
+
+    // Unknown or already-finished parent: consumed, never a Raw card.
+    let orphan = json!({
+        "type": "tool_progress",
+        "tool_use_id": "tu_x-heartbeat-0",
+        "tool_name": "Agent",
+        "parent_tool_use_id": "tu_x",
+        "elapsed_time_seconds": 30
+    });
+    assert!(t.translate_line(&orphan.to_string()).events.is_empty());
+}
+
+#[test]
 fn tool_result_with_error_emits_shell_failed() {
     let mut t = tr();
     let tu = json!({

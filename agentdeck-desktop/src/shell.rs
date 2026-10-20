@@ -879,6 +879,14 @@ impl Shell {
         }
     }
 
+    /// 本客户端续聊过的会话当前是否在工作；其他客户端或 CLI 里跑的会话看不到。
+    pub(crate) fn session_activity(&self, session: &Session) -> Option<crate::live::Activity> {
+        self.live
+            .iter()
+            .find(|live| session.is(&live.key))
+            .and_then(LiveSession::activity)
+    }
+
     /// 当前会话页的记录 = 历史块 + live 块；只换 blocks，列表由 render 对账。
     fn refresh_live_view(&mut self, cx: &mut Context<Self>) {
         if let Stage::Session {

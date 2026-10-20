@@ -37,6 +37,10 @@
 //!     (initialize / interrupt / set_permission_mode); consumed silently.
 //!   - `"control_cancel_request"` — CC withdrew a pending `can_use_tool`
 //!     prompt; consumed silently, the owner drops the route.
+//!   - `"tool_progress"` — heartbeat every ~30s while a tool runs
+//!     (`parent_tool_use_id`, `elapsed_time_seconds`). An in-flight tool
+//!     re-emits its running snapshot (Shell `duration_ms` / ToolCall
+//!     `durationMs`); Diff tools and unknown parents are consumed silently.
 //!
 //! ## Cumulative semantics
 //!
@@ -197,6 +201,7 @@ impl ClaudeCodeTranslator {
             // pending `can_use_tool` with `control_cancel_request` (e.g.
             // after an interrupt) and the owner drops its route.
             "control_response" | "control_cancel_request" => TranslateOutput::default(),
+            "tool_progress" => self.handle_tool_progress(&parsed),
             _ => self.raw_event(kind, trimmed),
         }
     }
@@ -519,6 +524,58 @@ impl ClaudeCodeTranslator {
             },
         );
         Some(event)
+    }
+
+    /// Refresh a running tool card's elapsed time; never surfaces as Raw.
+    fn handle_tool_progress(&mut self, parsed: &Value) -> TranslateOutput {
+        let Some(id) = parsed
+            .get("parent_tool_use_id")
+            .or_else(|| parsed.get("tool_use_id"))
+            .and_then(Value::as_str)
+        else {
+            return TranslateOutput::default();
+        };
+        let Some(record) = self.in_flight_tools.get(id) else {
+            return TranslateOutput::default();
+        };
+        let elapsed_ms = parsed
+            .get("elapsed_time_seconds")
+            .and_then(Value::as_f64)
+            .map(|secs| (secs * 1000.) as u64)
+            .unwrap_or_else(|| now_ms().saturating_sub(record.started_at_ms));
+        let item = match record.name.as_str() {
+            "Bash" => AgentItem::Shell {
+                command: record
+                    .input
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                status: ShellStatus::Running,
+                exit_code: None,
+                duration_ms: Some(elapsed_ms),
+                meta: tool_meta(id, &record.name),
+            },
+            // Diff cards carry no running state.
+            "Edit" | "Write" | "MultiEdit" => return TranslateOutput::default(),
+            name => {
+                let mut meta = tool_meta(id, name);
+                meta.vendor_extensions
+                    .insert("status".into(), json!("inProgress"));
+                meta.vendor_extensions
+                    .insert("durationMs".into(), json!(elapsed_ms));
+                AgentItem::ToolCall {
+                    name: name.to_string(),
+                    args: record.input.clone(),
+                    result: None,
+                    meta,
+                }
+            }
+        };
+        TranslateOutput {
+            events: vec![self.item_event(item, None, AgentItemState::Streaming)],
+            permission_route_hint: None,
+        }
     }
 
     // ── user snapshot (tool_result echo) ───────────────────────────────────
