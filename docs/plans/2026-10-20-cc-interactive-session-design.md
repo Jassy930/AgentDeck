@@ -77,7 +77,7 @@ claude --print --input-format stream-json --output-format stream-json \
   1. 有 turn 在跑就先 interrupt；
   2. 关闭 stdin；
   3. 在 10 秒内继续排空 stdout；
-  4. wait 子进程，超时则 kill 进程组，最后再清扫一次进程组；
+  4. 使用 owner 启动时保存的 PGID 回收进程组；即使 direct child 已被 wait，也清扫其残留工具进程并确认组已消失，无法确认则报 `cc-cleanup-failed`；
   5. 发 exit 信号，由 hub 发出唯一一个 `SessionClosed`。
 - 子进程意外退出时：正在跑的 turn 报 `TurnFinished(failed, closing, cc-process-exited)`，错误信息里附 stderr 尾部；
   会话以 `failed` 收口。
@@ -86,20 +86,25 @@ claude --print --input-format stream-json --output-format stream-json \
 ## P2 桌面续聊（2026-10-20 已实施）
 
 - `daemon.rs`：每个 `Client` 一条 `async-channel` 事件通道。读线程把非回复行解析成
-  `ServerEvent` 推入通道，连接结束时补推 `Error{sessionId:null, code:daemon-disconnected}`；
-  `send()` 只写不等回复。
+  `ServerEvent` 推入通道；每条连接记录经它启动的 sessionId，连接结束时逐会话推送
+  `Error{sessionId, code:daemon-disconnected}`，已关闭会话不再通知。旧连接的迟到 EOF 不影响新连接上的会话。
+  `send()` 只写不等回复；`AgentCapabilities` 同次读取并缓存 CLI 版本与完整 typed 能力。
 - `live.rs`：纯状态机 `LiveSession`。首次发送生成 `SessionStart(resumeThreadId, initialTurn)`，
-  之后发 `TurnStart`。按 itemId upsert 流式条目；`Error` 会清掉运行状态，会话没起来或
-  daemon 不认识时，下次发送重新 SessionStart。重新打开会话时丢弃已完成的轮次，因为它们已写进 vendor 历史。
+  之后发 `TurnStart`。按 itemId upsert 流式条目；终止性 `Error` 清掉运行状态，会话没起来或
+  daemon 不认识时，下次发送重新 SessionStart。审批按 requestId 保存在 `VecDeque`，依到达顺序逐项处理，
+  同 requestId 更新原请求；断线、写失败或本轮结束时清空待决审批。重新打开会话时丢弃已完成的轮次，因为它们已写进 vendor 历史。
 - `shell.rs`：每台机器一个事件监听任务，按 machine id 定位，不按 host，避免重新添加同名机器时串线。
   会话页底部有审批条、错误行、输入框和发送/停止按钮，记录区 = 历史块 + live 块。
 - `transcript.rs`：`append` 平移 live 块的组下标；`render` 发现 blocks 换了一份时，
   保留已展开的组重算可见行，并跟随到底部。
-- N2：输入框对所有会话显示，按 kind 只构造 `VendorSessionOptions`（vendor 命名空间）；
-  CC 用 default 权限模式，Codex 用 daemon 固定的 M0 选项（未从桌面验证）。
-- 实窗验证：在临时目录新建一次性 CC 会话，用临时环境变量开关自动打开会话并发送消息，截图确认
+- N2：`SessionRouter` 按 typed `VendorCapabilities` 构造 `VendorSessionOptions`，确认 advertised 能力支持默认配置；
+  CC 保持 default 权限模式，Codex 保持 daemon 固定的 M0 选项（未从桌面验证），缺失支持时不回退放宽权限。
+  首轮使用缓存的 agent 能力，`SessionCapabilities` 握手后改以会话能力为准：`StreamingMessages` 启用续聊，
+  `Approval` 启用审批；停止要求已收到会话能力且有运行中的 turn，协议没有单独的取消 capability。
+  UI 按钮与键盘处理使用同一能力判定。
+- 初始实窗验证：在临时目录新建一次性 CC 会话，用临时环境变量开关自动打开会话并发送消息，截图确认
   历史、续聊气泡、流式"变更"条目、审批条和"停止"按钮都已渲染。点击"允许 / 拒绝 / 停止"
-  需要真实鼠标，未自动验证。
+  当时未验证；下述 PR #43 修复验证补齐了 fake daemon 下的实际按钮操作。
 
 ## P3 权限功能（2026-10-20，协议 v8）
 
@@ -115,13 +120,16 @@ claude --print --input-format stream-json --output-format stream-json \
 实现：
 - 协议 v8：`ActionRequest.detail`、`ActionKind::ApprovePlan`、`ActionDecision.message`、CC `canPersist`、
   `ClaudeCodeVendorPanelEvent::PermissionModeChanged`。新字段可缺省，v7 形状仍能解码；Swift 镜像已同步。
-- owner 写出 `set_permission_mode` 后立即回复 hub（hub 在 stdin 循环里内联处理，不能阻塞），并登记 request_id；
+- owner 写出 `set_permission_mode` 后立即回复 hub（不等待 CC 回包，以免阻塞后续生命周期命令），并登记 request_id；
   CC 回 success 时发 `PermissionModeChanged`，回 error 时发 `Error(cc-permission-mode-rejected)`。
   translator 跟踪 system 行里的模式，相同模式不重复发。
 - hub 把 VendorControl 放进有序 lifecycle 队列：之前紧跟 SessionStart 发出的模式切换会先于会话注册执行，
   报 session-not-found。
-- 桌面：模式选择器的列表来自 `AgentCapabilities` 的 vendor 能力块（N2）；会话开始前改的是本地选择，
-  开始后发 VendorControl，显示只认事件。"跳过权限"需要二次确认。审批卡显示 detail；拒绝时输入框文字作为 message。
+- 桌面：模式选择器与命令都通过 `SessionRouter` 路由，启动前用完整 `AgentCapabilities`，
+  启动后只用 `SessionCapabilities` 的 feature 与模式列表。开始前改本地选择，开始后发 VendorControl，显示只认事件。
+  下拉选择“跳过权限”只展开确认条，必须点击“确认开启”才发命令。审批卡保留 detail 全文并滚动显示；
+  审批按 requestId 排队，persist 与拒绝反馈 message 都交给当前请求。
+  daemon 协议未知或非 v8 时禁用交互；Client 在实际发送连接上检查 ProtocolVersion，旧 daemon 不会收到 v8 审批字段，历史仍可读取。
   本轮还没有任何输出时显示"等待 agent 响应…"（GUI 环境下用户插件的 hook 可能让 CC 首个输出等上几分钟，实测约 2 分钟）。
 
 验证：离线 owner 测试（切模式成功/被拒）、translator 测试（模式事件去重、计划审批、Edit patch）、
@@ -163,3 +171,24 @@ desktop live 测试（开始前本地、开始后事件驱动）；经 daemon �
   - `SessionClosed(closed)`，共 56 个 streaming 快照；
   - 另起 daemon 用 `resumeThreadId` 续聊，模型记得前文，`persist=true` 后同类 Bash 不再询问。
   - `AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_claude_code`：修复 cwd 后 9/9 通过。
+
+### PR #43 审查修复验证（2026-10-20）
+
+- 离线回归通过：desktop 83 项功能测试与新增的 1 项会话 UI vendor 边界测试、CC session 4 项测试，
+  以及完整 `scripts/verify-offline-tests.sh`。覆盖审批队列、断线与写失败状态清理、旧连接 EOF 隔离、
+  能力握手路由，以及 direct child 已 wait 后的进程组回收。
+- 当前 checkout 构建的 daemon/CLI selfcheck 与 diagnostics report 通过，desktop selfcheck 通过；
+  `swift test` 的 XCTest 76 项、Swift Testing 31 项通过。
+- `/bin/bash script/build_and_run.sh --verify` 验证真实 bundle 初始化、内置 daemon 和 macOS 15.0 最低版本。
+  交互阶段使用独立 bundle 标识和临时 fake daemon：能力读取首次失败后点击重试，确认恢复发送；
+  两条待决审批依次点击允许、拒绝；下一轮点击停止，界面恢复发送。
+  fake daemon 命令记录确认两个不同 requestId 分别收到 approve/deny，并收到对应 turn 的 `TurnCancel`。
+- 本轮未运行真实 vendor E2E，以上实窗按钮结果只证明离线 IPC/UI 路径；Codex 桌面发送、远端续聊仍待实测。
+  上述 2 秒 reset 与 10 秒 CC 收尾窗口仍是已知限制。
+
+### PR #44 整合回归（2026-10-20）
+
+- 桌面 87 项离线测试通过，覆盖旧协议拒绝交互但保留只读请求、同连接协议检查、
+  会话握手覆盖预查询权限模式、模式拒绝后状态不变、审批队列中 persist 与反馈的请求关联。
+- PR #43 的能力重试、多个审批、旧连接 EOF 隔离与进程组清理实现均保留。
+- 本轮真实 vendor、桌面权限按钮点击与 bundle 验证尚未执行；此前真实链路记录不替代本轮验证。

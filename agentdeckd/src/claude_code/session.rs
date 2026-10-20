@@ -141,6 +141,8 @@ impl Owner {
         initial_turn: Option<(TurnId, String)>,
         exit: oneshot::Sender<AgentSessionExit>,
     ) {
+        // `Child::id()` becomes None once an unexpected exit has been reaped.
+        let process_group_id = child.id();
         let mut lines = stdout.lines();
         let mut closing = false;
         let mut failure = self
@@ -197,11 +199,11 @@ impl Owner {
         })
         .await
         .is_ok();
-        let cleanup_confirmed = reap(&mut child, drained).await;
-        if failure.is_none() && !cleanup_confirmed {
+        let cleanup_confirmed = reap(&mut child, process_group_id, drained).await;
+        if !cleanup_confirmed {
             failure = Some(error(
                 "cc-cleanup-failed",
-                "claude child did not exit and could not be reaped",
+                "could not confirm claude child and process group exit",
             ));
         }
 
@@ -489,27 +491,28 @@ impl Owner {
 }
 
 /// Wait for the child (killing its process group if it would not exit in
-/// time) and sweep any orphans left in the group. True once reaped.
-async fn reap(child: &mut Child, exited_gracefully: bool) -> bool {
-    let pid = child.id();
+/// time) and sweep any orphans left in the group. True once both are gone.
+async fn reap(child: &mut Child, process_group_id: Option<u32>, exited_gracefully: bool) -> bool {
     if !exited_gracefully
         || tokio::time::timeout(Duration::from_secs(2), child.wait())
             .await
             .is_err()
     {
-        if let Some(pid) = pid {
-            kill_group(pid);
+        if let Some(pid) = process_group_id {
+            let _ = kill_group(pid);
         }
         let _ = child.start_kill();
     }
     let reaped = tokio::time::timeout(Duration::from_secs(5), child.wait())
         .await
         .is_ok_and(|status| status.is_ok());
-    if let Some(pid) = pid {
+    let group_gone = if let Some(pid) = process_group_id {
         // Tool subprocesses (e.g. a backgrounded Bash) may outlive claude.
-        kill_group(pid);
-    }
-    reaped
+        kill_group(pid).is_ok() && confirm_group_exit(pid).await
+    } else {
+        !cfg!(unix)
+    };
+    reaped && group_gone
 }
 
 fn reject(command: SessionCommand, code: &str, message: &str) {
@@ -531,17 +534,49 @@ fn error(code: &str, message: impl Into<String>) -> ProtocolError {
     }
 }
 
-pub(crate) fn kill_group(pid: u32) {
+fn kill_group(pid: u32) -> std::io::Result<()> {
     #[cfg(unix)]
-    unsafe {
-        libc_kill(-(pid as i32), SIGKILL);
+    if unsafe { libc_kill(-(pid as i32), SIGKILL) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(ESRCH) {
+            return Err(error);
+        }
     }
     #[cfg(not(unix))]
     let _ = pid;
+    Ok(())
+}
+
+async fn confirm_group_exit(pid: u32) -> bool {
+    #[cfg(unix)]
+    return tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if unsafe { libc_kill(-(pid as i32), 0) } != 0 {
+                match std::io::Error::last_os_error().raw_os_error() {
+                    Some(ESRCH) => return true,
+                    // Darwin may report EPERM while only zombies remain.
+                    Some(EPERM) => {}
+                    _ => return false,
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
 }
 
 #[cfg(unix)]
 const SIGKILL: i32 = 9;
+#[cfg(unix)]
+const ESRCH: i32 = 3;
+#[cfg(unix)]
+const EPERM: i32 = 1;
 #[cfg(unix)]
 unsafe extern "C" {
     #[link_name = "kill"]
@@ -595,6 +630,38 @@ done
 
     fn turn(id: &str) -> TurnId {
         TurnId(id.into())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reaped_child_still_cleans_its_background_process_group() {
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 60 </dev/null >/dev/null 2>&1 & exit 3"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn fake claude with a background tool");
+        let pid = child.id().unwrap();
+        child.wait().await.expect("reap direct child");
+        assert!(child.id().is_none());
+        assert_eq!(unsafe { libc_kill(-(pid as i32), 0) }, 0);
+
+        let cleaned = reap(&mut child, Some(pid), true).await;
+        let group_gone = unsafe { libc_kill(-(pid as i32), 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(ESRCH);
+        let _ = kill_group(pid);
+        assert!(cleaned, "cleanup must confirm the full process group exit");
+        assert!(group_gone, "background tool outlived cleanup confirmation");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_process_group_id_prevents_cleanup_confirmation() {
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn fake claude");
+        assert!(!reap(&mut child, None, true).await);
     }
 
     #[tokio::test]

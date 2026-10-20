@@ -54,7 +54,7 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
   版本查询完成但拿不到版本号时显示「安装」，取得版本号时显示「更新」；拿不到版本号也可能是探测失败，不直接判定未安装。
   安装使用官方推荐的原生脚本，在对应机器上执行：Codex 为 `curl -fsSL https://chatgpt.com/codex/install.sh | sh`，Claude Code 为 `curl -fsSL https://claude.ai/install.sh | bash`，均不依赖 npm。
   Codex 使用官方 `CODEX_NON_INTERACTIVE=1` 跳过安装器询问，不自动启动登录或卸载其他渠道的安装。
-  安装／更新均需二次确认，且要求 daemon 与桌面端协议一致（当前 v7）；旧 daemon 仍可读取历史，操作按钮禁用并提示先更新／重装 daemon。
+  安装／更新均需二次确认，且要求 daemon 与桌面端协议一致（当前 v8）；旧 daemon 仍可读取历史，操作按钮禁用并提示先更新／重装 daemon。
   请求不自动重试；断开或超时会终止安装／更新进程及其子进程。CLI 操作期间不能同时重装该机器的 daemon。
   安装结束后重新探测版本并刷新历史；首次登录须在目标机器运行官方 CLI 完成，AgentDeck 不处理登录凭据。
   App 内置的 Codex 不运行 CLI 自更新，点击更新会提示通过对应 App 更新；独立安装的 Codex 仍使用自身更新命令。
@@ -63,10 +63,12 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
   完整状态、兼容性警告和读取错误；顶部是常驻的远端连接输入框。
 - 会话态底部是续聊输入框（Enter 发送、⌘Enter 换行，运行中切为“停止”）：首次发送以
   `SessionStart` 续上原 thread，之后同一 daemon 会话内 `TurnStart`；流式条目接在历史记录之后，
-  工具审批在输入框上方显示审批卡（命令、patch、写入内容或计划全文；拒绝 / 允许 / 总是允许，计划为
+  按 agent 与会话声明的能力启用续聊和审批；能力查询失败可就地重试。
+  工具审批按到达顺序在输入框上方显示审批卡（命令、patch、写入内容或计划全文；拒绝 / 允许 / 总是允许，计划为
   继续规划 / 开始执行，拒绝时输入框文字作为反馈），错误显示在输入框上方。输入框左侧是权限模式选择器
-  （列表来自 agent capabilities；默认 / 接受编辑 / 计划 / 自动 / 不询问 / 跳过权限，跳过权限需二次确认），
-  显示的模式只跟 daemon 推送的模式变化。空态提示“在侧栏打开会话即可续聊”。
+  （启动前使用 agent 能力，启动后使用会话握手能力；默认 / 接受编辑 / 计划 / 自动 / 不询问 / 跳过权限，跳过权限需二次确认），
+  会话开始后的模式只跟 daemon 推送的事件变化；只有点击确认条的“确认开启”才切到跳过权限。
+  断线或发送失败清除待决审批。daemon 协议未知或不是 v8 时禁用交互，历史仍可读取；发送前会在实际连接上再次确认协议。空态提示“在侧栏打开会话即可续聊”。
 - 透明标题栏下为红绿灯留出顶部空间，空态与会话态顶部均按系统偏好处理双击；
   打开窗口后搜索框默认聚焦。
 - 支持通过 `Command+Q` 或 AgentDeck 菜单中的“退出 AgentDeck”退出应用。
@@ -79,7 +81,7 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
 
 当前明确不包含：
 
-- 启动会话、发送 turn、streaming、审批和 vendor 控制；也没有 composer 输入框。
+- 新建会话和 vendor 控制面板。
 - 用户消息中注入上下文块（如 `<system-reminder>`）的识别与折叠、会话正文全文搜索与按项目分组。
 - daemon 网络监听和配对流程。
 - 对旧 AppKit 界面或行为的兼容层。
@@ -99,7 +101,7 @@ diagnostics 等较宽的代码表面。Codex 路径已经落地 protocol v4 的 
 ## 仓库结构
 
 ```text
-agentdeck-desktop/       Rust/GPUI macOS 客户端（外壳 + daemon 只读历史）
+agentdeck-desktop/       Rust/GPUI macOS 客户端（历史读取 + 已有会话续聊）
 agentdeck-protocol/      AgentDeck 中立 IPC 类型与 schema 事实源
 agentdeckd/              Codex / Claude Code adapter daemon
 agentdeck-cli/           参考客户端与 E2E 驱动
@@ -181,7 +183,7 @@ Codex schema 已验证基线为 `codex-cli 0.155.0-alpha.16`，完整版本写�
 两类操作可能选择不同运行时：历史优先当前桌面端，避免旧 CLI 无法读取新版保存的记录；
 live session 涉及发送任务，仍使用经过验证的版本。
 执行失败、非法输出、超时或清理失败立即报错。版本探测与 app-server 启动使用
-同一个规范化绝对路径。AgentDeck 自身 IPC 为 v7，支持 `AgentInstall` / `AgentUpdate`；历史成功回复可携带中立的 warnings。
+同一个规范化绝对路径。AgentDeck 自身 IPC 为 v8，支持 `AgentInstall` / `AgentUpdate`；历史成功回复可携带中立的 warnings。
 
 需要指定某一份运行时时，可设置 `AGENTDECK_CODEX_BIN` 为 Codex 可执行文件的绝对
 路径；设置后只使用该路径，错误时不自动回退。离线测试也通过这个入口绑定假程序。
