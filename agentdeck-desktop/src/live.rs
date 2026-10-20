@@ -74,6 +74,13 @@ pub fn event_session(event: &ServerEvent) -> Option<&SessionId> {
     }
 }
 
+/// 不终止当前轮次的会话级错误：daemon 的 record 告警、审批决定没送达。
+const NON_TERMINAL_ERRORS: &[&str] = &[
+    "record_write_failed",
+    "cc-decision-no-route",
+    "action-decision-not-supported",
+];
+
 pub struct LiveTurn {
     prompt: String,
     /// 按 itemId upsert：流式快照和工具开始/完成共用同一个 id。
@@ -211,7 +218,10 @@ impl LiveSession {
                 }
             }
             ServerEvent::Error { error, .. } => {
-                self.finish_turn();
+                // 记录写失败和审批路由错误不影响正在跑的轮次。
+                if !NON_TERMINAL_ERRORS.contains(&error.code.as_str()) {
+                    self.finish_turn();
+                }
                 // 没起来的会话和 daemon 已不认识的会话，下次发送重新 SessionStart。
                 if !self.started || error.code == "session-not-found" {
                     self.session_id = None;
@@ -350,6 +360,21 @@ mod tests {
             live.send("retry".into(), "/repo".into()),
             ClientCommand::SessionStart(_)
         ));
+    }
+
+    #[test]
+    fn record_warnings_keep_the_turn_running() {
+        let mut live = session();
+        live.send("hi".into(), "/repo".into());
+        live.apply(ServerEvent::SessionStarted {
+            session_id: SessionId("s".into()),
+            thread_id: None,
+            agent_kind: AgentKind::ClaudeCode,
+        });
+        live.apply(error("record_write_failed"));
+        assert!(live.running.is_some(), "the vendor turn is still running");
+        assert!(live.session_id.is_some());
+        assert!(live.error.is_some());
     }
 
     #[test]

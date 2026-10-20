@@ -104,6 +104,8 @@ claude --print --input-format stream-json --output-format stream-json \
 ## 已知边界
 
 - 桌面不发 `SessionClose`，CC 子进程随 daemon（应用退出或连接重置）回收。
+- 显式断开机器或装完 daemon 后的 `reset()` 会在 2 秒后 SIGKILL daemon；若此时 CC 正在收尾（宽限 10 秒），
+  `claude` 子进程可能成为孤儿。应用正常退出走 stdin EOF，不受影响。
 - live 内容更新时总是跟随到底部，用户上翻查看时会被拉回。
 
 
