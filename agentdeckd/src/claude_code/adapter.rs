@@ -92,6 +92,9 @@ impl ClaudeCodeAdapter {
             .arg("stream-json")
             .arg("--permission-prompt-tool")
             .arg("stdio")
+            // Hidden in 2.1.304's --help: lets set_permission_mode switch to
+            // bypassPermissions mid-session. It does not change the start mode.
+            .arg("--allow-dangerously-skip-permissions")
             .arg("--include-partial-messages")
             .arg("--include-hook-events")
             .arg("--verbose")

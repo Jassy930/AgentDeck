@@ -690,6 +690,7 @@ impl CodexTranslator {
             request_id,
             kind,
             summary,
+            detail: None,
             vendor: ActionRequestVendor::Codex {
                 approval_policy_at_decision: self.approval_policy,
                 sandbox_at_decision: self.sandbox,

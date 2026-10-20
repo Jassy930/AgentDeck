@@ -102,6 +102,7 @@ pub(crate) fn spawn_owner(
         active_turn: None,
         cancel_requested: false,
         pending: HashMap::new(),
+        pending_modes: HashMap::new(),
         next_control_id: 0,
     };
     let task = tokio::spawn(owner.run(
@@ -125,6 +126,8 @@ struct Owner {
     cancel_requested: bool,
     /// Open `can_use_tool` prompts keyed by control request id.
     pending: HashMap<String, PermissionRoute>,
+    /// Our `set_permission_mode` requests awaiting CC's answer.
+    pending_modes: HashMap<String, ClaudeCodePermissionMode>,
     next_control_id: u64,
 }
 
@@ -248,7 +251,9 @@ impl Owner {
                     Ok(())
                 } else {
                     self.cancel_requested = true;
-                    self.send_control(json!({"subtype": "interrupt"})).await
+                    self.send_control(json!({"subtype": "interrupt"}))
+                        .await
+                        .map(drop)
                 };
                 let _ = reply.send(result);
             }
@@ -261,10 +266,10 @@ impl Owner {
                         "subtype": "set_permission_mode",
                         "mode": super::adapter::permission_mode_to_cli(mode),
                     }))
-                    .await;
-                if result.is_ok() {
-                    self.translator.set_permission_mode(mode);
-                }
+                    .await
+                    .map(|request_id| {
+                        self.pending_modes.insert(request_id, mode);
+                    });
                 let _ = reply.send(result);
             }
             SessionCommand::Close { .. } => unreachable!("close is handled by the run loop"),
@@ -312,7 +317,11 @@ impl Owner {
                 allow
             }
             ActionDecisionKind::Deny => {
-                json!({"behavior": "deny", "message": "Denied by the user in AgentDeck"})
+                let message = decision
+                    .message
+                    .filter(|message| !message.trim().is_empty())
+                    .unwrap_or_else(|| "Denied by the user in AgentDeck".into());
+                json!({"behavior": "deny", "message": message})
             }
         };
         self.write_line(&json!({
@@ -328,31 +337,35 @@ impl Owner {
 
     async fn handle_line(&mut self, line: &str) {
         let out = self.translator.translate_line(line);
-        if let Some(route) = out.permission_route_hint {
-            self.pending.insert(route.request_id.clone(), route);
-        } else if let Ok(parsed) = serde_json::from_str::<Value>(line)
-            && parsed.get("type").and_then(Value::as_str) == Some("control_cancel_request")
-        {
-            if let Some(request_id) = parsed.get("request_id").and_then(Value::as_str) {
-                self.pending.remove(request_id);
+        let parsed = serde_json::from_str::<Value>(line).unwrap_or(Value::Null);
+        let request_id = parsed.get("request_id").and_then(Value::as_str);
+        match parsed.get("type").and_then(Value::as_str) {
+            _ if out.permission_route_hint.is_some() => {
+                let route = out.permission_route_hint.expect("checked above");
+                self.pending.insert(route.request_id.clone(), route);
             }
-        } else if let Ok(parsed) = serde_json::from_str::<Value>(line)
-            && parsed.get("type").and_then(Value::as_str) == Some("control_request")
-        {
-            // We register no hooks or SDK MCP servers, so any other
-            // inbound control request is unexpected; answer so CC never
-            // waits on us forever.
-            let request_id = parsed.get("request_id").cloned().unwrap_or(Value::Null);
-            let _ = self
-                .write_line(&json!({
-                    "type": "control_response",
-                    "response": {
-                        "subtype": "error",
-                        "request_id": request_id,
-                        "error": "unsupported control request",
-                    },
-                }))
-                .await;
+            Some("control_cancel_request") => {
+                if let Some(request_id) = request_id {
+                    self.pending.remove(request_id);
+                }
+            }
+            Some("control_response") => self.handle_control_response(&parsed["response"]).await,
+            Some("control_request") => {
+                // We register no hooks or SDK MCP servers, so any other
+                // inbound control request is unexpected; answer so CC never
+                // waits on us forever.
+                let _ = self
+                    .write_line(&json!({
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "error",
+                            "request_id": request_id,
+                            "error": "unsupported control request",
+                        },
+                    }))
+                    .await;
+            }
+            _ => {}
         }
         for mut event in out.events {
             if let ServerEvent::TurnFinished {
@@ -376,7 +389,9 @@ impl Owner {
         }
     }
 
-    async fn send_control(&mut self, request: Value) -> Result<(), ProtocolError> {
+    /// Write one control request; returns its id so the caller can match
+    /// CC's `control_response`.
+    async fn send_control(&mut self, request: Value) -> Result<String, ProtocolError> {
         self.next_control_id += 1;
         let request_id = format!("agentdeck-{}", self.next_control_id);
         self.write_line(&json!({
@@ -384,7 +399,36 @@ impl Owner {
             "request_id": request_id,
             "request": request,
         }))
-        .await
+        .await?;
+        Ok(request_id)
+    }
+
+    /// CC answers `set_permission_mode` asynchronously. The client command was
+    /// already acknowledged (RuntimeHub handles it inline), so the outcome is
+    /// published as an event: the mode change, or a session error.
+    async fn handle_control_response(&mut self, response: &Value) {
+        let Some(mode) = response
+            .get("request_id")
+            .and_then(Value::as_str)
+            .and_then(|id| self.pending_modes.remove(id))
+        else {
+            return;
+        };
+        if response.get("subtype").and_then(Value::as_str) == Some("success") {
+            if let Some(event) = self.translator.observe_permission_mode(mode) {
+                self.emit(event).await;
+            }
+            return;
+        }
+        let reason = response
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("claude rejected the permission mode");
+        self.emit(ServerEvent::Error {
+            session_id: Some(self.session_id.clone()),
+            error: error("cc-permission-mode-rejected", reason),
+        })
+        .await;
     }
 
     async fn write_line(&mut self, value: &Value) -> Result<(), ProtocolError> {
@@ -551,6 +595,12 @@ mod tests {
 while IFS= read -r line; do
   case "$line" in
     *'"subtype":"initialize"'*) echo '{"type":"control_response","response":{"subtype":"success","request_id":"agentdeck-1","response":{}}}' ;;
+    *'"subtype":"set_permission_mode"'*)
+      id=$(printf %s "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+      case "$line" in
+        *bypassPermissions*) echo "{\"type\":\"control_response\",\"response\":{\"subtype\":\"error\",\"request_id\":\"$id\",\"error\":\"not launched with bypass\"}}" ;;
+        *) echo "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$id\",\"response\":{}}}" ;;
+      esac ;;
     *'"subtype":"interrupt"'*) echo '{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"thread-x"}' ;;
     *'"behavior":"allow"'*) echo '{"type":"assistant","session_id":"thread-x","message":{"id":"m2","content":[{"type":"text","text":"approved"}]}}'
       echo '{"type":"result","subtype":"success","is_error":false,"session_id":"thread-x"}' ;;
@@ -669,6 +719,7 @@ done
             request_id: "nope".into(),
             decision: ActionDecisionKind::Approve,
             persist: false,
+            message: None,
         };
         assert_eq!(
             call(&commands, |reply| SessionCommand::Decision {
@@ -684,6 +735,7 @@ done
             request_id: "perm-1".into(),
             decision: ActionDecisionKind::Approve,
             persist: false,
+            message: None,
         };
         call(&commands, |reply| SessionCommand::Decision {
             decision: approve,
@@ -741,6 +793,58 @@ done
         assert!(exit.error.is_none());
         assert!(exit.cleanup_confirmed);
         assert_eq!(exit.thread_id, Some(ThreadId("thread-x".into())));
+    }
+
+    #[tokio::test]
+    async fn permission_mode_changes_follow_claude_answers() {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", FAKE_CLAUDE])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let (events_tx, mut events) = mpsc::channel(64);
+        let (exit_tx, _exit_rx) = oneshot::channel();
+        let (commands, _abort) = spawn_owner(
+            command.spawn().expect("spawn fake claude"),
+            OwnerStart {
+                session_id: SessionId("s".into()),
+                thread_id: ThreadId("thread-x".into()),
+                permission_mode: ClaudeCodePermissionMode::Default,
+                initial_turn: None,
+            },
+            events_tx,
+            exit_tx,
+        )
+        .expect("owner starts");
+
+        for mode in [
+            ClaudeCodePermissionMode::Plan,
+            ClaudeCodePermissionMode::BypassPermissions,
+        ] {
+            call(&commands, |reply| SessionCommand::SetPermissionMode {
+                mode,
+                reply,
+            })
+            .await
+            .expect("request written");
+        }
+        assert!(matches!(
+            next(&mut events).await,
+            ServerEvent::VendorPanelEvent {
+                payload: agentdeck_protocol::VendorPanelPayload::ClaudeCode(
+                    agentdeck_protocol::ClaudeCodeVendorPanelEvent::PermissionModeChanged {
+                        mode: ClaudeCodePermissionMode::Plan
+                    }
+                ),
+                ..
+            }
+        ));
+        assert!(matches!(
+            next(&mut events).await,
+            ServerEvent::Error { error, .. } if error.code == "cc-permission-mode-rejected"
+        ));
     }
 
     #[tokio::test]

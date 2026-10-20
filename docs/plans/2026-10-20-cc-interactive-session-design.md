@@ -106,7 +106,44 @@ claude --print --input-format stream-json --output-format stream-json \
   历史、续聊气泡、流式"变更"条目、审批条和"停止"按钮都已渲染。点击"允许 / 拒绝 / 停止"
   当时未验证；下述 PR #43 修复验证补齐了 fake daemon 下的实际按钮操作。
 
+## P3 权限功能（2026-10-20，协议 v8）
+
+实测（claude 2.1.304）：
+- default 启动的会话 `set_permission_mode` 到 bypassPermissions 会被拒（"session was not launched with
+  --dangerously-skip-permissions"）。启动带隐藏参数 `--allow-dangerously-skip-permissions` 后可切换；该参数
+  不改变启动模式。plan / acceptEdits / auto / dontAsk 都可以直接切换。
+- `system.init` 和 `system.status` 带 `permissionMode`。计划批准后推送 `status{permissionMode:<原模式>}`；
+  persist 的 `setMode` 建议生效后推送 `status{permissionMode:"acceptEdits"}`。
+- `ExitPlanMode` 的 `can_use_tool` 中，`input.plan` 是计划 markdown，另带 `planFilePath`，没有 suggestions。
+  deny 加 message 后，CC 会留在 plan 模式按反馈修改计划，并再次请求审批。
+
+实现：
+- 协议 v8：`ActionRequest.detail`、`ActionKind::ApprovePlan`、`ActionDecision.message`、CC `canPersist`、
+  `ClaudeCodeVendorPanelEvent::PermissionModeChanged`。新字段可缺省，v7 形状仍能解码；Swift 镜像已同步。
+- owner 写出 `set_permission_mode` 后立即回复 hub（不等待 CC 回包，以免阻塞后续生命周期命令），并登记 request_id；
+  CC 回 success 时发 `PermissionModeChanged`，回 error 时发 `Error(cc-permission-mode-rejected)`。
+  translator 跟踪 system 行里的模式，相同模式不重复发。
+- hub 把 VendorControl 放进有序 lifecycle 队列：之前紧跟 SessionStart 发出的模式切换会先于会话注册执行，
+  报 session-not-found。
+- 桌面：模式选择器与命令都通过 `SessionRouter` 路由，启动前用完整 `AgentCapabilities`，
+  启动后只用 `SessionCapabilities` 的 feature 与模式列表。开始前改本地选择，开始后发 VendorControl，显示只认事件。
+  下拉选择“跳过权限”只展开确认条，必须点击“确认开启”才发命令。审批卡保留 detail 全文并滚动显示；
+  审批按 requestId 排队，persist 与拒绝反馈 message 都交给当前请求。
+  daemon 协议未知或非 v8 时禁用交互；Client 在实际发送连接上检查 ProtocolVersion，旧 daemon 不会收到 v8 审批字段，历史仍可读取。
+  本轮还没有任何输出时显示"等待 agent 响应…"（GUI 环境下用户插件的 hook 可能让 CC 首个输出等上几分钟，实测约 2 分钟）。
+
+验证：离线 owner 测试（切模式成功/被拒）、translator 测试（模式事件去重、计划审批、Edit patch）、
+desktop live 测试（开始前本地、开始后事件驱动）；经 daemon 的真实链路：
+- 中途切 bypass 后写文件不询问；
+- 计划被拒并反馈后修改计划、批准后回到 default；
+- 总是允许后切到 acceptEdits。
+
+实窗截图确认计划审批卡、跳过权限确认条和模式按钮渲染正常；点击未自动验证。
+
 ## 已知边界
+
+- `AskUserQuestion` 在 default 模式下也走 `can_use_tool`，但它需要在 `updatedInput` 里填答案；审批卡目前只能允许或拒绝，
+  允许时 CC 拿到的是空答案。
 
 - 桌面不发 `SessionClose`，CC 子进程随 daemon（应用退出或连接重置）回收。
 - 显式断开机器或装完 daemon 后的 `reset()` 会在 2 秒后 SIGKILL daemon；若此时 CC 正在收尾（宽限 10 秒），
@@ -148,3 +185,15 @@ claude --print --input-format stream-json --output-format stream-json \
   fake daemon 命令记录确认两个不同 requestId 分别收到 approve/deny，并收到对应 turn 的 `TurnCancel`。
 - 本轮未运行真实 vendor E2E，以上实窗按钮结果只证明离线 IPC/UI 路径；Codex 桌面发送、远端续聊仍待实测。
   上述 2 秒 reset 与 10 秒 CC 收尾窗口仍是已知限制。
+
+### PR #44 整合回归（2026-10-20）
+
+- 桌面 87 项离线测试通过，覆盖旧协议拒绝交互但保留只读请求、同连接协议检查、
+  会话握手覆盖预查询权限模式、模式拒绝后状态不变、审批队列中 persist 与反馈的请求关联。
+- PR #43 的能力重试、多个审批、旧连接 EOF 隔离与进程组清理实现均保留。
+- 完整离线门禁、当前 checkout 的 daemon/CLI selfcheck 与 diagnostics report、desktop selfcheck、真实 bundle verify 均通过。
+  Swift XCTest 76 项与 Swift Testing 31 项、iPhone 17 / iOS 26.5 fixture 测试 21 项通过。
+- 临时 fake daemon 的实窗验证通过：握手后模式列表采用会话能力；重复选择 bypass 仍只展开确认条，
+  专用确认按钮才发命令；计划拒绝反馈与后续持久允许分别写入正确 requestId。
+  160 行计划可滚到末尾标记，审批 Markdown 使用自动高度，外层保留 240px 滚动视口。
+- 本轮未重跑真实 vendor E2E；以上实窗结果只证明离线 IPC/UI 路径，此前真实链路记录不替代本轮验证。

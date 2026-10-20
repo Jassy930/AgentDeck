@@ -165,10 +165,6 @@ impl ClaudeCodeTranslator {
         self.permission_mode
     }
 
-    pub fn set_permission_mode(&mut self, mode: ClaudeCodePermissionMode) {
-        self.permission_mode = mode;
-    }
-
     /// Translate one stream-json line into 0..N ServerEvents.
     pub fn translate_line(&mut self, line: &str) -> TranslateOutput {
         let trimmed = line.trim();
@@ -208,6 +204,36 @@ impl ClaudeCodeTranslator {
     // ── system ─────────────────────────────────────────────────────────────
 
     fn handle_system(&mut self, parsed: &Value) -> TranslateOutput {
+        let mode_changed = parsed
+            .get("permissionMode")
+            .cloned()
+            .and_then(|mode| serde_json::from_value(mode).ok())
+            .and_then(|mode| self.observe_permission_mode(mode));
+        let mut out = self.handle_system_subtype(parsed);
+        out.events.extend(mode_changed);
+        out
+    }
+
+    /// Record the session's effective mode; returns the change event when it
+    /// differs from what clients last saw.
+    pub fn observe_permission_mode(
+        &mut self,
+        mode: ClaudeCodePermissionMode,
+    ) -> Option<ServerEvent> {
+        if mode == self.permission_mode {
+            return None;
+        }
+        self.permission_mode = mode;
+        Some(ServerEvent::VendorPanelEvent {
+            session_id: self.session_id.clone(),
+            agent_kind: AgentKind::ClaudeCode,
+            payload: VendorPanelPayload::ClaudeCode(
+                ClaudeCodeVendorPanelEvent::PermissionModeChanged { mode },
+            ),
+        })
+    }
+
+    fn handle_system_subtype(&mut self, parsed: &Value) -> TranslateOutput {
         let subtype = parsed.get("subtype").and_then(Value::as_str).unwrap_or("");
         match subtype {
             "init" => {
@@ -665,29 +691,45 @@ impl ClaudeCodeTranslator {
             .unwrap_or("Unknown")
             .to_string();
         let input = request.get("input").cloned().unwrap_or(json!({}));
-        let detail = input
+        let suggestions = request
+            .get("permission_suggestions")
+            .cloned()
+            .filter(|s| s.is_array())
+            .unwrap_or(json!([]));
+        let target = input
             .get("command")
             .or_else(|| input.get("file_path"))
             .or_else(|| request.get("description"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        let summary = if detail.is_empty() {
-            tool_name.clone()
-        } else {
-            format!("{tool_name}: {detail}")
+        let summary = match tool_name.as_str() {
+            "ExitPlanMode" => {
+                let title = input
+                    .get("plan")
+                    .and_then(Value::as_str)
+                    .and_then(|plan| plan.lines().find(|line| !line.trim().is_empty()))
+                    .map(|line| line.trim_start_matches('#').trim())
+                    .unwrap_or("");
+                format!("{tool_name}: {title}")
+            }
+            _ if target.is_empty() => tool_name.clone(),
+            _ => format!("{tool_name}: {target}"),
         };
         let kind = match tool_name.as_str() {
             "Bash" => ActionKind::ExecuteCommand,
             "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => ActionKind::EditFiles,
+            "ExitPlanMode" => ActionKind::ApprovePlan,
             _ => ActionKind::GrantExtraPermission,
         };
         let action = ActionRequest {
             request_id: request_id.to_string(),
             kind,
             summary,
+            detail: action_detail(&tool_name, &input),
             vendor: ActionRequestVendor::ClaudeCode {
                 permission_mode_at_decision: self.permission_mode,
                 tool_name,
+                can_persist: suggestions.as_array().is_some_and(|s| !s.is_empty()),
             },
         };
         TranslateOutput {
@@ -700,10 +742,7 @@ impl ClaudeCodeTranslator {
             permission_route_hint: Some(PermissionRoute {
                 request_id: request_id.to_string(),
                 input,
-                suggestions: request
-                    .get("permission_suggestions")
-                    .cloned()
-                    .unwrap_or(json!([])),
+                suggestions,
             }),
         }
     }
@@ -872,6 +911,35 @@ fn diff_files_from_tool_use(tool_name: &str, input: &Value) -> Vec<DiffFile> {
         }
         _ => Vec::new(),
     }
+}
+
+/// What the user reviews before approving a tool call.
+fn action_detail(tool_name: &str, input: &Value) -> Option<String> {
+    let text = |key: &str| input.get(key).and_then(Value::as_str).unwrap_or("");
+    let detail = match tool_name {
+        "Bash" => text("command").to_string(),
+        "Write" => text("content").to_string(),
+        "Edit" => synth_patch(text("old_string"), text("new_string")),
+        "MultiEdit" => input
+            .get("edits")
+            .and_then(Value::as_array)
+            .map(|edits| {
+                edits
+                    .iter()
+                    .map(|edit| {
+                        synth_patch(
+                            edit.get("old_string").and_then(Value::as_str).unwrap_or(""),
+                            edit.get("new_string").and_then(Value::as_str).unwrap_or(""),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default(),
+        "ExitPlanMode" => text("plan").to_string(),
+        _ => serde_json::to_string_pretty(input).unwrap_or_default(),
+    };
+    (!detail.is_empty()).then_some(detail)
 }
 
 fn synth_patch(old: &str, new: &str) -> String {

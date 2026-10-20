@@ -119,6 +119,7 @@ async fn submit_decision_on_unknown_session_returns_session_not_found() {
         request_id: "fake".into(),
         decision: ActionDecisionKind::Approve,
         persist: false,
+        message: None,
     };
     let result = a.submit_decision(&sid, decision).await;
     assert!(result.is_err());

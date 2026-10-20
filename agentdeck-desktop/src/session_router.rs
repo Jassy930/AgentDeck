@@ -1,7 +1,8 @@
 use agentdeck_protocol::{
-    CapabilityId, ClaudeCodePermissionMode, ClaudeCodeSessionOptions, CodexApprovalPolicy,
-    CodexReasoningEffort, CodexSandboxMode, CodexSessionOptions, SessionCapabilities,
-    VendorCapabilities, VendorSessionOptions,
+    CapabilityId, ClaudeCodePermissionMode, ClaudeCodeSessionOptions, ClaudeCodeVendorControl,
+    ClientCommand, CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode,
+    CodexSessionOptions, SessionCapabilities, SessionId, VendorCapabilities, VendorControlPayload,
+    VendorSessionOptions,
 };
 
 pub struct SessionRouter<'a>(pub &'a SessionCapabilities);
@@ -15,7 +16,39 @@ impl SessionRouter<'_> {
         self.0.features.contains(&CapabilityId::Approval)
     }
 
-    pub fn start_options(&self) -> Result<VendorSessionOptions, String> {
+    pub fn permission_modes(&self) -> &[ClaudeCodePermissionMode] {
+        if !self
+            .0
+            .features
+            .contains(&CapabilityId::ClaudeCodePermissionMode)
+        {
+            return &[];
+        }
+        match &self.0.vendor {
+            VendorCapabilities::ClaudeCode(capabilities) => &capabilities.permission_modes,
+            _ => &[],
+        }
+    }
+
+    pub fn permission_mode_command(
+        &self,
+        session_id: SessionId,
+        mode: ClaudeCodePermissionMode,
+    ) -> Option<ClientCommand> {
+        self.permission_modes()
+            .contains(&mode)
+            .then_some(ClientCommand::VendorControl {
+                session_id,
+                payload: VendorControlPayload::ClaudeCode(
+                    ClaudeCodeVendorControl::UpdatePermissionMode(mode),
+                ),
+            })
+    }
+
+    pub fn start_options(
+        &self,
+        mode: ClaudeCodePermissionMode,
+    ) -> Result<VendorSessionOptions, String> {
         match &self.0.vendor {
             VendorCapabilities::Codex(capabilities) => {
                 if !capabilities
@@ -39,14 +72,11 @@ impl SessionRouter<'_> {
                 }))
             }
             VendorCapabilities::ClaudeCode(capabilities) => {
-                if !capabilities
-                    .permission_modes
-                    .contains(&ClaudeCodePermissionMode::Default)
-                {
-                    return Err("当前能力不支持桌面所需的 default 权限模式".into());
+                if !capabilities.permission_modes.contains(&mode) {
+                    return Err("当前能力不支持所选权限模式".into());
                 }
                 Ok(VendorSessionOptions::ClaudeCode(ClaudeCodeSessionOptions {
-                    permission_mode: ClaudeCodePermissionMode::Default,
+                    permission_mode: mode,
                     model: None,
                     effort: None,
                     hooks: vec![],
@@ -79,9 +109,18 @@ pub(crate) fn test_capabilities(kind: agentdeck_protocol::AgentKind) -> SessionC
             }),
         ),
         AgentKind::ClaudeCode => (
-            BTreeSet::from([CapabilityId::StreamingMessages, CapabilityId::Approval]),
+            BTreeSet::from([
+                CapabilityId::StreamingMessages,
+                CapabilityId::Approval,
+                CapabilityId::ClaudeCodePermissionMode,
+            ]),
             VendorCapabilities::ClaudeCode(ClaudeCodeCapabilities {
-                permission_modes: vec![ClaudeCodePermissionMode::Default],
+                permission_modes: vec![
+                    ClaudeCodePermissionMode::Default,
+                    ClaudeCodePermissionMode::Plan,
+                    ClaudeCodePermissionMode::AcceptEdits,
+                    ClaudeCodePermissionMode::BypassPermissions,
+                ],
                 cli_version: "test".into(),
                 ..Default::default()
             }),
@@ -132,8 +171,9 @@ mod tests {
     fn default_options_follow_typed_vendor_capabilities() {
         let mut capabilities = test_capabilities(AgentKind::Codex);
         capabilities.agent_kind = AgentKind::ClaudeCode;
-        let VendorSessionOptions::Codex(options) =
-            SessionRouter(&capabilities).start_options().unwrap()
+        let VendorSessionOptions::Codex(options) = SessionRouter(&capabilities)
+            .start_options(ClaudeCodePermissionMode::Default)
+            .unwrap()
         else {
             panic!("options must follow typed vendor capabilities");
         };
@@ -144,8 +184,9 @@ mod tests {
         assert!(options.mcp_overrides.is_empty());
 
         let capabilities = test_capabilities(AgentKind::ClaudeCode);
-        let VendorSessionOptions::ClaudeCode(options) =
-            SessionRouter(&capabilities).start_options().unwrap()
+        let VendorSessionOptions::ClaudeCode(options) = SessionRouter(&capabilities)
+            .start_options(ClaudeCodePermissionMode::Default)
+            .unwrap()
         else {
             panic!("expected Claude Code options");
         };
@@ -159,21 +200,62 @@ mod tests {
             unreachable!();
         };
         vendor.sandbox_modes = vec![CodexSandboxMode::FullAccess];
-        assert!(SessionRouter(&capabilities).start_options().is_err());
+        assert!(
+            SessionRouter(&capabilities)
+                .start_options(ClaudeCodePermissionMode::Default)
+                .is_err()
+        );
 
         let mut capabilities = test_capabilities(AgentKind::Codex);
         let VendorCapabilities::Codex(vendor) = &mut capabilities.vendor else {
             unreachable!();
         };
         vendor.reasoning_effort_levels = vec![CodexReasoningEffort::High];
-        assert!(SessionRouter(&capabilities).start_options().is_err());
+        assert!(
+            SessionRouter(&capabilities)
+                .start_options(ClaudeCodePermissionMode::Default)
+                .is_err()
+        );
 
         let mut capabilities = test_capabilities(AgentKind::ClaudeCode);
         let VendorCapabilities::ClaudeCode(vendor) = &mut capabilities.vendor else {
             unreachable!();
         };
         vendor.permission_modes = vec![ClaudeCodePermissionMode::BypassPermissions];
-        assert!(SessionRouter(&capabilities).start_options().is_err());
+        assert!(
+            SessionRouter(&capabilities)
+                .start_options(ClaudeCodePermissionMode::Default)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn permission_controls_require_both_the_feature_and_advertised_mode() {
+        let mut capabilities = test_capabilities(AgentKind::ClaudeCode);
+        assert!(
+            SessionRouter(&capabilities)
+                .permission_mode_command(SessionId("s".into()), ClaudeCodePermissionMode::Plan)
+                .is_some()
+        );
+        assert!(
+            SessionRouter(&capabilities)
+                .permission_mode_command(SessionId("s".into()), ClaudeCodePermissionMode::Auto)
+                .is_none()
+        );
+        capabilities
+            .features
+            .remove(&CapabilityId::ClaudeCodePermissionMode);
+        assert!(SessionRouter(&capabilities).permission_modes().is_empty());
+        assert!(
+            SessionRouter(&capabilities)
+                .permission_mode_command(SessionId("s".into()), ClaudeCodePermissionMode::Plan)
+                .is_none()
+        );
+        assert!(
+            SessionRouter(&test_capabilities(AgentKind::Codex))
+                .permission_modes()
+                .is_empty()
+        );
     }
 
     #[test]

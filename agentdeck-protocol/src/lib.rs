@@ -38,9 +38,9 @@ pub use vendor::codex::{CodexSessionOptions, McpOverride};
 pub use vendor::codex::{CodexVendorControl, CodexVendorPanelEvent};
 
 /// 契约产物版本。改动协议形态时手动 +1，并重生成快照。
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
-/// Aggregate JSON Schema for all v7 wire types. Snapshot-tested against
+/// Aggregate JSON Schema for all v8 wire types. Snapshot-tested against
 /// `protocol/agentdeck/agentdeck-protocol.schema.json`.
 pub fn protocol_schema() -> serde_json::Value {
     use schemars::schema_for;

@@ -6,6 +6,7 @@ fn codex_action_request_carries_sandbox_at_decision() {
         request_id: "r1".into(),
         kind: ActionKind::ExecuteCommand,
         summary: "rm -rf node_modules".into(),
+        detail: None,
         vendor: ActionRequestVendor::Codex {
             approval_policy_at_decision: CodexApprovalPolicy::OnRequest,
             sandbox_at_decision: CodexSandboxMode::WorkspaceWrite,
@@ -25,14 +26,37 @@ fn cc_action_request_carries_permission_mode() {
         request_id: "r2".into(),
         kind: ActionKind::EditFiles,
         summary: "edit auth.py".into(),
+        detail: Some("-a\n+b".into()),
         vendor: ActionRequestVendor::ClaudeCode {
             permission_mode_at_decision: ClaudeCodePermissionMode::AcceptEdits,
             tool_name: "Edit".into(),
+            can_persist: true,
         },
     };
     let json = serde_json::to_string(&req).unwrap();
     assert!(json.contains(r#""toolName":"Edit""#));
+    assert!(json.contains(r#""canPersist":true"#));
     let _: ActionRequest = serde_json::from_str(&json).unwrap();
+}
+
+/// v7 peers omit the v8 fields; they must still decode.
+#[test]
+fn v7_action_shapes_still_decode() {
+    let request: ActionRequest = serde_json::from_str(
+        r#"{"requestId":"r","kind":"editFiles","summary":"s","vendor":{"agentKind":"claude_code","permissionModeAtDecision":"default","toolName":"Write"}}"#,
+    )
+    .unwrap();
+    assert!(request.detail.is_none());
+    assert!(matches!(
+        request.vendor,
+        ActionRequestVendor::ClaudeCode {
+            can_persist: false,
+            ..
+        }
+    ));
+    let decision: ActionDecision =
+        serde_json::from_str(r#"{"requestId":"r","decision":"deny","persist":false}"#).unwrap();
+    assert!(decision.message.is_none());
 }
 
 #[test]

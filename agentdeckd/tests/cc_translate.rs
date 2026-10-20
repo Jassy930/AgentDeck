@@ -675,7 +675,9 @@ fn permission_mode_is_stamped_on_action_request() {
         ActionRequestVendor::ClaudeCode {
             permission_mode_at_decision,
             ref tool_name,
+            can_persist,
         } => {
+            assert!(can_persist, "the fixture carries a setMode suggestion");
             assert_eq!(
                 permission_mode_at_decision,
                 ClaudeCodePermissionMode::AcceptEdits
@@ -716,4 +718,81 @@ fn tool_snapshots_preserve_their_identity_until_completion() {
             );
         }
     }
+}
+
+#[test]
+fn system_permission_mode_changes_emit_once() {
+    // claude 2.1.304 pushes `status` with permissionMode after a plan approval
+    // or a persisted setMode suggestion; `init` carries the starting mode.
+    let mut t = tr();
+    let status = |mode: &str| {
+        json!({"type": "system", "subtype": "status", "status": null, "permissionMode": mode, "session_id": "thread_1"})
+            .to_string()
+    };
+    let changed = |out: &agentdeckd::claude_code::translate::TranslateOutput| {
+        out.events.iter().any(|e| {
+            matches!(
+                e,
+                ServerEvent::VendorPanelEvent {
+                    payload: VendorPanelPayload::ClaudeCode(
+                        ClaudeCodeVendorPanelEvent::PermissionModeChanged {
+                            mode: ClaudeCodePermissionMode::AcceptEdits
+                        }
+                    ),
+                    ..
+                }
+            )
+        })
+    };
+    assert!(changed(&t.translate_line(&status("acceptEdits"))));
+    assert!(!changed(&t.translate_line(&status("acceptEdits"))));
+}
+
+#[test]
+fn exit_plan_mode_becomes_plan_approval_with_the_plan_as_detail() {
+    let mut t = tr();
+    let line = json!({
+        "type": "control_request",
+        "request_id": "plan-1",
+        "request": {
+            "subtype": "can_use_tool",
+            "tool_name": "ExitPlanMode",
+            "input": {"plan": "# 计划：创建 a.txt\n\n1. 写入", "planFilePath": "/p.md"},
+            "tool_use_id": "toolu_plan"
+        }
+    });
+    let out = t.translate_line(&line.to_string());
+    let ServerEvent::ActionRequest { request, .. } = &out.events[0] else {
+        panic!("expected ActionRequest");
+    };
+    assert!(matches!(request.kind, ActionKind::ApprovePlan));
+    assert_eq!(request.summary, "ExitPlanMode: 计划：创建 a.txt");
+    assert_eq!(
+        request.detail.as_deref(),
+        Some("# 计划：创建 a.txt\n\n1. 写入")
+    );
+    assert!(matches!(
+        request.vendor,
+        ActionRequestVendor::ClaudeCode {
+            can_persist: false,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn edit_approval_detail_is_a_patch() {
+    let mut t = tr();
+    let out = t.translate_line(&can_use_tool(
+        "Edit",
+        json!({"file_path": "a.rs", "old_string": "old", "new_string": "new"}),
+    ));
+    let ServerEvent::ActionRequest { request, .. } = &out.events[0] else {
+        panic!("expected ActionRequest");
+    };
+    let detail = request.detail.as_deref().unwrap();
+    assert!(
+        detail.contains("-old") && detail.contains("+new"),
+        "{detail}"
+    );
 }

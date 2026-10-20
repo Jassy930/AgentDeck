@@ -19,6 +19,14 @@
             "decision": {
               "$ref": "#/definitions/ActionDecisionKind"
             },
+            "message": {
+              "default": null,
+              "description": "Feedback for the agent on deny (e.g. how to revise a plan).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "persist": {
               "type": "boolean"
             },
@@ -2800,16 +2808,35 @@
       "$schema": "http://json-schema.org/draft-07/schema#",
       "definitions": {
         "ActionKind": {
-          "enum": [
-            "executeCommand",
-            "editFiles",
-            "grantExtraPermission"
-          ],
-          "type": "string"
+          "oneOf": [
+            {
+              "enum": [
+                "executeCommand",
+                "editFiles",
+                "grantExtraPermission"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "The agent finished planning and asks to start executing the plan.",
+              "enum": [
+                "approvePlan"
+              ],
+              "type": "string"
+            }
+          ]
         },
         "ActionRequest": {
           "additionalProperties": false,
           "properties": {
+            "detail": {
+              "default": null,
+              "description": "Full content to review: command text, patch, file content or plan markdown. Not truncated; clients clip for display.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "kind": {
               "$ref": "#/definitions/ActionKind"
             },
@@ -2868,6 +2895,11 @@
                     "claude_code"
                   ],
                   "type": "string"
+                },
+                "canPersist": {
+                  "default": false,
+                  "description": "CC offered permission suggestions, so an approval can be persisted.",
+                  "type": "boolean"
                 },
                 "permissionModeAtDecision": {
                   "$ref": "#/definitions/ClaudeCodePermissionMode"
@@ -3379,6 +3411,26 @@
         },
         "ClaudeCodeVendorPanelEvent": {
           "oneOf": [
+            {
+              "additionalProperties": false,
+              "description": "The session's effective permission mode changed — after a client `UpdatePermissionMode`, a plan approval, or a persisted `setMode` suggestion. Clients display the mode from this event only.",
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "permissionModeChanged"
+                  ],
+                  "type": "string"
+                },
+                "mode": {
+                  "$ref": "#/definitions/ClaudeCodePermissionMode"
+                }
+              },
+              "required": [
+                "kind",
+                "mode"
+              ],
+              "type": "object"
+            },
             {
               "additionalProperties": false,
               "description": "Hook fire events from `claude --include-hook-events`.",
@@ -4785,6 +4837,6 @@
       "type": "object"
     }
   },
-  "title": "AgentDeck Protocol v7",
+  "title": "AgentDeck Protocol v8",
   "type": "object"
 }

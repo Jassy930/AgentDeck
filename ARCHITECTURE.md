@@ -28,7 +28,7 @@ AgentDeckMobileCore + ios/
 
 唯一允许的本机桌面通路是
 `agentdeck-desktop → typed local client → agentdeckd`。该通路已落地，覆盖历史读取
-（agent list / history list / history read）与续聊：生命周期命令只写不等回复，daemon
+（agent list / history list / history read）与续聊：生命周期命令先在同一连接检查协议版本，再写入命令而不等待运行回复，daemon
 推回的 `ServerEvent` 进每台机器的事件通道，桌面按 sessionId 交给 live 会话；新建会话
 尚未接入，selfcheck 也不走这条通路。每台机器一条常驻连接，history 按 requestId
 多路复用，进程退出后下次请求重连。每条连接记录自己的 sessionId，EOF 只向这些会话发
@@ -51,9 +51,9 @@ poison 并退出 daemon。protocol v4 增加累计消息的 item identity/state/
 
 ## 分层边界
 
-- `agentdeck-desktop/`：macOS GPUI executable。负责窗口、组件根节点、外壳布局（侧栏 / 空态 / 会话态 / 机器管理页）和桌面 selfcheck。`daemon.rs` 是唯一的数据入口：发送 `AgentList`、`AgentCapabilities`（同次读取 CLI 版本与完整 typed 能力）、`AgentInstall` / `AgentUpdate`（机器页安装／更新 CLI，命令由各 adapter 提供）、`Selfcheck`、`ProtocolVersion`、`History`，以及续聊的 `SessionStart` / `TurnStart` / `TurnCancel` / `ActionDecision`；消费 typed reply 与 `ServerEvent`，不解析 vendor JSON。`session_router.rs` 依据 typed `VendorCapabilities` 构造受支持的默认启动选项，以 `StreamingMessages` / `Approval` 控制续聊与审批；会话握手后的 `SessionCapabilities` 取代启动前缓存的能力。侧栏与空态卡片按 daemon 返回的 `AgentKind` 迭代生成，来源图标仅用它标识 agent，不按 vendor 分支路由会话操作。阻塞 IPC 一律走 GPUI background executor，UI 线程不等 daemon。机器页另在本机 `curl` 查 npm registry 的 CLI 最新版本（`versions.rs`），并能把与桌面端同版本的预编译 agentdeckd 从 GitHub Release 经 ssh 装到远端 `~/.local/bin`（`remotes.rs`）。
+- `agentdeck-desktop/`：macOS GPUI executable。负责窗口、组件根节点、外壳布局（侧栏 / 空态 / 会话态 / 机器管理页）和桌面 selfcheck。`daemon.rs` 是唯一的数据入口：发送 `AgentList`、`AgentCapabilities`（同次读取 CLI 版本与完整 typed 能力）、`AgentInstall` / `AgentUpdate`（机器页安装／更新 CLI，命令由各 adapter 提供）、`Selfcheck`、`ProtocolVersion`、`History`，以及续聊的 `SessionStart` / `TurnStart` / `TurnCancel` / `ActionDecision` / `VendorControl`；消费 typed reply 与 `ServerEvent`，不解析 vendor JSON。`session_router.rs` 依据 typed `VendorCapabilities` 构造受支持的默认启动选项，以 `StreamingMessages` / `Approval` / `ClaudeCodePermissionMode` 控制续聊、审批与权限模式命令；会话握手后的 `SessionCapabilities` 取代启动前缓存的能力。侧栏与空态卡片按 daemon 返回的 `AgentKind` 迭代生成，来源图标仅用它标识 agent，不按 vendor 分支路由会话操作。阻塞 IPC 一律走 GPUI background executor，UI 线程不等 daemon。机器页另在本机 `curl` 查 npm registry 的 CLI 最新版本（`versions.rs`），并能把与桌面端同版本的预编译 agentdeckd 从 GitHub Release 经 ssh 装到远端 `~/.local/bin`（`remotes.rs`）。
 - `Sources/AgentDeckMobileCore/`：iOS 使用的平台无关 Swift 模型，禁止 import AppKit/UIKit。
-- `agentdeck-protocol/`：本地 IPC 协议事实源 crate。分 trunk / capabilities / vendor 三个模块，`PROTOCOL_VERSION` = 7，`protocol_schema()` 聚合本地 v7 类型。
+- `agentdeck-protocol/`：本地 IPC 协议事实源 crate。分 trunk / capabilities / vendor 三个模块，`PROTOCOL_VERSION` = 8，`protocol_schema()` 聚合本地 v8 类型。
 - `agentdeckd/src/ipc.rs`：re-export `agentdeck-protocol::*` 壳，保持 daemon 内 `crate::ipc::X` 引用不变。
 - `agentdeckd/src/agent.rs`：`Agent` trait + `AgentKind` 枚举。两个 adapter 共享的逻辑在此，不得让 adapter 相互引用。
 - `agentdeckd/src/runtime/`：`RuntimeHub`（stdin loop + stdout writer）+ `AgentRouter`（sessionId → agentKind → adapter）。
@@ -131,8 +131,10 @@ agentdeck-cli（参考客户端 / E2E 驱动，与 GUI 互相独立）
 
 `agentdeck-protocol` crate 是 IPC 协议的唯一事实源：
 
-- `PROTOCOL_VERSION`：当前为 7。v7 增加 `AgentInstall { agentKind }`，v6 增加 `AgentUpdate { agentKind }`，通过 admin 回复返回
-  安装／更新输出或错误；`Selfcheck` 回复携带 daemon 版本。桌面端确认 `protocolVersion` 与当前版本一致（v7）
+- `PROTOCOL_VERSION`：当前为 8。v8 为审批补 `ActionRequest.detail`、`ActionKind::ApprovePlan`、
+  `ActionDecision.message` 与 CC `canPersist`，新增 CC 面板事件 `PermissionModeChanged`（新字段均可缺省，
+  v7 形状仍可解码）。v7 增加 `AgentInstall { agentKind }`，v6 增加 `AgentUpdate { agentKind }`，通过 admin 回复返回
+  安装／更新输出或错误；`Selfcheck` 回复携带 daemon 版本。桌面端确认 `protocolVersion` 与当前版本一致（v8）
   后才开放 CLI 安装／更新，旧 daemon 的只读历史继续可用，Swift Core 同步命令编解码。
   v5 增加 `HistoryReply` / `HistoryWarning`，历史成功回复
   保留顶层 `response` 并可携带同层 `warnings`；`HistoryReply` 只表示成功内容，忽略
@@ -141,7 +143,7 @@ agentdeck-cli（参考客户端 / E2E 驱动，与 GUI 互相独立）
   `state`（streaming/completed），同 item 的文本是累计快照。v3 引入 caller-owned `sessionId` / `turnId`、显式
   `TurnStart` / `TurnCancel` / `SessionClose` 和两级 terminal；Codex 与 Claude Code
   均已迁移，`TurnComplete` 仅为 wire 兼容保留、不再产生。
-- `protocol_schema()`：schemars 从 Rust 类型派生的 JSON Schema，聚合所有 v7 公共类型。
+- `protocol_schema()`：schemars 从 Rust 类型派生的 JSON Schema，聚合所有 v8 公共类型。
 - 快照：`protocol/agentdeck/agentdeck-protocol.schema.json`（`UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot` 重生成）。
 - 漂移测试随 `cargo test` 运行。
 - 中立性测试（`neutrality_tests.rs`）守护 N1/N4。

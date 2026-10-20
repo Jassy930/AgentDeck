@@ -8,9 +8,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentdeck_protocol::{
-    ActionDecision, ActionDecisionKind, ActionRequest, AgentItem, AgentItemMeta, ClientCommand,
-    HistoryTurn, InitialTurn, ServerEvent, SessionCapabilities, SessionId, SessionStart, TurnId,
-    TurnOutcome,
+    ActionDecision, ActionDecisionKind, ActionRequest, AgentItem, AgentItemMeta,
+    ClaudeCodePermissionMode, ClaudeCodeVendorPanelEvent, ClientCommand, HistoryTurn, InitialTurn,
+    ServerEvent, SessionCapabilities, SessionId, SessionStart, TurnId, TurnOutcome,
+    VendorPanelPayload,
 };
 
 use crate::session_router::SessionRouter;
@@ -52,6 +53,9 @@ const NON_TERMINAL_ERRORS: &[&str] = &[
     "record_write_failed",
     "cc-decision-no-route",
     "action-decision-not-supported",
+    "cc-permission-mode-rejected",
+    "cc-vendor-control-not-supported",
+    "cc-vendor-control-requires-new-turn",
 ];
 
 pub struct LiveTurn {
@@ -72,6 +76,7 @@ pub struct LiveSession {
     actions: VecDeque<ActionRequest>,
     capabilities: Option<SessionCapabilities>,
     pub error: Option<String>,
+    pub mode: ClaudeCodePermissionMode,
 }
 
 impl LiveSession {
@@ -85,6 +90,7 @@ impl LiveSession {
             actions: VecDeque::new(),
             capabilities: None,
             error: None,
+            mode: ClaudeCodePermissionMode::Default,
         }
     }
 
@@ -103,7 +109,7 @@ impl LiveSession {
         self.running.is_none()
             && self.router(initial).is_some_and(|router| {
                 router.supports_messages()
-                    && (self.session_id.is_some() || router.start_options().is_ok())
+                    && (self.session_id.is_some() || router.start_options(self.mode).is_ok())
             })
     }
 
@@ -118,7 +124,7 @@ impl LiveSession {
             return None;
         }
         let options = if self.session_id.is_none() {
-            Some(self.router(initial)?.start_options().ok()?)
+            Some(self.router(initial)?.start_options(self.mode).ok()?)
         } else {
             None
         };
@@ -161,7 +167,29 @@ impl LiveSession {
         })
     }
 
-    pub fn decide(&mut self, approve: bool) -> Option<ClientCommand> {
+    pub fn set_mode(
+        &mut self,
+        mode: ClaudeCodePermissionMode,
+        initial: Option<&SessionCapabilities>,
+    ) -> Option<ClientCommand> {
+        let router = self.router(initial)?;
+        if !router.permission_modes().contains(&mode) {
+            return None;
+        }
+        if let Some(session_id) = self.session_id.clone() {
+            router.permission_mode_command(session_id, mode)
+        } else {
+            self.mode = mode;
+            None
+        }
+    }
+
+    pub fn decide(
+        &mut self,
+        approve: bool,
+        persist: bool,
+        message: Option<String>,
+    ) -> Option<ClientCommand> {
         self.action()?;
         let session_id = self.session_id.clone()?;
         let request = self.actions.pop_front()?;
@@ -174,7 +202,8 @@ impl LiveSession {
                 } else {
                     ActionDecisionKind::Deny
                 },
-                persist: false,
+                persist,
+                message,
             },
         })
     }
@@ -235,6 +264,13 @@ impl LiveSession {
                     self.actions.push_back(request);
                 }
             }
+            ServerEvent::VendorPanelEvent {
+                payload:
+                    VendorPanelPayload::ClaudeCode(ClaudeCodeVendorPanelEvent::PermissionModeChanged {
+                        mode,
+                    }),
+                ..
+            } => self.mode = mode,
             ServerEvent::TurnFinished { outcome, error, .. } => {
                 self.finish_turn();
                 if outcome == TurnOutcome::Failed {
@@ -278,6 +314,12 @@ impl LiveSession {
         if let Some(turn) = self.turns.last_mut() {
             turn.finished = true;
         }
+    }
+
+    pub fn waiting(&self) -> bool {
+        self.running.is_some()
+            && self.actions.is_empty()
+            && self.turns.last().is_some_and(|turn| turn.items.is_empty())
     }
 
     pub fn turns(&self) -> Vec<HistoryTurn> {
@@ -333,9 +375,11 @@ mod tests {
                 request_id: id.into(),
                 kind: ActionKind::ExecuteCommand,
                 summary: "Bash: ls".into(),
+                detail: Some("ls".into()),
                 vendor: ActionRequestVendor::ClaudeCode {
                     permission_mode_at_decision: ClaudeCodePermissionMode::Default,
                     tool_name: "Bash".into(),
+                    can_persist: true,
                 },
             },
         }
@@ -437,6 +481,69 @@ mod tests {
     }
 
     #[test]
+    fn permission_modes_follow_session_handshake_and_confirmed_events() {
+        use agentdeck_protocol::{VendorCapabilities, VendorSessionOptions};
+        let mut live = session();
+        let caps = crate::session_router::test_capabilities(AgentKind::ClaudeCode);
+        assert!(
+            live.set_mode(ClaudeCodePermissionMode::Plan, Some(&caps))
+                .is_none()
+        );
+        let ClientCommand::SessionStart(start) = live
+            .send("plan".into(), "/repo".into(), Some(&caps))
+            .unwrap()
+        else {
+            panic!("expected session start");
+        };
+        assert!(
+            matches!(start.vendor_options, VendorSessionOptions::ClaudeCode(options) if options.permission_mode == ClaudeCodePermissionMode::Plan)
+        );
+        assert!(live.waiting());
+        assert!(
+            live.set_mode(ClaudeCodePermissionMode::BypassPermissions, Some(&caps))
+                .is_none(),
+            "wait for the session handshake"
+        );
+        let mut session_caps = caps.clone();
+        let VendorCapabilities::ClaudeCode(vendor) = &mut session_caps.vendor else {
+            unreachable!()
+        };
+        vendor.permission_modes = vec![
+            ClaudeCodePermissionMode::Plan,
+            ClaudeCodePermissionMode::AcceptEdits,
+        ];
+        live.apply(capabilities_event(session_caps));
+        assert!(
+            live.set_mode(ClaudeCodePermissionMode::BypassPermissions, Some(&caps))
+                .is_none(),
+            "machine capability cannot override session capability"
+        );
+        assert!(matches!(
+            live.set_mode(ClaudeCodePermissionMode::AcceptEdits, None),
+            Some(ClientCommand::VendorControl { .. })
+        ));
+        assert_eq!(live.mode, ClaudeCodePermissionMode::Plan);
+        live.apply(ServerEvent::SessionStarted {
+            session_id: start.session_id,
+            thread_id: None,
+            agent_kind: AgentKind::ClaudeCode,
+        });
+        live.apply(error("cc-permission-mode-rejected"));
+        assert!(live.running.is_some());
+        assert_eq!(live.mode, ClaudeCodePermissionMode::Plan);
+        live.apply(ServerEvent::VendorPanelEvent {
+            session_id: SessionId("s".into()),
+            agent_kind: AgentKind::ClaudeCode,
+            payload: VendorPanelPayload::ClaudeCode(
+                ClaudeCodeVendorPanelEvent::PermissionModeChanged {
+                    mode: ClaudeCodePermissionMode::AcceptEdits,
+                },
+            ),
+        });
+        assert_eq!(live.mode, ClaudeCodePermissionMode::AcceptEdits);
+    }
+
+    #[test]
     fn record_warnings_keep_the_turn_running() {
         let mut live = session();
         send(&mut live, "hi");
@@ -463,14 +570,16 @@ mod tests {
                 request_id: "perm-1".into(),
                 kind: ActionKind::ExecuteCommand,
                 summary: "Bash: ls".into(),
+                detail: Some("ls".into()),
                 vendor: ActionRequestVendor::ClaudeCode {
                     permission_mode_at_decision: ClaudeCodePermissionMode::Default,
                     tool_name: "Bash".into(),
+                    can_persist: true,
                 },
             },
         });
         assert!(matches!(
-            live.decide(true),
+            live.decide(true, false, None),
             Some(ClientCommand::ActionDecision { decision, .. })
                 if decision.request_id == "perm-1" && decision.decision == ActionDecisionKind::Approve
         ));
@@ -491,10 +600,17 @@ mod tests {
         assert_eq!(live.actions.len(), 2);
         for (id, approve) in [("first", true), ("second", false)] {
             assert_eq!(live.action().unwrap().request_id, id);
-            let Some(ClientCommand::ActionDecision { decision, .. }) = live.decide(approve) else {
+            let Some(ClientCommand::ActionDecision { decision, .. }) =
+                live.decide(approve, approve, (!approve).then(|| "修改计划".into()))
+            else {
                 panic!("pending request must remain answerable");
             };
             assert_eq!(decision.request_id, id);
+            assert_eq!(decision.persist, approve);
+            assert_eq!(
+                decision.message.as_deref(),
+                (!approve).then_some("修改计划")
+            );
             assert_eq!(
                 decision.decision,
                 if approve {
@@ -504,7 +620,7 @@ mod tests {
                 }
             );
         }
-        assert!(live.decide(true).is_none());
+        assert!(live.decide(true, false, None).is_none());
         assert!(live.running.is_some());
     }
 
@@ -526,7 +642,7 @@ mod tests {
             assert!(live.error.is_some());
             send(&mut live, "retry");
             assert!(
-                live.decide(true).is_none(),
+                live.decide(true, false, None).is_none(),
                 "old requests must not reach the new session"
             );
         }
@@ -550,7 +666,7 @@ mod tests {
         caps.features.remove(&CapabilityId::Approval);
         live.apply(capabilities_event(caps.clone()));
         live.apply(approval("unsupported"));
-        assert!(live.decide(true).is_none());
+        assert!(live.decide(true, false, None).is_none());
         assert!(live.action().is_none());
         assert!(live.cancel().is_some());
         live.apply(finished(TurnOutcome::Succeeded));

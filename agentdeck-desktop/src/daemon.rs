@@ -5,7 +5,7 @@
 //! 每个请求都带目标机器：`None` 是本机，`Some(host)` 经 `ssh <host>` 在远端
 //! login shell 里启动 `agentdeckd`，stdio 协议不变，鉴权与加密交给 SSH 密钥。
 //!
-//! 会话生命周期命令（SessionStart / TurnStart / ...）只写不等回复，daemon 推回的
+//! 会话生命周期命令在同一连接确认协议后写入，不等待运行回复；daemon 推回的
 //! `ServerEvent` 进 `Client::events()` 通道；连接断开时逐会话推 `daemon-disconnected`。
 //!
 //! 所有函数都是阻塞的，调用方必须放到 GPUI 的 background executor 上。
@@ -552,9 +552,10 @@ impl Client {
         self.inner.events.1.clone()
     }
 
-    /// 会话生命周期命令只写不等回复，结果经 `events()` 回来；写失败视为断线。
+    /// 同一连接确认协议后发送；运行结果经 `events()` 回来，写失败视为断线。
     pub fn send(&self, command: &ClientCommand) -> Result<()> {
         let connection = self.connection().map_err(|error| error.to_string())?;
+        self.require_current_protocol(&connection)?;
         connection.write(command).map_err(|error| {
             connection.close(error.kind(), &error.to_string());
             error.to_string()
@@ -586,6 +587,22 @@ impl Client {
             }
         }
         reply
+    }
+
+    fn require_current_protocol(&self, connection: &Connection) -> Result<()> {
+        let protocol = self
+            .request_once(
+                connection,
+                &ClientCommand::ProtocolVersion,
+                "protocolVersion",
+            )
+            .map_err(|error| error.to_string())??;
+        if protocol["protocolVersion"].as_u64()
+            != Some(u64::from(agentdeck_protocol::PROTOCOL_VERSION))
+        {
+            return Err("daemon 协议不支持此操作，请先更新或重装 agentdeckd".into());
+        }
+        Ok(())
     }
 }
 
@@ -667,18 +684,7 @@ impl Client {
     fn agent_modify(&self, command: &ClientCommand, expected_reply: &str) -> Result<String> {
         // 重连可能换成旧 daemon；必须在执行写操作的同一连接上确认协议，且写操作不重放。
         let connection = self.connection().map_err(|error| error.to_string())?;
-        let protocol = self
-            .request_once(
-                &connection,
-                &ClientCommand::ProtocolVersion,
-                "protocolVersion",
-            )
-            .map_err(|error| error.to_string())??;
-        if protocol["protocolVersion"].as_u64()
-            != Some(u64::from(agentdeck_protocol::PROTOCOL_VERSION))
-        {
-            return Err("daemon 协议不支持 CLI 安装或更新，请先更新或重装 agentdeckd".into());
-        }
+        self.require_current_protocol(&connection)?;
         let reply = self
             .request_once(&connection, command, expected_reply)
             .map_err(|error| error.to_string())??;
@@ -997,9 +1003,15 @@ mod tests {
     fn sent_commands_reach_the_daemon_and_events_flow_back() {
         let client = super::Client::new(Some("-offline-test"));
         let mut command = super::daemon_command("/bin/sh");
+        command.env(
+            "TEST_PROTOCOL_VERSION",
+            agentdeck_protocol::PROTOCOL_VERSION.to_string(),
+        );
         command.args([
             "-c",
-            r#"read -r line; case "$line" in *'"command":"sessionStart"'*)
+            r#"read -r line
+                printf '{"reply":"protocolVersion","protocolVersion":%s}\n' "$TEST_PROTOCOL_VERSION"
+                read -r line; case "$line" in *'"command":"sessionStart"'*)
                 echo '{"type":"turnStarted","sessionId":"s","threadId":"t","agentKind":"claude_code","turnId":"t1"}';; esac"#,
         ]);
         let connection = super::Connection::spawn(command, client.inner.events.0.clone()).unwrap();
@@ -1024,11 +1036,16 @@ mod tests {
         let client = super::Client::new(Some("-offline-test"));
         let events = client.events();
         let script = r#"while read -r line; do
+            case "$line" in *protocolVersion*) printf '{"reply":"protocolVersion","protocolVersion":%s}\n' "$TEST_PROTOCOL_VERSION"; continue;; esac
             id=$(printf %s "$line" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
             printf '{"type":"sessionStarted","sessionId":"%s","agentKind":"codex"}\n' "$id"
         done
         while [ -n "$EXIT_GATE" ] && [ ! -f "$EXIT_GATE" ]; do sleep 0.01; done"#;
         let mut command = super::daemon_command("/bin/sh");
+        command.env(
+            "TEST_PROTOCOL_VERSION",
+            agentdeck_protocol::PROTOCOL_VERSION.to_string(),
+        );
         command.args(["-c", script]).env("EXIT_GATE", &gate);
         let old = super::Connection::spawn(command, client.inner.events.0.clone()).unwrap();
         client.inner.state.lock().unwrap().connection = Some(old);
@@ -1043,6 +1060,10 @@ mod tests {
         client.reset();
 
         let mut command = super::daemon_command("/bin/sh");
+        command.env(
+            "TEST_PROTOCOL_VERSION",
+            agentdeck_protocol::PROTOCOL_VERSION.to_string(),
+        );
         command.args(["-c", script]).env_remove("EXIT_GATE");
         let replacement = super::Connection::spawn(command, client.inner.events.0.clone()).unwrap();
         client.inner.state.lock().unwrap().connection = Some(replacement.clone());
@@ -1079,7 +1100,13 @@ mod tests {
         let client = super::Client::new(Some("-offline-test"));
         let events = client.events();
         let mut command = super::daemon_command("/bin/sh");
+        command.env(
+            "TEST_PROTOCOL_VERSION",
+            agentdeck_protocol::PROTOCOL_VERSION.to_string(),
+        );
         command.args(["-c", r#"read -r line
+            printf '{"reply":"protocolVersion","protocolVersion":%s}\n' "$TEST_PROTOCOL_VERSION"
+            read -r line
             echo '{"type":"sessionClosed","sessionId":"s","threadId":"t","agentKind":"codex","outcome":"closed"}'
             cat >/dev/null"#]);
         let connection = super::Connection::spawn(command, client.inner.events.0.clone()).unwrap();
@@ -1272,6 +1299,43 @@ mod tests {
                 )
             ));
         }
+    }
+
+    #[test]
+    fn interaction_rejects_old_protocol_on_the_connection_that_would_send() {
+        let connection = fake_daemon(
+            r#"written=false
+            while read -r line; do
+                case "$line" in
+                    *protocolVersion*) echo '{"reply":"protocolVersion","protocolVersion":7}' ;;
+                    *agentList*) printf '{"reply":"agentList","agents":[],"written":%s}\n' "$written" ;;
+                    *) written=true ;;
+                esac
+            done"#,
+        );
+        let client = fake_client(&connection);
+        let approval = super::ClientCommand::ActionDecision {
+            session_id: super::SessionId("old".into()),
+            decision: agentdeck_protocol::ActionDecision {
+                request_id: "approval".into(),
+                decision: agentdeck_protocol::ActionDecisionKind::Deny,
+                persist: false,
+                message: Some("修改计划".into()),
+            },
+        };
+        for command in [start_session("new"), approval] {
+            assert!(
+                client
+                    .send(&command)
+                    .unwrap_err()
+                    .contains("请先更新或重装")
+            );
+        }
+        let reply = client
+            .round_trip(&super::ClientCommand::AgentList, "agentList")
+            .unwrap();
+        assert_eq!(reply["written"], false, "no interaction reaches v7");
+        assert!(connection.is_alive(), "read-only requests remain available");
     }
 
     #[test]

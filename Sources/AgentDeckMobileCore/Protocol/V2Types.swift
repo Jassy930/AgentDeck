@@ -505,13 +505,13 @@ public struct ProtocolError: Codable, Sendable {
 // MARK: - ActionKind / ActionRequest / ActionDecision
 
 public enum ActionKind: String, Codable, Sendable {
-    case executeCommand, editFiles, grantExtraPermission
+    case executeCommand, editFiles, grantExtraPermission, approvePlan
 }
 
 /// `#[serde(tag = "agentKind")]` ActionRequestVendor.
 public enum ActionRequestVendor: Codable, Sendable {
     case codex(approvalPolicyAtDecision: CodexApprovalPolicy, sandboxAtDecision: CodexSandboxMode, canPersist: Bool)
-    case claudeCode(permissionModeAtDecision: ClaudeCodePermissionMode, toolName: String)
+    case claudeCode(permissionModeAtDecision: ClaudeCodePermissionMode, toolName: String, canPersist: Bool)
 
     private enum CodingKeys: String, CodingKey {
         case agentKind, approvalPolicyAtDecision, sandboxAtDecision, canPersist
@@ -530,7 +530,8 @@ public enum ActionRequestVendor: Codable, Sendable {
         case .claudeCode:
             let mode = try c.decode(ClaudeCodePermissionMode.self, forKey: .permissionModeAtDecision)
             let tool = try c.decode(String.self, forKey: .toolName)
-            self = .claudeCode(permissionModeAtDecision: mode, toolName: tool)
+            let canPersist = try c.decodeIfPresent(Bool.self, forKey: .canPersist) ?? false
+            self = .claudeCode(permissionModeAtDecision: mode, toolName: tool, canPersist: canPersist)
         }
     }
 
@@ -542,10 +543,11 @@ public enum ActionRequestVendor: Codable, Sendable {
             try c.encode(p, forKey: .approvalPolicyAtDecision)
             try c.encode(s, forKey: .sandboxAtDecision)
             try c.encode(cp, forKey: .canPersist)
-        case .claudeCode(let m, let t):
+        case .claudeCode(let m, let t, let cp):
             try c.encode(AgentKind.claudeCode, forKey: .agentKind)
             try c.encode(m, forKey: .permissionModeAtDecision)
             try c.encode(t, forKey: .toolName)
+            try c.encode(cp, forKey: .canPersist)
         }
     }
 }
@@ -554,12 +556,18 @@ public struct ActionRequest: Codable, Sendable {
     public let requestId: String
     public let kind: ActionKind
     public let summary: String
+    /// Full content to review (command, patch, plan markdown); v8.
+    public let detail: String?
     public let vendor: ActionRequestVendor
 
-    public init(requestId: String, kind: ActionKind, summary: String, vendor: ActionRequestVendor) {
+    public init(
+        requestId: String, kind: ActionKind, summary: String, detail: String? = nil,
+        vendor: ActionRequestVendor
+    ) {
         self.requestId = requestId
         self.kind = kind
         self.summary = summary
+        self.detail = detail
         self.vendor = vendor
     }
 }
@@ -572,11 +580,16 @@ public struct ActionDecision: Codable, Sendable {
     public let requestId: String
     public let decision: ActionDecisionKind
     public let persist: Bool
+    /// Feedback for the agent on deny; v8.
+    public let message: String?
 
-    public init(requestId: String, decision: ActionDecisionKind, persist: Bool = false) {
+    public init(
+        requestId: String, decision: ActionDecisionKind, persist: Bool = false, message: String? = nil
+    ) {
         self.requestId = requestId
         self.decision = decision
         self.persist = persist
+        self.message = message
     }
 }
 
@@ -725,6 +738,7 @@ public enum CodexVendorPanelEvent: Codable, Sendable {
 }
 
 public enum ClaudeCodeVendorPanelEvent: Codable, Sendable {
+    case permissionModeChanged(mode: ClaudeCodePermissionMode)
     case hookFired(matcher: String, toolUseId: String?, elapsedMs: UInt64?)
     case systemStatus(
         subtype: String,
@@ -738,7 +752,7 @@ public enum ClaudeCodeVendorPanelEvent: Codable, Sendable {
     )
 
     private enum CodingKeys: String, CodingKey {
-        case kind, matcher, toolUseId, elapsedMs, subtype, status, message, attempt
+        case kind, mode, matcher, toolUseId, elapsedMs, subtype, status, message, attempt
         case error, errorStatus, maxRetries, retryDelayMs
     }
 
@@ -746,6 +760,8 @@ public enum ClaudeCodeVendorPanelEvent: Codable, Sendable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let kind = try c.decode(String.self, forKey: .kind)
         switch kind {
+        case "permissionModeChanged":
+            self = .permissionModeChanged(mode: try c.decode(ClaudeCodePermissionMode.self, forKey: .mode))
         case "hookFired":
             let m = try c.decode(String.self, forKey: .matcher)
             let t = try c.decodeIfPresent(String.self, forKey: .toolUseId)
@@ -780,6 +796,9 @@ public enum ClaudeCodeVendorPanelEvent: Codable, Sendable {
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         switch self {
+        case .permissionModeChanged(let mode):
+            try c.encode("permissionModeChanged", forKey: .kind)
+            try c.encode(mode, forKey: .mode)
         case .hookFired(let m, let t, let e):
             try c.encode("hookFired", forKey: .kind)
             try c.encode(m, forKey: .matcher)
