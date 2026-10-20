@@ -37,6 +37,10 @@
 //!     (initialize / interrupt / set_permission_mode); consumed silently.
 //!   - `"control_cancel_request"` — CC withdrew a pending `can_use_tool`
 //!     prompt; consumed silently, the owner drops the route.
+//!   - `"tool_progress"` — heartbeat every ~30s while a tool runs
+//!     (`parent_tool_use_id`, `elapsed_time_seconds`). An in-flight Bash
+//!     re-emits its Running Shell snapshot with `duration_ms` set; other
+//!     heartbeats are consumed silently.
 //!
 //! ## Cumulative semantics
 //!
@@ -197,6 +201,7 @@ impl ClaudeCodeTranslator {
             // pending `can_use_tool` with `control_cancel_request` (e.g.
             // after an interrupt) and the owner drops its route.
             "control_response" | "control_cancel_request" => TranslateOutput::default(),
+            "tool_progress" => self.handle_tool_progress(&parsed),
             _ => self.raw_event(kind, trimmed),
         }
     }
@@ -519,6 +524,42 @@ impl ClaudeCodeTranslator {
             },
         );
         Some(event)
+    }
+
+    /// Refresh a running Bash card's elapsed time; never surfaces as Raw.
+    fn handle_tool_progress(&mut self, parsed: &Value) -> TranslateOutput {
+        let Some(id) = parsed
+            .get("parent_tool_use_id")
+            .or_else(|| parsed.get("tool_use_id"))
+            .and_then(Value::as_str)
+        else {
+            return TranslateOutput::default();
+        };
+        let Some(record) = self.in_flight_tools.get(id).filter(|r| r.name == "Bash") else {
+            return TranslateOutput::default();
+        };
+        let elapsed_ms = parsed
+            .get("elapsed_time_seconds")
+            .and_then(Value::as_f64)
+            .map(|secs| (secs * 1000.) as u64)
+            .unwrap_or_else(|| now_ms().saturating_sub(record.started_at_ms));
+        let command = record
+            .input
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let item = AgentItem::Shell {
+            command,
+            status: ShellStatus::Running,
+            exit_code: None,
+            duration_ms: Some(elapsed_ms),
+            meta: tool_meta(id, "Bash"),
+        };
+        TranslateOutput {
+            events: vec![self.item_event(item, None, AgentItemState::Streaming)],
+            permission_route_hint: None,
+        }
     }
 
     // ── user snapshot (tool_result echo) ───────────────────────────────────
