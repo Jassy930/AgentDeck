@@ -8,8 +8,9 @@
   fake 集成、Swift 和 CLI 自检通过；真实 Codex 四轮 M0 在下述临时配置覆盖环境通过，
   默认本机配置仍不兼容，历史列表首轮超时、复验通过但耗时接近 deadline。
   iOS iPhone 17 Simulator 已执行 21 项测试且全部通过。详见 [M0 CLI 实施记录](plans/2026-09-21-backend-m0-cli-implementation.md)。
-- 当前桌面边界：GPUI 桌面已连接 daemon，但只用 `AgentList` 与 `History` 三个只读入口；
-  本页其余 backend 能力仍不能视为桌面端可用能力。
+- 当前桌面边界：GPUI 桌面已连接 daemon，使用 `AgentList`、`History` 与续聊所需的
+  SessionStart / TurnStart / TurnCancel / ActionDecision；Claude Code 续聊已真实验证，
+  Codex 从桌面发送未验证，本页其余 backend 能力仍不能视为桌面端可用能力。
 - 运行时策略：复用本机 Codex，macOS 桌面端优先、CLI 兜底。历史 list/read 接受首个
   版本探测成功的运行时，版本不同仅 warning；live session 仍保留精确版本门禁。
   warning 显示实际版本、路径和已验证基线；历史 RPC/解码失败保留实际运行时
@@ -26,7 +27,7 @@
 - desktop 接入前的目标边界：
   `docs/plans/2026-08-17-codex-app-server-lifecycle-adr.md` 与
   `docs/plans/2026-08-17-agentdeckd-minimum-stable-boundary-design.md`。代码实现包含生命周期、streaming/item identity、持久 CLI 与 RunRecord/diagnostics；
-  M0 已完成限定环境验收；GPUI desktop 目前只接入只读历史。
+  M0 已完成限定环境验收；GPUI desktop 已接入历史与续聊。
 
 ## 状态定义
 
@@ -92,7 +93,7 @@ README、架构、诊断和计划文档用于解释目标与不变量；当文�
 | observability | diagnostic log/report | 部分 | Codex lifecycle 已覆盖 spawn/version/PID、RPC、turn outcome、interrupt、cleanup；failure diagnosticRef 仅在成功落盘后返回，对应实际 runId/eventSeq。写失败省略引用并保留 stderr fallback；审批/history 等 M0 外路径尚未贯通。 | `agentdeckd/src/diag.rs`、`agentdeckd/src/codex/session.rs` |
 | quality | 默认测试离线安全 | 较完整 | 真实 session、prompt、history、auth 和 vendor process 测试统一只认 `AGENTDECK_E2E=1`；普通 version/auth probe 使用可注入 fake。marker tripwire 通过临时 HOME 隔离用户 vendor history 与默认 AgentDeck data dir，并通过 `AGENTDECK_CODEX_BIN` 绑定 Codex marker，验证标准 workspace tests 不执行 vendor shim；macOS workflow 已配置该门禁，首个 hosted run 已在 2026-08-18 通过。普通 passed 仍不代表真实 E2E 已执行。 | `agentdeckd/tests/support/mod.rs`、`scripts/verify-offline-tests.sh`、`.github/workflows/offline-ci.yml` |
 | CLI | admin、session、history | 部分 | session live 在一个 daemon 连接上双向转发 typed JSONL，支持顺序多轮、cancel、close、Ping，EOF 有序关闭。run/continue 保持 one-shot；record_write_failed 不终止健康会话。live 是协议驱动入口，尚无交互式审批产品界面。 | `agentdeck-cli/src/commands.rs`、`agentdeck-cli/src/client.rs`、`agentdeck-cli/tests/session_live.rs` |
-| product integration | GPUI desktop → daemon | 部分 | bundle 自带 `agentdeckd`；桌面每台机器维持一个常驻 daemon 连接（远端经 SSH stdio），按 requestId 多路复用 JSONL，用 `AgentList` + `History(List/Read)` 驱动侧栏与会话记录，阻塞 IPC 走 background executor，selfcheck 不连 daemon。读取失败支持自动与手动重试，每来源按 50 条扩展，最多 2,000 条。2026-09-23 的 alpha.16 实窗已验收 Codex 正文及 50 → 100 条加载更多，Claude Code 返回 49 条。会话启动、turn、streaming、审批和 vendor 控制仍未接入。 | `agentdeck-desktop/src/daemon.rs`、`agentdeck-desktop/src/shell.rs`、`script/build_and_run.sh` |
+| product integration | GPUI desktop → daemon | 部分 | bundle 自带 `agentdeckd`；桌面每台机器维持一个常驻 daemon 连接（远端经 SSH stdio），按 requestId 多路复用 JSONL，用 `AgentList` + `History(List/Read)` 驱动侧栏与会话记录，阻塞 IPC 走 background executor，selfcheck 不连 daemon。读取失败支持自动与手动重试，每来源按 50 条扩展，最多 2,000 条。2026-09-23 的 alpha.16 实窗已验收 Codex 正文及 50 → 100 条加载更多，Claude Code 返回 49 条。2026-10-20 起可续聊已有会话：每台机器一条事件通道，生命周期命令只写不等回复，断线推 `daemon-disconnected`；CC 续聊、流式与审批条已在实窗截图验证。新建会话和 vendor 控制仍未接入。 | `agentdeck-desktop/src/daemon.rs`、`agentdeck-desktop/src/shell.rs`、`script/build_and_run.sh` |
 
 ## 当前验收边界
 
@@ -104,9 +105,8 @@ README、架构、诊断和计划文档用于解释目标与不变量；当文�
 - 真实四轮为 succeeded/succeeded/canceled/succeeded，streaming 快照数为 29/30/2/28；PID `9186`、threadId `01a0c1d3-2841-75e1-93f7-fb678dd68b4a` 全程复用。唯一 SessionClosed(closed)、完整 record/footer、IPC 同序和进程组消失断言通过，diagnostics report 已生成。
 - 验收回执目录：`/tmp/agentdeck-m0-real-launcher-efmchgel/`；record 与 diagnostics：`/var/folders/zy/fn4lmxbx1cd5flcp81mk2xx80000gn/T/agentdeck-codex-live-e2e-9179-1789958234236367000/`。其余 7 项 Codex E2E 中，agent list、capabilities、Ping、selfcheck、one-shot run、continue 通过，history list 首轮在 30 秒总 deadline 超时。
 - history list 同条件复验返回 500 条并通过（27.57 秒）；独立官方探测确认 500 条分五页，总耗时 25.64 秒，接近 28 秒工作截止时间。8 项均有单项通过回执，但首轮套件不是全绿，历史查询时延风险未修复；真实 failed turn 仍未验收。
-- Codex 交互审批、history 管理语义和远程能力仍在 M0 外。Claude Code lifecycle、partial streaming 和审批已于 2026-10-20 在 daemon 侧落地，见 `plans/2026-10-20-cc-interactive-session-design.md`；桌面尚未接入。
-- GPUI desktop 只接入只读历史；后端验证通过不等于桌面产品闭环完成，桌面上能看到会话
-  也不代表能启动或继续会话。
+- Codex 交互审批、history 管理语义和远程能力仍在 M0 外。Claude Code lifecycle、partial streaming 和审批已于 2026-10-20 在 daemon 侧落地并接入桌面续聊，见 `plans/2026-10-20-cc-interactive-session-design.md`。
+- GPUI desktop 可续聊侧栏已有会话，不能新建会话；后端验证通过不等于桌面产品闭环完成。
 
 ## 证据与验证边界
 

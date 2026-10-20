@@ -1,4 +1,5 @@
 mod daemon;
+mod live;
 mod machines;
 mod remotes;
 mod shell;

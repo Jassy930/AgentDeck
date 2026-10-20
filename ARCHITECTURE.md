@@ -27,9 +27,10 @@ AgentDeckMobileCore + ios/
 ```
 
 唯一允许的本机桌面通路是
-`agentdeck-desktop → typed local client → agentdeckd`。该通路已落地，但当前只覆盖
-只读历史（agent list / history list / history read）；session 生命周期、turn、streaming
-和审批仍未接入，selfcheck 也不走这条通路。每台机器一条常驻连接，history 按 requestId
+`agentdeck-desktop → typed local client → agentdeckd`。该通路已落地，覆盖历史读取
+（agent list / history list / history read）与续聊：生命周期命令只写不等回复，daemon
+推回的 `ServerEvent` 进每台机器的事件通道，桌面按 sessionId 交给 live 会话；新建会话
+尚未接入，selfcheck 也不走这条通路。每台机器一条常驻连接，history 按 requestId
 多路复用，进程退出后下次请求重连。每个机器实例持有独立 client，异步请求在调度时
 捕获该实例；显式断开取消其请求并回收子进程，旧实例不能自动重连或借用后来重新添加的
 同名机器连接。已完成请求及时移除等待条目。对用户在界面上添加的远端机器，typed

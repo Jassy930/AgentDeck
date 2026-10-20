@@ -351,6 +351,20 @@ pub fn prepare(turns: Vec<HistoryTurn>) -> Vec<Block> {
     blocks
 }
 
+/// 历史块后接 live 块：live 块单独 `prepare`，组下标整体平移，免得每个流式快照
+/// 都把整段历史重算一遍。
+pub fn append(history: &[Block], live: Vec<Block>) -> Vec<Block> {
+    let offset = history.len();
+    history
+        .iter()
+        .cloned()
+        .chain(live.into_iter().map(|mut block| {
+            block.group = block.group.map(|(start, len)| (start + offset, len));
+            block
+        }))
+        .collect()
+}
+
 pub fn collapsed_indices(blocks: &[Block]) -> impl Iterator<Item = usize> + '_ {
     blocks.iter().enumerate().filter_map(|(ix, block)| {
         block
@@ -364,14 +378,37 @@ struct VisibleRows {
     /// 列表位置会随折叠变化，内容和展开状态始终使用原始块下标。
     indices: Vec<usize>,
     expanded_groups: HashSet<usize>,
+    /// 构建 `indices` 时的块；live 更新换成新的一份后需要重算。
+    source: Rc<[Block]>,
 }
 
 impl VisibleRows {
-    fn new(blocks: &[Block]) -> Self {
+    fn new(blocks: &Rc<[Block]>) -> Self {
         Self {
             indices: collapsed_indices(blocks).collect(),
             expanded_groups: HashSet::new(),
+            source: blocks.clone(),
         }
+    }
+
+    /// 块内容变了（live 追加或流式快照）：保留已展开的组重算可见行。
+    /// 返回 true 表示调用方要重置列表。
+    fn sync(&mut self, blocks: &Rc<[Block]>) -> bool {
+        if Rc::ptr_eq(&self.source, blocks) {
+            return false;
+        }
+        self.source = blocks.clone();
+        self.indices = blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, block)| {
+                block
+                    .group
+                    .is_none_or(|(start, _)| start == ix || self.expanded_groups.contains(&start))
+                    .then_some(ix)
+            })
+            .collect();
+        true
     }
 
     fn toggle_group(&mut self, row: usize, start: usize, len: usize, list: &ListState) {
@@ -514,6 +551,21 @@ pub fn render(
         cx,
         |_, _| VisibleRows::new(&blocks),
     );
+    visible.update(cx, |rows, _| {
+        let changed = rows.sync(&blocks);
+        if !changed && state.item_count() != rows.indices.len() {
+            // 读完历史时列表按历史块数重置过，这时已拼上了运行中的 live 轮次。
+            state.reset(rows.indices.len());
+        }
+        if changed {
+            // ponytail: 有新内容就跟到底部；用户往上翻看时也会被拉回，
+            // 需要时改成"只在原本就停在底部时跟随"。
+            state.reset(rows.indices.len());
+            if let Some(last) = rows.indices.len().checked_sub(1) {
+                state.scroll_to_reveal_item(last);
+            }
+        }
+    });
     let list_state = state.clone();
     // 常驻显示：长会话需要随时看到当前位置，不跟随系统的自动隐藏。
     let scrollbar = Scrollbar::vertical(&state).scrollbar_show(ScrollbarShow::Always);
@@ -746,13 +798,14 @@ fn edge_fade(top: bool, cx: &gpui::App) -> gpui::Div {
 #[cfg(test)]
 mod tests {
     use super::{
-        BODY_LIMIT, Block, VisibleRows, collapsed_indices, describe, fence, is_binary, prepare,
-        truncate,
+        BODY_LIMIT, Block, VisibleRows, append, collapsed_indices, describe, fence, is_binary,
+        prepare, truncate,
     };
     use agentdeck_protocol::{
         AgentItem, AgentItemMeta, HistoryTurn, PlanStep, PlanStepStatus, ShellStatus,
     };
     use gpui::{ListAlignment, ListOffset, ListState, px};
+    use std::rc::Rc;
 
     fn meta() -> AgentItemMeta {
         AgentItemMeta::default()
@@ -1030,7 +1083,7 @@ mod tests {
             .chain((0..3).map(|_| process()))
             .chain(std::iter::once(message()))
             .collect();
-        let blocks = prepare(vec![HistoryTurn { items }]);
+        let blocks: Rc<[Block]> = prepare(vec![HistoryTurn { items }]).into();
         let mut rows = VisibleRows::new(&blocks);
         let list = ListState::new(
             collapsed_indices(&blocks).count(),
@@ -1063,5 +1116,33 @@ mod tests {
         assert_eq!(list.logical_scroll_top().item_ix, 4);
         assert_eq!(list.logical_scroll_top().offset_in_item, px(7.));
         assert!(rows.expanded_groups.is_empty());
+    }
+
+    #[test]
+    fn appended_live_blocks_shift_groups_and_keep_expanded_history_groups() {
+        let process = || AgentItem::Reasoning {
+            text: "步骤".into(),
+            meta: meta(),
+        };
+        let message = |text: &str| AgentItem::UserMessage {
+            text: text.into(),
+            meta: meta(),
+        };
+        let history: Rc<[Block]> = prepare(vec![HistoryTurn {
+            items: vec![message("旧"), process(), process()],
+        }])
+        .into();
+        let mut rows = VisibleRows::new(&history);
+        let list = ListState::new(rows.indices.len(), ListAlignment::Top, px(1000.));
+        rows.toggle_group(1, 1, 2, &list);
+        assert!(!rows.sync(&history), "same blocks need no reset");
+
+        let live = prepare(vec![HistoryTurn {
+            items: vec![message("新"), process(), process()],
+        }]);
+        let combined: Rc<[Block]> = append(&history, live).into();
+        assert_eq!(combined[4].group, Some((4, 2)));
+        assert!(rows.sync(&combined));
+        assert_eq!(rows.indices, [0, 1, 2, 3, 4]);
     }
 }

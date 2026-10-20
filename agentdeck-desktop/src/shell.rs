@@ -1,14 +1,16 @@
 //! 桌面端外壳：全高侧栏 + 主区，主区在空态、会话态和机器管理页之间切换。
 //!
 //! 会话列表和会话记录来自本机与经 ssh 连接的远端 `agentdeckd`，通过 `daemon`
-//! 模块按机器、按 agent 拉取；本期只读历史，不启动 session、不发 turn。
+//! 模块按机器、按 agent 拉取。会话页底部可以续聊：发送、停止和审批经 daemon
+//! 事件流回到 `live` 状态，渲染在历史记录之后。
 
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use agentdeck_protocol::{
-    AgentKind, HistoryListItem, HistoryWarning, MAX_HISTORY_LIST_LIMIT, ThreadId,
+    AgentKind, ClientCommand, HistoryListItem, HistoryWarning, MAX_HISTORY_LIST_LIMIT, ServerEvent,
+    ThreadId,
 };
 use gpui::{
     App, Context, Entity, FocusHandle, IntoElement, ListAlignment, ListState, ParentElement,
@@ -18,11 +20,12 @@ use gpui_component::{
     ActiveTheme, Colorize, Icon, InteractiveElementExt, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
-    input::{InputEvent, InputState},
+    input::{Input, InputEvent, InputState},
     v_flex,
 };
 
 use crate::daemon;
+use crate::live::LiveSession;
 use crate::machines;
 use crate::remotes;
 use crate::sidebar;
@@ -94,7 +97,10 @@ fn transcript_list() -> ListState {
 pub enum Transcript {
     Loading,
     Ready {
+        /// 历史块后接本次续聊的 live 块。
         blocks: Rc<[transcript::Block]>,
+        /// 只含读回的历史；live 更新时在它后面重新拼接。
+        history: Rc<[transcript::Block]>,
         warnings: Vec<HistoryWarning>,
     },
     Failed(String),
@@ -117,8 +123,10 @@ impl Stage {
             *transcript = match read {
                 Ok((turns, warnings)) => {
                     list.reset(transcript::collapsed_indices(&turns).count());
+                    let history: Rc<[transcript::Block]> = turns.into();
                     Transcript::Ready {
-                        blocks: turns.into(),
+                        blocks: history.clone(),
+                        history,
                         warnings,
                     }
                 }
@@ -623,6 +631,11 @@ pub struct Shell {
     pub(crate) quick_add_open: bool,
     /// 已点过一次、等待确认的安装或更新按钮；鼠标移开即取消。
     pub(crate) update_armed: Option<(u64, AgentKind, AgentOperation)>,
+    /// 续聊过的会话；切走后 daemon 上的会话继续跑，回来还能看到进度。
+    /// ponytail: 从不发 SessionClose，vendor 进程随 daemon 退出回收；会话多了再按空闲关闭。
+    live: Vec<LiveSession>,
+    /// 会话页底部输入框：Enter 发送，⌘Enter 换行。
+    composer: Entity<InputState>,
 }
 
 impl Shell {
@@ -654,6 +667,22 @@ impl Shell {
         })
         .detach();
 
+        let composer = cx.new(|cx| {
+            InputState::new(window, cx)
+                .auto_grow(1, 8)
+                .placeholder("发消息续聊，Enter 发送，⌘Enter 换行")
+        });
+        cx.subscribe_in(
+            &composer,
+            window,
+            |shell, _, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { secondary: false } = event {
+                    shell.send_message(window, cx);
+                }
+            },
+        )
+        .detach();
+
         let mut shell = Self {
             stage: Stage::Empty,
             frame_stats: dev_mode.then(FrameStats::default),
@@ -676,6 +705,8 @@ impl Shell {
             latest_requested: false,
             quick_add_open: false,
             update_armed: None,
+            live: Vec::new(),
+            composer,
         };
         if connect_daemon {
             shell.add_machine(None, cx);
@@ -709,8 +740,169 @@ impl Shell {
     fn add_machine(&mut self, host: Host, cx: &mut Context<Self>) {
         self.next_machine_id += 1;
         let id = self.next_machine_id;
-        self.machines.push(Machine::new(id, host));
+        let machine = Machine::new(id, host);
+        let events = machine.client.events();
+        self.machines.push(machine);
         self.load_machine(id, cx);
+        // 机器移除后 Client 释放，读线程结束，通道关闭，这个任务随之退出。
+        cx.spawn(async move |this, cx| {
+            while let Ok(event) = events.recv().await {
+                if this
+                    .update(cx, |shell, cx| shell.on_event(id, event, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// daemon 推回的会话事件：按 sessionId 交给对应的 live 会话。
+    fn on_event(&mut self, machine_id: u64, event: ServerEvent, cx: &mut Context<Self>) {
+        let Some(host) = self.machine(machine_id).map(|machine| machine.host.clone()) else {
+            return;
+        };
+        if let ServerEvent::Error {
+            session_id: None,
+            error,
+        } = &event
+        {
+            if error.code == daemon::DISCONNECTED {
+                for live in self.live.iter_mut().filter(|live| live.key.0 == host) {
+                    live.disconnected("与机器的连接已断开，再发消息会重新连接");
+                }
+                self.refresh_live_view(cx);
+            }
+            return;
+        }
+        let Some(session_id) = crate::live::event_session(&event).cloned() else {
+            return;
+        };
+        let Some(live) = self
+            .live
+            .iter_mut()
+            .find(|live| live.key.0 == host && live.session_id.as_ref() == Some(&session_id))
+        else {
+            return;
+        };
+        if live.apply(event) {
+            self.refresh_live_view(cx);
+        }
+    }
+
+    /// 当前会话页的记录 = 历史块 + live 块；只换 blocks，列表由 render 对账。
+    fn refresh_live_view(&mut self, cx: &mut Context<Self>) {
+        if let Stage::Session {
+            session,
+            transcript: Transcript::Ready {
+                blocks, history, ..
+            },
+            ..
+        } = &mut self.stage
+        {
+            let live = self
+                .live
+                .iter()
+                .find(|live| session.is(&live.key))
+                .map(|live| transcript::prepare(live.turns()))
+                .unwrap_or_default();
+            *blocks = if live.is_empty() {
+                history.clone()
+            } else {
+                transcript::append(history, live).into()
+            };
+        }
+        cx.notify();
+    }
+
+    fn current_live(&mut self) -> Option<(&mut LiveSession, std::path::PathBuf, daemon::Client)> {
+        let Stage::Session {
+            session,
+            transcript: Transcript::Ready { .. },
+            ..
+        } = &self.stage
+        else {
+            return None;
+        };
+        let key = session.key();
+        let cwd = session.item.cwd.clone();
+        let client = self
+            .machines
+            .iter()
+            .find(|machine| machine.host == key.0)?
+            .client
+            .clone();
+        let index = match self.live.iter().position(|live| live.key == key) {
+            Some(index) => index,
+            None => {
+                self.live.push(LiveSession::new(key));
+                self.live.len() - 1
+            }
+        };
+        Some((&mut self.live[index], cwd, client))
+    }
+
+    /// 写命令可能卡在 ssh 上，放后台；写失败就当这一轮没发出去。
+    fn dispatch(&mut self, client: daemon::Client, command: ClientCommand, cx: &mut Context<Self>) {
+        let key = self.stage.key();
+        cx.spawn(async move |this, cx| {
+            let sent = cx
+                .background_executor()
+                .spawn(async move { client.send(&command) })
+                .await;
+            if let Err(message) = sent {
+                this.update(cx, |shell, cx| {
+                    if let Some(live) = shell
+                        .live
+                        .iter_mut()
+                        .find(|live| Some(&live.key) == key.as_ref())
+                    {
+                        live.send_failed(message);
+                    }
+                    shell.refresh_live_view(cx);
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    pub fn send_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.composer.read(cx).value().trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let Some((live, cwd, client)) = self.current_live() else {
+            return;
+        };
+        if live.running.is_some() {
+            return;
+        }
+        let command = live.send(text, cwd);
+        self.composer
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.dispatch(client, command, cx);
+        self.refresh_live_view(cx);
+    }
+
+    pub fn stop_turn(&mut self, cx: &mut Context<Self>) {
+        let Some((live, _, client)) = self.current_live() else {
+            return;
+        };
+        if let Some(command) = live.cancel() {
+            self.dispatch(client, command, cx);
+        }
+    }
+
+    pub fn decide(&mut self, approve: bool, cx: &mut Context<Self>) {
+        let Some((live, _, client)) = self.current_live() else {
+            return;
+        };
+        if let Some(command) = live.decide(approve) {
+            self.dispatch(client, command, cx);
+        }
+        cx.notify();
     }
 
     /// 先问 daemon 注册了哪些 agent，再按 agent 分别拉历史：谁先返回谁先进侧栏，
@@ -1108,6 +1300,7 @@ impl Shell {
         machine.client.disconnect();
         let host = machine.host;
         self.sessions.retain(|session| session.host != host);
+        self.live.retain(|live| live.key.0 != host);
         if self
             .agent_filter
             .as_ref()
@@ -1262,6 +1455,9 @@ impl Shell {
             return;
         };
         let client = machine.client.clone();
+        if let Some(live) = self.live.iter_mut().find(|live| session.is(&live.key)) {
+            live.forget_finished();
+        }
         self.sidebar_cursor = Some(session.key());
         self.next_read_id += 1;
         let read_id = self.next_read_id;
@@ -1298,7 +1494,7 @@ impl Shell {
             this.update(cx, |shell, cx| {
                 // 回到同一会话也属于新请求，不能接受上次读取的迟到结果。
                 if shell.stage.finish_read(read_id, read) {
-                    cx.notify();
+                    shell.refresh_live_view(cx);
                 }
                 if let Some(next) = shell.reads.finish() {
                     shell.start_read(next, cx);
@@ -1618,15 +1814,114 @@ impl Shell {
                 },
             )
             .child(body)
+            .when(matches!(transcript, Transcript::Ready { .. }), |section| {
+                section.child(self.render_composer(session, cx))
+            })
+    }
+
+    /// 底部续聊区：待决审批、最近错误、输入框和发送/停止按钮；固定高度，不被记录挤压。
+    fn render_composer(
+        &self,
+        session: &Session,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let live = self.live.iter().find(|live| session.is(&live.key));
+        let running = live.is_some_and(|live| live.running.is_some());
+        let action = live.and_then(|live| live.action.clone());
+        let error = live.and_then(|live| live.error.clone());
+        let theme = cx.theme();
+        let (border, surface, danger, warning) =
+            (theme.border, theme.secondary, theme.danger, theme.warning);
+
+        v_flex()
+            .w_full()
+            .flex_shrink_0()
+            .items_center()
+            .px_6()
+            .pt_2()
+            .pb_4()
+            .gap_2()
+            .when_some(action, |section, action| {
+                section.child(
+                    h_flex()
+                        .w_full()
+                        .max_w(px(760.))
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .items_center()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(warning.opacity(0.5))
+                        .bg(warning.opacity(0.08))
+                        .child(
+                            Icon::empty()
+                                .xsmall()
+                                .path(crate::ALERT_ICON)
+                                .text_color(warning),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .text_sm()
+                                .line_clamp(2)
+                                .child(format!("请求授权：{}", action.summary)),
+                        )
+                        .child(
+                            Button::new("deny-action")
+                                .small()
+                                .outline()
+                                .label("拒绝")
+                                .on_click(cx.listener(|shell, _, _, cx| shell.decide(false, cx))),
+                        )
+                        .child(
+                            Button::new("approve-action")
+                                .small()
+                                .primary()
+                                .label("允许")
+                                .on_click(cx.listener(|shell, _, _, cx| shell.decide(true, cx))),
+                        ),
+                )
+            })
+            .when_some(error, |section, error| {
+                section.child(
+                    div()
+                        .w_full()
+                        .max_w(px(760.))
+                        .text_xs()
+                        .text_color(danger)
+                        .line_clamp(3)
+                        .child(error),
+                )
+            })
             .child(
-                // 发送接入前只留一行只读提示；固定高度，不被上方记录挤压。
                 h_flex()
                     .w_full()
-                    .flex_shrink_0()
-                    .justify_center()
-                    .pt_2()
-                    .pb_4()
-                    .child(read_only_notice(cx)),
+                    .max_w(px(760.))
+                    .gap_2()
+                    .p_2()
+                    .items_end()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(border)
+                    .bg(surface)
+                    .child(Input::new(&self.composer).appearance(false).flex_1())
+                    .child(if running {
+                        Button::new("stop-turn")
+                            .small()
+                            .outline()
+                            .label("停止")
+                            .on_click(cx.listener(|shell, _, _, cx| shell.stop_turn(cx)))
+                    } else {
+                        Button::new("send-message")
+                            .small()
+                            .primary()
+                            .label("发送")
+                            .on_click(
+                                cx.listener(|shell, _, window, cx| shell.send_message(window, cx)),
+                            )
+                    }),
             )
     }
 }
@@ -1640,7 +1935,7 @@ fn placeholder(text: &str, cx: &App) -> impl IntoElement + use<> {
     )
 }
 
-/// 只读提示胶囊：状态点 + 文案，常驻但不抢视线。
+/// 空态提示胶囊：状态点 + 文案，常驻但不抢视线。
 fn read_only_notice(cx: &App) -> impl IntoElement + use<> {
     h_flex()
         .gap_2()
@@ -1653,8 +1948,8 @@ fn read_only_notice(cx: &App) -> impl IntoElement + use<> {
         .bg(cx.theme().muted.opacity(0.6))
         .text_xs()
         .text_color(cx.theme().muted_foreground)
-        .child(div().size(px(6.)).rounded_full().bg(cx.theme().warning))
-        .child("只读历史预览 · 暂不能发送任务")
+        .child(div().size(px(6.)).rounded_full().bg(cx.theme().success))
+        .child("在侧栏打开会话即可续聊 · 新建会话暂未支持")
 }
 
 /// 会话头部的元信息标签。
@@ -2099,7 +2394,7 @@ mod tests {
         assert!(!stage.finish_read(1, Ok((vec![], vec![]))));
         assert!(matches!(
             &stage,
-            Stage::Session { transcript: Transcript::Ready { blocks, warnings }, list, .. }
+            Stage::Session { transcript: Transcript::Ready { blocks, warnings, .. }, list, .. }
                 if blocks.len() == 1 && list.item_count() == 1 && warnings == &[warning()]
         ));
 

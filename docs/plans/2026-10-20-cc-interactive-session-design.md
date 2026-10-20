@@ -83,7 +83,29 @@ claude --print --input-format stream-json --output-format stream-json \
   会话以 `failed` 收口。
 - 未知的 inbound control_request 回 `control_response{subtype:error}`，避免 CC 一直挂起等待。
 
+## P2 桌面续聊（2026-10-20 已实施）
+
+- `daemon.rs`：每个 `Client` 一条 `async-channel` 事件通道。读线程把非回复行解析成
+  `ServerEvent` 推入通道，连接结束时补推 `Error{sessionId:null, code:daemon-disconnected}`；
+  `send()` 只写不等回复。
+- `live.rs`：纯状态机 `LiveSession`。首次发送生成 `SessionStart(resumeThreadId, initialTurn)`，
+  之后发 `TurnStart`。按 itemId upsert 流式条目；`Error` 会清掉运行状态，会话没起来或
+  daemon 不认识时，下次发送重新 SessionStart。重新打开会话时丢弃已完成的轮次，因为它们已写进 vendor 历史。
+- `shell.rs`：每台机器一个事件监听任务，按 machine id 定位，不按 host，避免重新添加同名机器时串线。
+  会话页底部有审批条、错误行、输入框和发送/停止按钮，记录区 = 历史块 + live 块。
+- `transcript.rs`：`append` 平移 live 块的组下标；`render` 发现 blocks 换了一份时，
+  保留已展开的组重算可见行，并跟随到底部。
+- N2：输入框对所有会话显示，按 kind 只构造 `VendorSessionOptions`（vendor 命名空间）；
+  CC 用 default 权限模式，Codex 用 daemon 固定的 M0 选项（未从桌面验证）。
+- 实窗验证：在临时目录新建一次性 CC 会话，用临时环境变量开关自动打开会话并发送消息，截图确认
+  历史、续聊气泡、流式"变更"条目、审批条和"停止"按钮都已渲染。点击"允许 / 拒绝 / 停止"
+  需要真实鼠标，未自动验证。
+
 ## 已知边界
+
+- 桌面不发 `SessionClose`，CC 子进程随 daemon（应用退出或连接重置）回收。
+- live 内容更新时总是跟随到底部，用户上翻查看时会被拉回。
+
 
 - CLI one-shot `agentdeck run` 的 CC 默认权限改为 `acceptEdits`（2026-10-20），文件编辑不再等审批；
   Bash 等其他工具仍会等待决定，交互审批请改用 `session live`，或显式指定 `--permission bypass-permissions`。

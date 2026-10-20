@@ -5,6 +5,9 @@
 //! 每个请求都带目标机器：`None` 是本机，`Some(host)` 经 `ssh <host>` 在远端
 //! login shell 里启动 `agentdeckd`，stdio 协议不变，鉴权与加密交给 SSH 密钥。
 //!
+//! 会话生命周期命令（SessionStart / TurnStart / ...）只写不等回复，daemon 推回的
+//! `ServerEvent` 进 `Client::events()` 通道；连接断开时推一条 `daemon-disconnected`。
+//!
 //! 所有函数都是阻塞的，调用方必须放到 GPUI 的 background executor 上。
 
 use std::collections::{HashMap, VecDeque};
@@ -18,8 +21,11 @@ use std::time::{Duration, Instant};
 
 use agentdeck_protocol::{
     AgentKind, ClientCommand, HistoryListItem, HistoryReply, HistoryRequest, HistoryResponse,
-    HistoryTurn, HistoryWarning, ThreadId,
+    HistoryTurn, HistoryWarning, ProtocolError, ServerEvent, ThreadId,
 };
+
+/// 连接断开时推给事件消费者的错误码：该机器上所有 live 会话都随 daemon 结束。
+pub const DISCONNECTED: &str = "daemon-disconnected";
 
 /// 与 CLI 一致的显式覆盖入口：一旦设置就必须指向绝对路径的可执行文件，不回退。
 const DAEMON_BIN_ENV: &str = "AGENTDECK_DAEMON_BIN";
@@ -261,6 +267,11 @@ pub struct Client {
 struct ClientInner {
     host: Option<String>,
     state: Mutex<ClientState>,
+    /// 读线程推 daemon 事件；重连后新读线程拿同一个 Sender。
+    events: (
+        async_channel::Sender<ServerEvent>,
+        async_channel::Receiver<ServerEvent>,
+    ),
 }
 
 #[derive(Default)]
@@ -270,7 +281,10 @@ struct ClientState {
 }
 
 impl Connection {
-    fn spawn(mut command: Command) -> io::Result<Arc<Self>> {
+    fn spawn(
+        mut command: Command,
+        events: async_channel::Sender<ServerEvent>,
+    ) -> io::Result<Arc<Self>> {
         let child = command.spawn().map_err(|source| {
             io::Error::new(source.kind(), format!("启动 agentdeckd 失败：{source}"))
         })?;
@@ -290,7 +304,7 @@ impl Connection {
         let alive = Arc::new(AtomicBool::new(true));
         {
             let (pending, alive) = (Arc::clone(&pending), Arc::clone(&alive));
-            std::thread::spawn(move || read_replies(stdout, stderr, &pending, &alive));
+            std::thread::spawn(move || read_replies(stdout, stderr, &pending, &alive, &events));
         }
         Ok(Arc::new(Self {
             stdin: Mutex::new(Some(stdin)),
@@ -320,6 +334,16 @@ impl Connection {
         }
     }
 
+    fn write(&self, command: &ClientCommand) -> io::Result<()> {
+        let mut line = serde_json::to_string(command).map_err(io::Error::other)?;
+        line.push('\n');
+        match self.stdin.lock().unwrap().as_mut() {
+            Some(stdin) => stdin.write_all(line.as_bytes()),
+            None => Err(io::Error::other("机器连接已断开")),
+        }
+        .map_err(|source| io::Error::new(source.kind(), format!("写入 agentdeckd 失败：{source}")))
+    }
+
     fn request(&self, command: &ClientCommand, expected_reply: &str) -> Reply {
         let (command, key) = match command {
             ClientCommand::History(request) => {
@@ -338,12 +362,6 @@ impl Connection {
             ),
             command => (command.clone(), expected_reply.to_string()),
         };
-        let mut line = match serde_json::to_string(&command) {
-            Ok(line) => line,
-            Err(source) => return Ok(Err(format!("序列化命令失败：{source}"))),
-        };
-        line.push('\n');
-
         // 先登记再写入，回复不会早于等待者；登记与读线程判活在同一把锁下。
         let (tx, rx) = mpsc::channel();
         {
@@ -356,16 +374,7 @@ impl Connection {
             }
             pending.entry(key).or_default().push_back(tx);
         }
-        let written = match self.stdin.lock().unwrap().as_mut() {
-            Some(stdin) => stdin.write_all(line.as_bytes()),
-            None => Err(io::Error::other("机器连接已断开")),
-        };
-        if let Err(source) = written {
-            return Err(io::Error::new(
-                source.kind(),
-                format!("写入 agentdeckd 失败：{source}"),
-            ));
-        }
+        self.write(&command)?;
         let timeout = match command {
             ClientCommand::AgentInstall { .. } | ClientCommand::AgentUpdate { .. } => {
                 UPDATE_TIMEOUT
@@ -401,6 +410,7 @@ fn read_replies(
     stderr: mpsc::Receiver<String>,
     pending: &Pending,
     alive: &AtomicBool,
+    events: &async_channel::Sender<ServerEvent>,
 ) {
     let mut lines = BufReader::new(stdout).lines();
     let failure = loop {
@@ -425,11 +435,14 @@ fn read_replies(
                 );
             }
         };
-        // 非 JSON 行与无人等待的事件（如未来的 ServerEvent）直接跳过。
+        // 非 JSON 行与无人等待的回复直接跳过；不是回复的行按会话事件交给订阅方。
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
         let Some(key) = reply_key(&value) else {
+            if let Ok(event) = serde_json::from_value::<ServerEvent>(value) {
+                let _ = events.try_send(event);
+            }
             continue;
         };
         let waiter = {
@@ -449,6 +462,14 @@ fn read_replies(
     for waiter in pending.drain().flat_map(|(_, waiters)| waiters) {
         let _ = waiter.send(Err(io::Error::new(failure.kind(), failure.to_string())));
     }
+    let _ = events.try_send(ServerEvent::Error {
+        session_id: None,
+        error: ProtocolError {
+            code: DISCONNECTED.into(),
+            message: failure.to_string(),
+            diagnostic_ref: None,
+        },
+    });
 }
 
 impl Client {
@@ -457,6 +478,7 @@ impl Client {
             inner: Arc::new(ClientInner {
                 host: host.map(str::to_string),
                 state: Mutex::default(),
+                events: async_channel::unbounded(),
             }),
         }
     }
@@ -475,7 +497,7 @@ impl Client {
         }
         let command = build_command(self.inner.host.as_deref())
             .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
-        let connection = Connection::spawn(command)?;
+        let connection = Connection::spawn(command, self.inner.events.0.clone())?;
         state.connection = Some(Arc::clone(&connection));
         Ok(connection)
     }
@@ -498,6 +520,20 @@ impl Client {
         if let Some(connection) = connection {
             connection.close(io::ErrorKind::Other, "正在重新连接");
         }
+    }
+
+    /// 本机连接上 daemon 推回的会话事件；同一 Client 只应有一个消费者。
+    pub fn events(&self) -> async_channel::Receiver<ServerEvent> {
+        self.inner.events.1.clone()
+    }
+
+    /// 会话生命周期命令只写不等回复，结果经 `events()` 回来；写失败视为断线。
+    pub fn send(&self, command: &ClientCommand) -> Result<()> {
+        let connection = self.connection().map_err(|error| error.to_string())?;
+        connection.write(command).map_err(|error| {
+            connection.close(error.kind(), &error.to_string());
+            error.to_string()
+        })
     }
 
     fn round_trip(
@@ -905,7 +941,7 @@ mod tests {
     fn fake_daemon(script: &str) -> std::sync::Arc<super::Connection> {
         let mut command = super::daemon_command("/bin/sh");
         command.args(["-c", script]);
-        super::Connection::spawn(command).unwrap()
+        super::Connection::spawn(command, async_channel::unbounded().0).unwrap()
     }
 
     fn fake_client(connection: &std::sync::Arc<super::Connection>) -> super::Client {
@@ -913,6 +949,37 @@ mod tests {
         let client = super::Client::new(Some("-offline-test"));
         client.inner.state.lock().unwrap().connection = Some(connection.clone());
         client
+    }
+
+    /// 生命周期命令只写不等回复；daemon 推回的事件进通道，连接结束再推一条断开。
+    #[test]
+    fn sent_commands_reach_the_daemon_and_events_flow_back() {
+        let client = super::Client::new(Some("-offline-test"));
+        let mut command = super::daemon_command("/bin/sh");
+        command.args([
+            "-c",
+            r#"read -r line; case "$line" in *'"command":"turnCancel"'*)
+                echo '{"type":"turnStarted","sessionId":"s","threadId":"t","agentKind":"claude_code","turnId":"t1"}';; esac"#,
+        ]);
+        let connection = super::Connection::spawn(command, client.inner.events.0.clone()).unwrap();
+        client.inner.state.lock().unwrap().connection = Some(connection);
+        let events = client.events();
+
+        client
+            .send(&agentdeck_protocol::ClientCommand::TurnCancel {
+                session_id: agentdeck_protocol::SessionId("s".into()),
+                turn_id: agentdeck_protocol::TurnId("t1".into()),
+            })
+            .unwrap();
+        assert!(matches!(
+            events.recv_blocking().unwrap(),
+            agentdeck_protocol::ServerEvent::TurnStarted { turn_id, .. } if turn_id.0 == "t1"
+        ));
+        assert!(matches!(
+            events.recv_blocking().unwrap(),
+            agentdeck_protocol::ServerEvent::Error { session_id: None, error }
+                if error.code == super::DISCONNECTED
+        ));
     }
 
     fn wait_until(mut condition: impl FnMut() -> bool) {
