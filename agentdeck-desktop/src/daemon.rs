@@ -1321,6 +1321,7 @@ mod tests {
                 decision: agentdeck_protocol::ActionDecisionKind::Deny,
                 persist: false,
                 message: Some("修改计划".into()),
+                answers: None,
             },
         };
         for command in [start_session("new"), approval] {

@@ -796,3 +796,36 @@ fn edit_approval_detail_is_a_patch() {
         "{detail}"
     );
 }
+
+#[test]
+fn ask_user_question_becomes_questions_without_detail() {
+    // Shape recorded from claude 2.1.304; extra option fields are ignored.
+    let mut t = tr();
+    let line = json!({
+        "type": "control_request",
+        "request_id": "ask-1",
+        "request": {
+            "subtype": "can_use_tool",
+            "tool_name": "AskUserQuestion",
+            "input": {"questions": [
+                {"question": "你喜欢哪种颜色？", "header": "颜色", "multiSelect": false,
+                 "options": [{"label": "红", "description": "红色", "preview": "x"}, {"label": "蓝"}]},
+                {"question": "你想要哪些水果？", "header": "水果", "multiSelect": true,
+                 "options": [{"label": "苹果"}, {"label": "橙子"}]}
+            ]},
+            "tool_use_id": "toolu_ask",
+            "requires_user_interaction": true
+        }
+    });
+    let out = t.translate_line(&line.to_string());
+    let ServerEvent::ActionRequest { request, .. } = &out.events[0] else {
+        panic!("expected ActionRequest");
+    };
+    assert!(matches!(request.kind, ActionKind::AnswerQuestions));
+    assert_eq!(request.summary, "AskUserQuestion: 你喜欢哪种颜色？");
+    assert!(request.detail.is_none());
+    let questions = request.questions.as_ref().unwrap();
+    assert_eq!(questions.len(), 2);
+    assert_eq!(questions[0].options[0].description.as_deref(), Some("红色"));
+    assert!(questions[1].multi_select);
+}

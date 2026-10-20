@@ -73,7 +73,7 @@ use agentdeck_protocol::{
     ActionKind, ActionRequest, ActionRequestVendor, AgentItem, AgentItemMeta, AgentItemState,
     AgentKind, ClaudeCodePermissionMode, ClaudeCodeVendorPanelEvent, DiffFile, DiffStatus,
     ProtocolError, ServerEvent, SessionId, ShellStatus, ThreadId, TurnId, TurnNextState,
-    TurnOutcome, TurnSummary, VendorPanelPayload,
+    TurnOutcome, TurnSummary, UserQuestion, UserQuestionOption, VendorPanelPayload,
 };
 
 /// One translator-output batch: 0..N ServerEvents from one input line,
@@ -712,6 +712,13 @@ impl ClaudeCodeTranslator {
                     .unwrap_or("");
                 format!("{tool_name}: {title}")
             }
+            "AskUserQuestion" => {
+                let first = input
+                    .pointer("/questions/0/question")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                format!("{tool_name}: {first}")
+            }
             _ if target.is_empty() => tool_name.clone(),
             _ => format!("{tool_name}: {target}"),
         };
@@ -719,13 +726,27 @@ impl ClaudeCodeTranslator {
             "Bash" => ActionKind::ExecuteCommand,
             "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => ActionKind::EditFiles,
             "ExitPlanMode" => ActionKind::ApprovePlan,
+            "AskUserQuestion" => ActionKind::AnswerQuestions,
             _ => ActionKind::GrantExtraPermission,
+        };
+        // Malformed questions degrade to a plain approval rather than vanish.
+        let questions = (tool_name == "AskUserQuestion")
+            .then(|| user_questions(&input))
+            .flatten();
+        let kind = if questions.is_none() && matches!(kind, ActionKind::AnswerQuestions) {
+            ActionKind::GrantExtraPermission
+        } else {
+            kind
         };
         let action = ActionRequest {
             request_id: request_id.to_string(),
             kind,
             summary,
-            detail: action_detail(&tool_name, &input),
+            detail: questions
+                .is_none()
+                .then(|| action_detail(&tool_name, &input))
+                .flatten(),
+            questions,
             vendor: ActionRequestVendor::ClaudeCode {
                 permission_mode_at_decision: self.permission_mode,
                 tool_name,
@@ -911,6 +932,39 @@ fn diff_files_from_tool_use(tool_name: &str, input: &Value) -> Vec<DiffFile> {
         }
         _ => Vec::new(),
     }
+}
+
+/// AskUserQuestion's `questions`, keeping only the neutral fields so newer CC
+/// option extras (e.g. previews) don't break parsing.
+fn user_questions(input: &Value) -> Option<Vec<UserQuestion>> {
+    let text = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).map(String::from);
+    let questions: Option<Vec<UserQuestion>> = input
+        .get("questions")?
+        .as_array()?
+        .iter()
+        .map(|question| {
+            Some(UserQuestion {
+                question: text(question, "question")?,
+                header: text(question, "header"),
+                options: question
+                    .get("options")?
+                    .as_array()?
+                    .iter()
+                    .map(|option| {
+                        Some(UserQuestionOption {
+                            label: text(option, "label")?,
+                            description: text(option, "description"),
+                        })
+                    })
+                    .collect::<Option<_>>()?,
+                multi_select: question
+                    .get("multiSelect")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+        })
+        .collect();
+    questions.filter(|questions| !questions.is_empty())
 }
 
 /// What the user reviews before approving a tool call.

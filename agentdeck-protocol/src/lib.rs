@@ -15,7 +15,7 @@ pub use trunk::AgentKind;
 pub use trunk::ClientCommand;
 pub use trunk::{
     ActionDecision, ActionDecisionKind, ActionKind, ActionRequest, ActionRequestVendor,
-    VendorControlPayload, VendorPanelPayload,
+    UserQuestion, UserQuestionOption, VendorControlPayload, VendorPanelPayload,
 };
 pub use trunk::{
     AgentItem, AgentItemMeta, AgentItemState, DiffFile, DiffStatus, PlanStep, PlanStepStatus,

@@ -255,6 +255,29 @@ pub enum ActionKind {
     GrantExtraPermission,
     /// The agent finished planning and asks to start executing the plan.
     ApprovePlan,
+    /// The agent asks the user to pick answers; see `ActionRequest.questions`.
+    AnswerQuestions,
+}
+
+/// One multiple-choice question the agent asks the user.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UserQuestion {
+    pub question: String,
+    /// Short chip label for the question.
+    #[serde(default)]
+    pub header: Option<String>,
+    pub options: Vec<UserQuestionOption>,
+    #[serde(default)]
+    pub multi_select: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UserQuestionOption {
+    pub label: String,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -291,6 +314,9 @@ pub struct ActionRequest {
     /// markdown. Not truncated; clients clip for display.
     #[serde(default)]
     pub detail: Option<String>,
+    /// Present for `AnswerQuestions`.
+    #[serde(default)]
+    pub questions: Option<Vec<UserQuestion>>,
     pub vendor: ActionRequestVendor,
 }
 
@@ -303,6 +329,10 @@ pub struct ActionDecision {
     /// Feedback for the agent on deny (e.g. how to revise a plan).
     #[serde(default)]
     pub message: Option<String>,
+    /// For `AnswerQuestions` approvals: question text → answer. Multi-select
+    /// answers join the chosen labels with ", ".
+    #[serde(default)]
+    pub answers: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

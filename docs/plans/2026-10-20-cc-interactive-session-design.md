@@ -138,12 +138,34 @@ desktop live 测试（开始前本地、开始后事件驱动）；经 daemon �
 - 计划被拒并反馈后修改计划、批准后回到 default；
 - 总是允许后切到 acceptEdits。
 
-实窗截图确认计划审批卡、跳过权限确认条和模式按钮渲染正常；点击未自动验证。
+初始实窗截图确认计划审批卡、跳过权限确认条和模式按钮渲染正常；本轮 fake daemon 点击与长正文滚动验收见下方 PR #44 记录。
+
+## P4 AskUserQuestion（2026-10-20，仍属协议 v8）
+
+实测（claude 2.1.304）：
+- 任何权限模式下（包括 bypassPermissions），AskUserQuestion 都会走 `can_use_tool`，并带
+  `requires_user_interaction: true`。`input.questions[]` 每题有 `question`、`header`、
+  `options[{label, description}]` 和 `multiSelect`。
+- 回答方式：allow，`updatedInput` = 原 input 加上 `answers: {问题原文: 选中的 label}`，多选用 `", "` 连接。
+  模型收到的 tool_result 是 `"Your questions have been answered: "Q"="A", ..."`。
+
+实现：
+- 协议新增中立的 `ActionKind::AnswerQuestions`、`ActionRequest.questions`（`UserQuestion` / `UserQuestionOption`）
+  和 `ActionDecision.answers`，都可缺省。
+- translator 按字段取值，忽略 CC 选项里多出的字段（如 preview）；问题解析失败时退化为普通审批。
+- owner 在 approve 时把 answers 写进 updatedInput；"跳过"即 deny。
+- 桌面问题卡：单选点了就替换，多选点了就切换，每题都选了才能"提交回答"。每题末尾有"其他"：单选题选它会清掉已选选项，
+  多选题可与选项并存；选中后出现输入框，填的文字接在选项后面，用 ", " 连接。"其他"留空或有题没答时，提交被拦下并在错误行提示。
+  题目区限高并可滚动，提交与跳过按钮固定在题目区外；自由文本草稿随会话中的待决请求保留，切换会话或机器页不会丢失，提交、跳过或请求结束后清除。
+  提问与普通审批共用 FIFO 队列，新请求入队不重置当前选择和草稿；处理当前请求后初始化下一条。同一 requestId 的题目变化或断线时清除旧答案。
+  实测 CC 接受选项之外的自由文本（答"墨绿色""苹果, 芒果"后，模型如实复述）。
+- Swift 镜像与 Rust 协议一致，省略 `multiSelect` 的题目按单选解码。
+
+验证：translator（真实形状、忽略多余字段）、owner（answers 写进 updatedInput）、桌面 live（每题必答、多选按选项顺序拼接）；
+经 daemon 的真实链路：模型复述"你喜欢蓝色，想要苹果和橙子"；实窗截图确认问题卡、选中态和提交按钮禁用态。
 
 ## 已知边界
 
-- `AskUserQuestion` 在 default 模式下也走 `can_use_tool`，但它需要在 `updatedInput` 里填答案；审批卡目前只能允许或拒绝，
-  允许时 CC 拿到的是空答案。
 
 - 桌面不发 `SessionClose`，CC 子进程随 daemon（应用退出或连接重置）回收。
 - 显式断开机器或装完 daemon 后的 `reset()` 会在 2 秒后 SIGKILL daemon；若此时 CC 正在收尾（宽限 10 秒），
@@ -197,3 +219,14 @@ desktop live 测试（开始前本地、开始后事件驱动）；经 daemon �
   专用确认按钮才发命令；计划拒绝反馈与后续持久允许分别写入正确 requestId。
   160 行计划可滚到末尾标记，审批 Markdown 使用自动高度，外层保留 240px 滚动视口。
 - 本轮未重跑真实 vendor E2E；以上实窗结果只证明离线 IPC/UI 路径，此前真实链路记录不替代本轮验证。
+
+
+### PR #45 问答整合回归（2026-10-20）
+
+- 完整离线门禁通过，桌面 90 项测试覆盖问题作答、FIFO 排队、草稿保留、同 requestId 改题及断线清理。
+  Swift XCTest 77 项与 Swift Testing 31 项、iPhone 17 / iOS 26.5 fixture 测试 21 项通过。
+- 当前 checkout 的 daemon/CLI 构建、CLI selfcheck 与 diagnostics report、desktop selfcheck 和真实 bundle verify 均通过。
+- 临时 fake daemon 实窗验证四题单选、多选、自由文本与问题区滚动，决定按钮保持可见。
+  切换机器页再返回后选择与自由文本草稿仍在；提交命令中的四条 answers 与界面逐项一致，
+  多选按选项顺序拼接，随后显示排队的普通审批。下一轮选择已清空，点击跳过发送 deny 且不携答案，后续审批仍可处理。
+- 本轮未重跑真实 vendor E2E；上述实窗只验证本地 IPC/UI，不替代远端或真实 vendor 验收。

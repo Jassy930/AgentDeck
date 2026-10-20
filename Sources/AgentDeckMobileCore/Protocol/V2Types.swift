@@ -505,7 +505,32 @@ public struct ProtocolError: Codable, Sendable {
 // MARK: - ActionKind / ActionRequest / ActionDecision
 
 public enum ActionKind: String, Codable, Sendable {
-    case executeCommand, editFiles, grantExtraPermission, approvePlan
+    case executeCommand, editFiles, grantExtraPermission, approvePlan, answerQuestions
+}
+
+/// One multiple-choice question the agent asks the user; v8.
+public struct UserQuestion: Codable, Sendable, Equatable {
+    public let question: String
+    public let header: String?
+    public let options: [UserQuestionOption]
+    public let multiSelect: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case question, header, options, multiSelect
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        question = try c.decode(String.self, forKey: .question)
+        header = try c.decodeIfPresent(String.self, forKey: .header)
+        options = try c.decode([UserQuestionOption].self, forKey: .options)
+        multiSelect = try c.decodeIfPresent(Bool.self, forKey: .multiSelect) ?? false
+    }
+}
+
+public struct UserQuestionOption: Codable, Sendable, Equatable {
+    public let label: String
+    public let description: String?
 }
 
 /// `#[serde(tag = "agentKind")]` ActionRequestVendor.
@@ -558,16 +583,19 @@ public struct ActionRequest: Codable, Sendable {
     public let summary: String
     /// Full content to review (command, patch, plan markdown); v8.
     public let detail: String?
+    /// Present for `answerQuestions`; v8.
+    public let questions: [UserQuestion]?
     public let vendor: ActionRequestVendor
 
     public init(
         requestId: String, kind: ActionKind, summary: String, detail: String? = nil,
-        vendor: ActionRequestVendor
+        questions: [UserQuestion]? = nil, vendor: ActionRequestVendor
     ) {
         self.requestId = requestId
         self.kind = kind
         self.summary = summary
         self.detail = detail
+        self.questions = questions
         self.vendor = vendor
     }
 }
@@ -582,14 +610,18 @@ public struct ActionDecision: Codable, Sendable {
     public let persist: Bool
     /// Feedback for the agent on deny; v8.
     public let message: String?
+    /// Question text → answer for `answerQuestions`; v8.
+    public let answers: [String: String]?
 
     public init(
-        requestId: String, decision: ActionDecisionKind, persist: Bool = false, message: String? = nil
+        requestId: String, decision: ActionDecisionKind, persist: Bool = false, message: String? = nil,
+        answers: [String: String]? = nil
     ) {
         self.requestId = requestId
         self.decision = decision
         self.persist = persist
         self.message = message
+        self.answers = answers
     }
 }
 

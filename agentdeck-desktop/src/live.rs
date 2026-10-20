@@ -77,6 +77,14 @@ pub struct LiveSession {
     capabilities: Option<SessionCapabilities>,
     pub error: Option<String>,
     pub mode: ClaudeCodePermissionMode,
+    /// 待决提问每题已选的选项标签。
+    pub picks: Vec<Vec<String>>,
+    /// 待决提问每题是否选了“其他”（自由输入）。
+    pub others: Vec<bool>,
+    /// 草稿随会话保留，切走再回来时重建输入框。
+    pub other_texts: Vec<String>,
+    /// 同 requestId 的题目变化时也重建输入框，避免恢复旧题草稿。
+    pub question_revision: u64,
 }
 
 impl LiveSession {
@@ -91,7 +99,135 @@ impl LiveSession {
             capabilities: None,
             error: None,
             mode: ClaudeCodePermissionMode::Default,
+            picks: Vec::new(),
+            others: Vec::new(),
+            other_texts: Vec::new(),
+            question_revision: 0,
         }
+    }
+
+    fn question_is_multi(&self, question: usize) -> Option<bool> {
+        self.action()?
+            .questions
+            .as_ref()?
+            .get(question)
+            .map(|asked| asked.multi_select)
+    }
+
+    pub fn set_other_text(
+        &mut self,
+        request_id: &str,
+        revision: u64,
+        question: usize,
+        text: String,
+    ) {
+        if revision == self.question_revision
+            && self
+                .action()
+                .is_some_and(|action| action.request_id == request_id)
+            && let Some(saved) = self.other_texts.get_mut(question)
+        {
+            *saved = text;
+        }
+    }
+
+    /// 单选题选“其他”会清掉已选选项；多选题与选项并存。
+    pub fn toggle_other(&mut self, question: usize) {
+        let Some(multi) = self.question_is_multi(question) else {
+            return;
+        };
+        let (Some(other), Some(picks)) =
+            (self.others.get_mut(question), self.picks.get_mut(question))
+        else {
+            return;
+        };
+        if multi {
+            *other = !*other;
+        } else {
+            *other = true;
+            picks.clear();
+        }
+    }
+
+    /// 每题都有选择（选项或“其他”）才算答完。
+    pub fn answered(&self) -> bool {
+        self.picks
+            .iter()
+            .zip(&self.others)
+            .all(|(picks, other)| !picks.is_empty() || *other)
+    }
+
+    /// 单选题点选即替换，多选题点选即切换。
+    pub fn toggle_pick(&mut self, question: usize, label: &str) {
+        let Some(asked) = self
+            .action()
+            .and_then(|action| action.questions.as_ref())
+            .and_then(|questions| questions.get(question))
+        else {
+            return;
+        };
+        let multi = asked.multi_select;
+        let (Some(picks), Some(other)) =
+            (self.picks.get_mut(question), self.others.get_mut(question))
+        else {
+            return;
+        };
+        if !multi {
+            *other = false;
+        }
+        match picks.iter().position(|pick| pick == label) {
+            Some(index) if multi => {
+                picks.remove(index);
+            }
+            Some(_) => {}
+            None if multi => picks.push(label.to_string()),
+            None => *picks = vec![label.to_string()],
+        }
+    }
+
+    /// 作答：每题的选项按原顺序，加上“其他”里填的文字，用 ", " 连接。
+    /// 有题没答或“其他”没填时返回给用户看的提示。
+    pub fn answer(&mut self) -> Result<ClientCommand, String> {
+        let session_id = self.session_id.clone().ok_or("会话已结束")?;
+        let action = self.action().ok_or("没有待回答的问题")?;
+        let questions = action.questions.as_ref().ok_or("没有待回答的问题")?;
+        let mut answers = std::collections::BTreeMap::new();
+        for (ix, question) in questions.iter().enumerate() {
+            let picks = self.picks.get(ix).map(Vec::as_slice).unwrap_or_default();
+            let mut chosen: Vec<String> = question
+                .options
+                .iter()
+                .filter(|option| picks.contains(&option.label))
+                .map(|option| option.label.clone())
+                .collect();
+            if self.others.get(ix).copied().unwrap_or(false) {
+                let text = self
+                    .other_texts
+                    .get(ix)
+                    .map(|text| text.trim())
+                    .unwrap_or_default();
+                if text.is_empty() {
+                    return Err(format!("“{}”选了其他，请填写内容", question.question));
+                }
+                chosen.push(text.to_string());
+            }
+            if chosen.is_empty() {
+                return Err(format!("还没回答“{}”", question.question));
+            }
+            answers.insert(question.question.clone(), chosen.join(", "));
+        }
+        let request = self.actions.pop_front().expect("checked above");
+        self.reset_questions();
+        Ok(ClientCommand::ActionDecision {
+            session_id,
+            decision: ActionDecision {
+                request_id: request.request_id,
+                decision: ActionDecisionKind::Approve,
+                persist: false,
+                message: None,
+                answers: Some(answers),
+            },
+        })
     }
 
     pub fn router<'a>(
@@ -190,9 +326,13 @@ impl LiveSession {
         persist: bool,
         message: Option<String>,
     ) -> Option<ClientCommand> {
-        self.action()?;
+        let request = self.action()?;
+        if approve && request.questions.is_some() {
+            return None;
+        }
         let session_id = self.session_id.clone()?;
         let request = self.actions.pop_front()?;
+        self.reset_questions();
         Some(ClientCommand::ActionDecision {
             session_id,
             decision: ActionDecision {
@@ -204,6 +344,7 @@ impl LiveSession {
                 },
                 persist,
                 message,
+                answers: None,
             },
         })
     }
@@ -254,14 +395,21 @@ impl LiveSession {
                 }
             }
             ServerEvent::ActionRequest { request, .. } => {
-                if let Some(existing) = self
+                let reset = if let Some(index) = self
                     .actions
-                    .iter_mut()
-                    .find(|action| action.request_id == request.request_id)
+                    .iter()
+                    .position(|action| action.request_id == request.request_id)
                 {
-                    *existing = request;
+                    let changed = index == 0 && self.actions[index].questions != request.questions;
+                    self.actions[index] = request;
+                    changed
                 } else {
+                    let first = self.actions.is_empty();
                     self.actions.push_back(request);
+                    first
+                };
+                if reset {
+                    self.reset_questions();
                 }
             }
             ServerEvent::VendorPanelEvent {
@@ -311,11 +459,25 @@ impl LiveSession {
     fn finish_turn(&mut self) {
         self.running = None;
         self.actions.clear();
+        self.reset_questions();
         if let Some(turn) = self.turns.last_mut() {
             turn.finished = true;
         }
     }
 
+    fn reset_questions(&mut self) {
+        let count = self
+            .actions
+            .front()
+            .and_then(|action| action.questions.as_ref())
+            .map_or(0, Vec::len);
+        self.picks = vec![Vec::new(); count];
+        self.others = vec![false; count];
+        self.other_texts = vec![String::new(); count];
+        self.question_revision += 1;
+    }
+
+    /// 本轮已发出但 agent 还没有任何输出，也没有待决审批。
     pub fn waiting(&self) -> bool {
         self.running.is_some()
             && self.actions.is_empty()
@@ -376,12 +538,37 @@ mod tests {
                 kind: ActionKind::ExecuteCommand,
                 summary: "Bash: ls".into(),
                 detail: Some("ls".into()),
+                questions: None,
                 vendor: ActionRequestVendor::ClaudeCode {
                     permission_mode_at_decision: ClaudeCodePermissionMode::Default,
                     tool_name: "Bash".into(),
                     can_persist: true,
                 },
             },
+        }
+    }
+
+    fn question(id: &str, multi: bool) -> ServerEvent {
+        let ServerEvent::ActionRequest { mut request, .. } = approval(id) else {
+            unreachable!()
+        };
+        request.kind = ActionKind::AnswerQuestions;
+        request.questions = Some(vec![agentdeck_protocol::UserQuestion {
+            question: "选择".into(),
+            header: None,
+            options: ["A", "B"]
+                .map(|label| agentdeck_protocol::UserQuestionOption {
+                    label: label.into(),
+                    description: None,
+                })
+                .into(),
+            multi_select: multi,
+        }]);
+        ServerEvent::ActionRequest {
+            session_id: SessionId("s".into()),
+            thread_id: ThreadId("thread".into()),
+            agent_kind: AgentKind::ClaudeCode,
+            request,
         }
     }
 
@@ -544,6 +731,88 @@ mod tests {
     }
 
     #[test]
+    fn questions_need_an_answer_each_and_join_multi_select_in_option_order() {
+        use agentdeck_protocol::{UserQuestion, UserQuestionOption};
+        let option = |label: &str| UserQuestionOption {
+            label: label.into(),
+            description: None,
+        };
+        let mut live = session();
+        send(&mut live, "hi");
+        live.apply(ServerEvent::ActionRequest {
+            session_id: SessionId("s".into()),
+            thread_id: ThreadId("thread".into()),
+            agent_kind: AgentKind::ClaudeCode,
+            request: ActionRequest {
+                request_id: "ask-1".into(),
+                kind: ActionKind::AnswerQuestions,
+                summary: "AskUserQuestion".into(),
+                detail: None,
+                questions: Some(vec![
+                    UserQuestion {
+                        question: "颜色".into(),
+                        header: None,
+                        options: vec![option("红"), option("蓝")],
+                        multi_select: false,
+                    },
+                    UserQuestion {
+                        question: "水果".into(),
+                        header: None,
+                        options: vec![option("苹果"), option("香蕉"), option("橙子")],
+                        multi_select: true,
+                    },
+                ]),
+                vendor: ActionRequestVendor::ClaudeCode {
+                    permission_mode_at_decision: ClaudeCodePermissionMode::Default,
+                    tool_name: "AskUserQuestion".into(),
+                    can_persist: false,
+                },
+            },
+        });
+        live.toggle_pick(0, "红");
+        live.toggle_other(0);
+        assert!(
+            live.picks[0].is_empty(),
+            "single select: other replaces the option"
+        );
+        live.toggle_pick(0, "蓝");
+        assert!(!live.others[0], "single select: an option replaces other");
+        assert!(!live.answered());
+        assert!(live.answer().unwrap_err().contains("水果"));
+
+        live.toggle_pick(1, "橙子");
+        live.toggle_pick(1, "香蕉");
+        live.toggle_pick(1, "苹果");
+        live.toggle_pick(1, "香蕉");
+        live.toggle_other(1);
+        assert!(live.answered());
+        assert!(
+            live.answer().unwrap_err().contains("其他"),
+            "an empty other is rejected"
+        );
+        live.set_other_text("ask-1", live.question_revision, 1, " 芒果 ".into());
+        live.forget_finished();
+        assert_eq!(
+            live.other_texts[1], " 芒果 ",
+            "reopening keeps the answer draft"
+        );
+        live.set_other_text(
+            "old-request",
+            live.question_revision,
+            1,
+            "stale input".into(),
+        );
+        let Ok(ClientCommand::ActionDecision { decision, .. }) = live.answer() else {
+            panic!("every question is answered");
+        };
+        let answers = decision.answers.unwrap();
+        assert_eq!(answers["颜色"], "蓝");
+        assert_eq!(answers["水果"], "苹果, 橙子, 芒果");
+        assert!(live.action().is_none());
+        assert!(live.other_texts.is_empty());
+    }
+
+    #[test]
     fn record_warnings_keep_the_turn_running() {
         let mut live = session();
         send(&mut live, "hi");
@@ -571,6 +840,7 @@ mod tests {
                 kind: ActionKind::ExecuteCommand,
                 summary: "Bash: ls".into(),
                 detail: Some("ls".into()),
+                questions: None,
                 vendor: ActionRequestVendor::ClaudeCode {
                     permission_mode_at_decision: ClaudeCodePermissionMode::Default,
                     tool_name: "Bash".into(),
@@ -622,6 +892,71 @@ mod tests {
         }
         assert!(live.decide(true, false, None).is_none());
         assert!(live.running.is_some());
+    }
+
+    #[test]
+    fn queued_questions_and_approvals_preserve_the_current_answer() {
+        let mut live = session();
+        send(&mut live, "hi");
+        live.apply(question("q1", true));
+        let revision = live.question_revision;
+        live.toggle_pick(0, "A");
+        live.toggle_other(0);
+        live.set_other_text("q1", revision, 0, "自定义".into());
+        live.apply(question("q2", false));
+        live.apply(approval("tool"));
+        live.apply(question("q1", true));
+        assert_eq!(live.question_revision, revision);
+        assert_eq!(live.picks, vec![vec!["A"]]);
+        assert_eq!(live.others, vec![true]);
+        assert_eq!(live.other_texts, vec!["自定义"]);
+        let ClientCommand::ActionDecision { decision, .. } = live.answer().unwrap() else {
+            panic!("expected answer");
+        };
+        assert_eq!(decision.request_id, "q1");
+        assert_eq!(decision.answers.unwrap()["选择"], "A, 自定义");
+        assert_eq!(live.action().unwrap().request_id, "q2");
+        assert!(!live.answered());
+        assert_eq!(live.other_texts, vec![""]);
+        assert!(live.decide(true, false, None).is_none());
+        live.toggle_pick(0, "B");
+        let ClientCommand::ActionDecision { decision, .. } = live.answer().unwrap() else {
+            panic!("expected second answer");
+        };
+        assert_eq!(decision.request_id, "q2");
+        assert_eq!(decision.answers.unwrap()["选择"], "B");
+        assert!(
+            matches!(live.decide(true, true, None), Some(ClientCommand::ActionDecision { decision, .. }) if decision.request_id == "tool" && decision.persist)
+        );
+        live.apply(question("skip", false));
+        assert!(
+            matches!(live.decide(false, false, None), Some(ClientCommand::ActionDecision { decision, .. }) if decision.request_id == "skip" && decision.decision == ActionDecisionKind::Deny)
+        );
+        assert!(live.actions.is_empty() && live.other_texts.is_empty());
+    }
+
+    #[test]
+    fn changed_questions_and_disconnect_discard_old_drafts() {
+        let mut live = session();
+        send(&mut live, "hi");
+        live.apply(question("q1", true));
+        let revision = live.question_revision;
+        live.toggle_pick(0, "A");
+        live.toggle_other(0);
+        live.set_other_text("q1", revision, 0, "旧草稿".into());
+        live.apply(question("q1", false));
+        assert_ne!(live.question_revision, revision);
+        assert_eq!(live.picks, vec![Vec::<String>::new()]);
+        assert_eq!(live.others, vec![false]);
+        live.set_other_text("q1", revision, 0, "迟到的旧输入".into());
+        assert_eq!(live.other_texts, vec![""]);
+        live.toggle_other(0);
+        live.set_other_text("q1", live.question_revision, 0, "新草稿".into());
+        live.apply(question("q2", true));
+        live.disconnected("断线");
+        assert!(live.actions.is_empty());
+        assert!(live.picks.is_empty() && live.others.is_empty() && live.other_texts.is_empty());
+        assert!(live.answer().is_err());
     }
 
     #[test]

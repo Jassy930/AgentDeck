@@ -25,6 +25,8 @@ struct ApprovalCardPresentation: Equatable {
             kindLabel = "授予额外权限"
         case .approvePlan:
             kindLabel = "批准计划"
+        case .answerQuestions:
+            kindLabel = "回答问题"
         }
         return ApprovalCardPresentation(summary: request.summary, vendorLine: vendorLine, kindLabel: kindLabel)
     }

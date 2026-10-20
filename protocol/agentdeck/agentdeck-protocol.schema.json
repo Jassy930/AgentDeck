@@ -16,6 +16,17 @@
         "ActionDecision": {
           "additionalProperties": false,
           "properties": {
+            "answers": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": null,
+              "description": "For `AnswerQuestions` approvals: question text → answer. Multi-select answers join the chosen labels with \", \".",
+              "type": [
+                "object",
+                "null"
+              ]
+            },
             "decision": {
               "$ref": "#/definitions/ActionDecisionKind"
             },
@@ -2823,6 +2834,13 @@
                 "approvePlan"
               ],
               "type": "string"
+            },
+            {
+              "description": "The agent asks the user to pick answers; see `ActionRequest.questions`.",
+              "enum": [
+                "answerQuestions"
+              ],
+              "type": "string"
             }
           ]
         },
@@ -2839,6 +2857,17 @@
             },
             "kind": {
               "$ref": "#/definitions/ActionKind"
+            },
+            "questions": {
+              "default": null,
+              "description": "Present for `AnswerQuestions`.",
+              "items": {
+                "$ref": "#/definitions/UserQuestion"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
             },
             "requestId": {
               "type": "string"
@@ -3812,6 +3841,57 @@
           },
           "required": [
             "elapsedMs"
+          ],
+          "type": "object"
+        },
+        "UserQuestion": {
+          "additionalProperties": false,
+          "description": "One multiple-choice question the agent asks the user.",
+          "properties": {
+            "header": {
+              "default": null,
+              "description": "Short chip label for the question.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "multiSelect": {
+              "default": false,
+              "type": "boolean"
+            },
+            "options": {
+              "items": {
+                "$ref": "#/definitions/UserQuestionOption"
+              },
+              "type": "array"
+            },
+            "question": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "options",
+            "question"
+          ],
+          "type": "object"
+        },
+        "UserQuestionOption": {
+          "additionalProperties": false,
+          "properties": {
+            "description": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "label": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "label"
           ],
           "type": "object"
         },

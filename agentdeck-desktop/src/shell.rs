@@ -964,6 +964,34 @@ impl Shell {
         cx.notify();
     }
 
+    pub fn toggle_pick(&mut self, question: usize, label: &str, cx: &mut Context<Self>) {
+        if let Some((live, _, _)) = self.current_live() {
+            live.toggle_pick(question, label);
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_other(&mut self, question: usize, cx: &mut Context<Self>) {
+        if let Some((live, _, _)) = self.current_live() {
+            live.toggle_other(question);
+        }
+        cx.notify();
+    }
+
+    pub fn submit_answers(&mut self, cx: &mut Context<Self>) {
+        let Some((live, _, client)) = self.current_live() else {
+            return;
+        };
+        match live.answer() {
+            Ok(command) => {
+                live.error = None;
+                self.dispatch(client, command, cx);
+            }
+            Err(message) => live.error = Some(message),
+        }
+        cx.notify();
+    }
+
     pub fn cancel_bypass(&mut self, cx: &mut Context<Self>) {
         self.bypass_armed = false;
         cx.notify();
@@ -2020,7 +2048,7 @@ impl Shell {
                 )
             })
             .when_some(action, |section, action| {
-                section.child(self.render_approval(&action, window, cx))
+                section.child(self.render_approval(session, &action, window, cx))
             })
             .when(self.bypass_armed, |section| {
                 section.child(
@@ -2141,6 +2169,7 @@ impl Shell {
     /// 审批卡：类型、摘要、可滚动的完整内容和决定按钮。计划审批的“拒绝”是继续规划。
     fn render_approval(
         &self,
+        session: &Session,
         action: &ActionRequest,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2155,7 +2184,9 @@ impl Shell {
                 ActionKind::ApprovePlan => detail.to_string(),
                 ActionKind::ExecuteCommand => transcript::fence("bash", detail),
                 ActionKind::EditFiles => transcript::fence("diff", detail),
-                ActionKind::GrantExtraPermission => transcript::fence("json", detail),
+                ActionKind::GrantExtraPermission | ActionKind::AnswerQuestions => {
+                    transcript::fence("json", detail)
+                }
             };
             transcript::markdown(
                 SharedString::from(format!("approval-{}", action.request_id)).into(),
@@ -2164,6 +2195,125 @@ impl Shell {
                 cx,
             )
         });
+        let questions = action.questions.clone().unwrap_or_default();
+        let asking = !questions.is_empty();
+        let live = self.live.iter().find(|live| session.is(&live.key));
+        let picks = live.map(|live| live.picks.clone()).unwrap_or_default();
+        let others = live.map(|live| live.others.clone()).unwrap_or_default();
+        let answered = live.is_some_and(LiveSession::answered);
+        let revision = live.map_or(0, |live| live.question_revision);
+        let saved_texts = live
+            .map(|live| live.other_texts.as_slice())
+            .unwrap_or_default();
+        let other_inputs: Vec<Entity<InputState>> = (0..questions.len())
+            .map(|ix| {
+                let key = session.key();
+                let request_id = action.request_id.clone();
+                let shell = cx.entity().downgrade();
+                let text = saved_texts.get(ix).cloned().unwrap_or_default();
+                window.use_keyed_state(
+                    SharedString::from(format!(
+                        "question-other-{key:?}-{request_id}-{revision}-{ix}"
+                    )),
+                    cx,
+                    |window, cx| {
+                        let mut input = InputState::new(window, cx).placeholder("输入你的答案");
+                        input.set_value(text, window, cx);
+                        cx.subscribe(&cx.entity(), move |input, _, event: &InputEvent, cx| {
+                            if matches!(event, InputEvent::Change) {
+                                let text = input.value().to_string();
+                                let _ = shell.update(cx, |shell, _| {
+                                    if let Some(live) =
+                                        shell.live.iter_mut().find(|live| live.key == key)
+                                    {
+                                        live.set_other_text(&request_id, revision, ix, text);
+                                    }
+                                });
+                            }
+                        })
+                        .detach();
+                        input
+                    },
+                )
+            })
+            .collect();
+        let question_rows: Vec<_> = questions
+            .into_iter()
+            .enumerate()
+            .map(|(ix, question)| {
+                let chosen = picks.get(ix).cloned().unwrap_or_default();
+                let other = others.get(ix).copied().unwrap_or(false);
+                let other_input = other_inputs[ix].clone();
+                v_flex()
+                    .gap_1p5()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .text_sm()
+                            .when_some(question.header.clone(), |row, header| {
+                                row.child(meta_chip(cx).flex_shrink_0().child(header))
+                            })
+                            .child(div().min_w(px(0.)).child(question.question.clone()))
+                            .when(question.multi_select, |row| {
+                                row.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("可多选"),
+                                )
+                            }),
+                    )
+                    .child(
+                        h_flex().flex_wrap().gap_1p5().children(
+                            question
+                                .options
+                                .into_iter()
+                                .enumerate()
+                                .map(|(option_ix, option)| {
+                                    let selected = chosen.contains(&option.label);
+                                    let label = option.label.clone();
+                                    Button::new(SharedString::from(format!(
+                                        "question-{ix}-option-{option_ix}"
+                                    )))
+                                    .small()
+                                    .when(selected, |button| button.primary())
+                                    .when(!selected, |button| button.outline())
+                                    .label(option.label)
+                                    .when_some(option.description, |button, description| {
+                                        button.tooltip(description)
+                                    })
+                                    .on_click(cx.listener(move |shell, _, _, cx| {
+                                        shell.toggle_pick(ix, &label, cx)
+                                    }))
+                                })
+                                .chain(std::iter::once(
+                                    Button::new(SharedString::from(format!("question-{ix}-other")))
+                                        .small()
+                                        .when(other, |button| button.primary())
+                                        .when(!other, |button| button.outline())
+                                        .label("其他")
+                                        .on_click(cx.listener(move |shell, _, _, cx| {
+                                            shell.toggle_other(ix, cx)
+                                        })),
+                                )),
+                        ),
+                    )
+                    .when(other, |row| {
+                        row.child(
+                            div()
+                                .w_full()
+                                .px_2()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .bg(cx.theme().secondary)
+                                .child(Input::new(&other_input).appearance(false)),
+                        )
+                    })
+            })
+            .collect();
         let theme = cx.theme();
         let (warning, muted) = (theme.warning, theme.muted_foreground);
 
@@ -2213,8 +2363,19 @@ impl Shell {
                         .child(detail.h_auto()),
                 )
             })
+            .when(asking, |card| {
+                card.child(
+                    div()
+                        .id("approval-questions")
+                        .w_full()
+                        .max_h(px(240.))
+                        .overflow_y_scroll()
+                        .child(v_flex().gap_2().children(question_rows)),
+                )
+            })
             .child(
                 h_flex()
+                    .flex_shrink_0()
                     .gap_2()
                     .items_center()
                     .child(
@@ -2223,7 +2384,9 @@ impl Shell {
                             .min_w(px(0.))
                             .text_xs()
                             .text_color(muted)
-                            .child(if plan {
+                            .child(if asking {
+                                "每题选好后提交；跳过则不回答"
+                            } else if plan {
                                 "输入框里的文字会作为修改意见随“继续规划”发出"
                             } else {
                                 "拒绝时输入框里的文字会作为理由发给 agent"
@@ -2233,7 +2396,13 @@ impl Shell {
                         Button::new("deny-action")
                             .small()
                             .outline()
-                            .label(if plan { "继续规划" } else { "拒绝" })
+                            .label(if asking {
+                                "跳过"
+                            } else if plan {
+                                "继续规划"
+                            } else {
+                                "拒绝"
+                            })
                             .on_click(cx.listener(|shell, _, window, cx| {
                                 shell.decide(false, false, window, cx)
                             })),
@@ -2253,9 +2422,20 @@ impl Shell {
                         Button::new("approve-action")
                             .small()
                             .primary()
-                            .label(if plan { "开始执行" } else { "允许" })
-                            .on_click(cx.listener(|shell, _, window, cx| {
-                                shell.decide(true, false, window, cx)
+                            .label(if asking {
+                                "提交回答"
+                            } else if plan {
+                                "开始执行"
+                            } else {
+                                "允许"
+                            })
+                            .disabled(asking && !answered)
+                            .on_click(cx.listener(move |shell, _, window, cx| {
+                                if asking {
+                                    shell.submit_answers(cx);
+                                } else {
+                                    shell.decide(true, false, window, cx);
+                                }
                             })),
                     ),
             )
@@ -2268,6 +2448,7 @@ fn action_label(kind: &ActionKind) -> &'static str {
         ActionKind::EditFiles => "编辑文件",
         ActionKind::GrantExtraPermission => "使用工具",
         ActionKind::ApprovePlan => "批准计划",
+        ActionKind::AnswerQuestions => "回答问题",
     }
 }
 
