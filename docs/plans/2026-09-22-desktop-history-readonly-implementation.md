@@ -148,9 +148,9 @@ PR 评论修复后的验证：
 
 ## 已知缺口与后续
 
-- Claude Code 会话标题常常是 `<local-command-caveat>Caveat: …`。这是
-  `agentdeckd/src/claude_code/history.rs` 的标题抽取问题，应在 daemon 侧修，不要在
-  desktop 打补丁。
+- ~~Claude Code 会话标题常常是 `<local-command-caveat>Caveat: …`~~ 已修（2026-10-20）：
+  `agentdeckd/src/claude_code/history.rs` 跳过 `isMeta` 行，斜杠命令显示为 `/name args`、
+  `!` 命令显示为 `! cmd`，命令输出与 `<task-notification>` 隐藏，标题只取真实提问。
 - Codex 列表为空已定位为 provider 默认过滤，查询现在显式使用 `modelProviders=[]`。
   正文已适配稳定分页接口，版本与官方 schema 同步升级至 `0.155.0-alpha.16`；
   桌面正文点击已在 2026-09-23 补齐验收；升级后的真实 lifecycle E2E 尚未重跑。

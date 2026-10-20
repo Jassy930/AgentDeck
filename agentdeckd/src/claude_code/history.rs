@@ -320,11 +320,13 @@ fn scan_session(path: &Path) -> (Option<String>, Option<PathBuf>) {
                     custom = Some(t.to_string());
                 }
             }
-            "user" if first_user.is_none() => {
+            "user" if first_user.is_none() && !is_meta(&v) => {
                 if let Some(s) = v
                     .get("message")
                     .and_then(|m| m.get("content"))
                     .and_then(Value::as_str)
+                    // Slash/bash command echoes are not a usable title.
+                    .filter(|s| !s.trim_start().starts_with('<'))
                 {
                     let snippet: String = s.chars().take(80).collect();
                     first_user = Some(snippet);
@@ -334,6 +336,45 @@ fn scan_session(path: &Path) -> (Option<String>, Option<PathBuf>) {
         }
     }
     (custom.or(first_user), cwd)
+}
+
+/// CC marks injected user lines (command caveats, skill bodies, image
+/// captions, system reminders) with `isMeta: true`; none is user input.
+fn is_meta(v: &Value) -> bool {
+    v.get("isMeta").and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// Map a CC user line to what the user actually typed: slash commands
+/// become `/name args`, `!` shell input becomes `! cmd`, and CLI-only
+/// echoes (command stdout, bash output, task notifications) are hidden.
+fn user_display_text(raw: &str) -> Option<String> {
+    let text = raw.trim();
+    if text.contains("<command-name>") {
+        let name = tag_inner(text, "command-name").unwrap_or_default();
+        let args = tag_inner(text, "command-args").unwrap_or_default();
+        return Some(format!("{name} {args}").trim().to_string()).filter(|s| !s.is_empty());
+    }
+    if text.starts_with("<bash-input>") {
+        return tag_inner(text, "bash-input").map(|cmd| format!("! {cmd}"));
+    }
+    const HIDDEN: [&str; 6] = [
+        "<local-command-stdout>",
+        "<local-command-stderr>",
+        "<local-command-caveat>",
+        "<bash-stdout>",
+        "<bash-stderr>",
+        "<task-notification>",
+    ];
+    if text.is_empty() || HIDDEN.iter().any(|t| text.starts_with(t)) {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+fn tag_inner<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let start = text.find(&format!("<{tag}>"))? + tag.len() + 2;
+    let end = start + text[start..].find(&format!("</{tag}>"))?;
+    Some(text[start..end].trim())
 }
 
 fn is_memory_agent_session(path: &Path) -> bool {
@@ -444,6 +485,7 @@ pub fn parse_session_jsonl(
         };
         let line_kind = v.get("type").and_then(Value::as_str).unwrap_or("");
         match line_kind {
+            "user" if is_meta(&v) => {}
             "user" => {
                 // Two sub-shapes:
                 //   1) plain user prompt: message.content is a string
@@ -452,11 +494,14 @@ pub fn parse_session_jsonl(
                 //      with `type:"tool_result"` blocks → fold into
                 //      the current turn (don't open a new one)
                 let content_val = v.get("message").and_then(|m| m.get("content"));
-                if let Some(text) = content_val.and_then(Value::as_str) {
+                if let Some(text) = content_val
+                    .and_then(Value::as_str)
+                    .and_then(user_display_text)
+                {
                     // New turn boundary.
                     flush(&mut current, &mut turns);
                     current.push(AgentItem::UserMessage {
-                        text: text.to_string(),
+                        text,
                         meta: AgentItemMeta::default(),
                     });
                 } else if let Some(arr) = content_val.and_then(Value::as_array) {
@@ -1261,6 +1306,34 @@ mod tests {
         assert_eq!(resp.turns.len(), 2);
         assert_eq!(resp.turns[0].items.len(), 2);
         assert_eq!(resp.turns[1].items.len(), 2);
+    }
+
+    #[test]
+    fn parse_session_jsonl_cleans_cli_command_noise() {
+        let jsonl = r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat: x</local-command-caveat>"}}
+{"type":"user","message":{"role":"user","content":"<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args>opus</command-args>"}}
+{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set model</local-command-stdout>"}}
+{"type":"user","message":{"role":"user","content":"<bash-input>ls</bash-input>"}}
+{"type":"user","message":{"role":"user","content":"<bash-stdout>a</bash-stdout><bash-stderr></bash-stderr>"}}
+{"type":"user","message":{"role":"user","content":"real question"}}
+"#;
+        let resp = parse_session_jsonl(jsonl, ThreadId("abc".into())).unwrap();
+        let texts: Vec<_> = resp
+            .turns
+            .iter()
+            .flat_map(|t| &t.items)
+            .filter_map(|i| match i {
+                AgentItem::UserMessage { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["/model opus", "! ls", "real question"]);
+
+        let dir = tempdir_unique();
+        let path = dir.join("s.jsonl");
+        std::fs::write(&path, jsonl).unwrap();
+        assert_eq!(scan_session(&path).0.as_deref(), Some("real question"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
