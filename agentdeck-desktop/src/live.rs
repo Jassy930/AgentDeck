@@ -9,9 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentdeck_protocol::{
     ActionDecision, ActionDecisionKind, ActionRequest, AgentItem, AgentItemMeta,
-    ClaudeCodePermissionMode, ClaudeCodeVendorPanelEvent, ClientCommand, HistoryTurn, InitialTurn,
-    ServerEvent, SessionCapabilities, SessionId, SessionStart, TurnId, TurnOutcome,
-    VendorPanelPayload,
+    ClaudeCodePermissionMode, ClaudeCodeVendorPanelEvent, ClientCommand, HistoryListItem,
+    HistoryTurn, InitialTurn, ServerEvent, SessionCapabilities, SessionId, SessionStart, TurnId,
+    TurnOutcome, VendorPanelPayload,
 };
 
 use crate::session_router::SessionRouter;
@@ -67,6 +67,8 @@ pub struct LiveTurn {
 
 pub struct LiveSession {
     pub key: SessionKey,
+    /// 新建会话：key 里是占位 thread id，SessionStart 不带 resume；SessionStarted 后由 Shell 取走换成真实 id。
+    pub draft: Option<HistoryListItem>,
     /// `Some` 表示 daemon 上开着这个会话，后续轮次直接 TurnStart。
     pub session_id: Option<SessionId>,
     /// 见过 SessionStarted；之前的错误说明会话没起来。
@@ -95,6 +97,7 @@ impl LiveSession {
     pub fn new(key: SessionKey) -> Self {
         Self {
             key,
+            draft: None,
             session_id: None,
             started: false,
             running: None,
@@ -346,7 +349,7 @@ impl LiveSession {
             session_id,
             agent_kind: *kind,
             cwd,
-            resume_thread_id: Some(thread_id.clone()),
+            resume_thread_id: self.draft.is_none().then(|| thread_id.clone()),
             initial_turn: Some(InitialTurn { turn_id, prompt }),
             vendor_options: options?,
             runtime_options: Default::default(),
@@ -437,6 +440,21 @@ impl LiveSession {
     }
 
     /// 应用一条属于本会话的事件；返回是否需要重绘。
+    /// 新建会话的 SessionStarted 带回真实 thread id：换掉占位 key，返回旧 key 和侧栏条目。
+    pub fn adopt_thread(&mut self, event: &ServerEvent) -> Option<(SessionKey, HistoryListItem)> {
+        let ServerEvent::SessionStarted {
+            thread_id: Some(thread_id),
+            ..
+        } = event
+        else {
+            return None;
+        };
+        let mut item = self.draft.take()?;
+        item.thread_id = thread_id.clone();
+        let old = std::mem::replace(&mut self.key.2, thread_id.clone());
+        Some(((self.key.0.clone(), self.key.1, old), item))
+    }
+
     pub fn apply(&mut self, event: ServerEvent) -> bool {
         match event {
             ServerEvent::SessionStarted { .. } => self.started = true,
@@ -669,6 +687,34 @@ mod tests {
                 diagnostic_ref: None,
             },
         }
+    }
+
+    #[test]
+    fn draft_starts_a_new_thread_and_adopts_the_started_id() {
+        let mut live = session();
+        live.draft = Some(agentdeck_protocol::HistoryListItem {
+            thread_id: ThreadId("thread".into()),
+            agent_kind: AgentKind::ClaudeCode,
+            title: Some("hi".into()),
+            cwd: "/tmp".into(),
+            last_active_ms: 0,
+            archived: false,
+        });
+        let ClientCommand::SessionStart(start) = send(&mut live, "hi") else {
+            panic!("first send must start a session");
+        };
+        assert_eq!(start.resume_thread_id, None);
+
+        let started = ServerEvent::SessionStarted {
+            session_id: start.session_id,
+            thread_id: Some(ThreadId("real".into())),
+            agent_kind: AgentKind::ClaudeCode,
+        };
+        let (old, item) = live.adopt_thread(&started).unwrap();
+        assert_eq!(old.2, ThreadId("thread".into()));
+        assert_eq!(item.thread_id, ThreadId("real".into()));
+        assert_eq!(live.key.2, ThreadId("real".into()));
+        assert!(live.adopt_thread(&started).is_none());
     }
 
     #[test]
