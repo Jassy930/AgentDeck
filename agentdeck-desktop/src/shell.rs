@@ -15,7 +15,8 @@ use agentdeck_protocol::{
 };
 use gpui::{
     App, Context, Entity, FocusHandle, IntoElement, ListAlignment, ListState, ParentElement,
-    ScrollStrategy, SharedString, UniformListScrollHandle, Window, div, prelude::*, px,
+    ScrollHandle, ScrollStrategy, SharedString, UniformListScrollHandle, Window, div, prelude::*,
+    px,
 };
 use gpui_component::{
     ActiveTheme, Colorize, Disableable, Icon, InteractiveElementExt, Selectable, Sizable,
@@ -35,6 +36,8 @@ use crate::session_router::SessionRouter;
 use crate::sidebar;
 use crate::transcript;
 use crate::versions;
+
+gpui::actions!(questions, [NextQuestion, PreviousQuestion]);
 
 /// 首屏和每次扩展的显示条数；多读一条用于判断是否还有会话。
 const SIDEBAR_LIMIT: usize = 50;
@@ -650,6 +653,7 @@ pub struct Shell {
     bypass_armed: bool,
     /// 提问卡的键盘焦点；每次新提问自动聚焦一次，按键在卡片上处理。
     question_focus: FocusHandle,
+    question_scroll: ScrollHandle,
     /// 已自动聚焦过的提问（requestId, revision）。
     question_focused: Option<(String, u64)>,
     /// 下一帧要聚焦的“其他”输入框（题号）；输入框实体只在渲染时拿得到。
@@ -727,6 +731,7 @@ impl Shell {
             composer,
             bypass_armed: false,
             question_focus: cx.focus_handle(),
+            question_scroll: ScrollHandle::new(),
             question_focused: None,
             focus_other: None,
         };
@@ -1002,6 +1007,7 @@ impl Shell {
                 return;
             }
             live.step_tab(true);
+            self.question_scroll.scroll_to_top_of_item(0);
         }
         cx.notify();
     }
@@ -1016,6 +1022,7 @@ impl Shell {
             self.submit_answers(cx);
         } else {
             live.step_tab(true);
+            self.question_scroll.scroll_to_top_of_item(0);
             cx.notify();
         }
     }
@@ -1024,6 +1031,7 @@ impl Shell {
         if let Some((live, _, _)) = self.current_live() {
             live.set_tab(tab);
         }
+        self.question_scroll.scroll_to_top_of_item(0);
         window.focus(&self.question_focus);
         cx.notify();
     }
@@ -1059,11 +1067,16 @@ impl Shell {
         // 光标位置 / 数字键对应的选项；等于选项数是“其他”。
         let choose = |index: usize| (index <= options.len()).then(|| options.get(index).cloned());
         match keystroke.key.as_str() {
-            "tab" => live.step_tab(!modifiers.shift),
-            "right" => live.step_tab(true),
-            "left" => live.step_tab(false),
-            "up" if !summary => live.move_cursor(false),
-            "down" if !summary => live.move_cursor(true),
+            key @ ("right" | "left") => {
+                live.step_tab(key == "right");
+                self.question_scroll.scroll_to_top_of_item(0);
+            }
+            key @ ("up" | "down") if !summary => {
+                live.move_cursor(key == "down");
+                let row = live.question_cursor + 1;
+                // 标题占第 0 行；对齐选项顶部，长说明也不会遮住选项名称。
+                self.question_scroll.scroll_to_top_of_item(row);
+            }
             "enter" | "space" if summary => self.submit_answers(cx),
             "enter" | "space" => {
                 if let Some(choice) = choose(live.question_cursor) {
@@ -1074,6 +1087,7 @@ impl Shell {
                 let digit = (key.as_bytes()[0] - b'0') as usize;
                 if let Some(choice) = digit.checked_sub(1).and_then(choose) {
                     live.question_cursor = digit - 1;
+                    self.question_scroll.scroll_to_top_of_item(digit);
                     self.pick_option(tab, choice, cx);
                 }
             }
@@ -1094,6 +1108,7 @@ impl Shell {
             }
             Err(message) => live.error = Some(message),
         }
+        self.question_scroll.scroll_to_top_of_item(0);
         cx.notify();
     }
 
@@ -2465,6 +2480,7 @@ impl Shell {
         if self.question_focused.as_ref() != Some(&focus_key) {
             cx.defer_in(window, move |shell, window, cx| {
                 window.focus(&shell.question_focus);
+                shell.question_scroll.scroll_to_top_of_item(0);
                 shell.question_focused = Some(focus_key);
                 cx.notify();
             });
@@ -2473,6 +2489,10 @@ impl Shell {
             .focus_other
             .and_then(|ix| other_inputs.get(ix).cloned())
         {
+            if let Some(question) = self.focus_other.and_then(|ix| questions.get(ix)) {
+                self.question_scroll
+                    .scroll_to_item(question.options.len() + 2);
+            }
             cx.defer_in(window, move |shell, window, cx| {
                 input.update(cx, |input, cx| input.focus(window, cx));
                 shell.focus_other = None;
@@ -2535,6 +2555,11 @@ impl Shell {
         let body =
             if summary {
                 v_flex()
+                    .id("question-page")
+                    .w_full()
+                    .max_h(px(320.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.question_scroll)
                     .gap_1()
                     .children(questions.iter().enumerate().map(|(ix, question)| {
                         h_flex()
@@ -2640,6 +2665,11 @@ impl Shell {
                         }))
                 };
                 v_flex()
+                    .id("question-page")
+                    .w_full()
+                    .max_h(px(320.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.question_scroll)
                     .gap_1()
                     .when_some(question, |page, question| {
                         let option_count = question.options.len();
@@ -2723,6 +2753,21 @@ impl Shell {
         v_flex()
             .id("question-card")
             .track_focus(&self.question_focus)
+            .when(self.question_focus.is_focused(window), |card| {
+                card.key_context("QuestionCard")
+            })
+            .on_action(cx.listener(|shell, _: &NextQuestion, window, cx| {
+                if let Some((live, _, _)) = shell.current_live() {
+                    let tab = live.question_tab + 1;
+                    shell.question_tab(tab, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|shell, _: &PreviousQuestion, window, cx| {
+                if let Some((live, _, _)) = shell.current_live() {
+                    let tab = live.question_tab.saturating_sub(1);
+                    shell.question_tab(tab, window, cx);
+                }
+            }))
             .on_key_down(
                 cx.listener(|shell, event: &gpui::KeyDownEvent, window, cx| {
                     shell.question_key(event, window, cx)
@@ -2751,14 +2796,7 @@ impl Shell {
                     .child(div().flex_shrink_0().font_semibold().child("回答问题"))
                     .children(tabs),
             )
-            .child(
-                div()
-                    .id("question-page")
-                    .w_full()
-                    .max_h(px(320.))
-                    .overflow_y_scroll()
-                    .child(body),
-            )
+            .child(body)
             .child(
                 h_flex()
                     .flex_shrink_0()

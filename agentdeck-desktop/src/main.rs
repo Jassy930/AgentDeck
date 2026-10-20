@@ -95,7 +95,11 @@ fn main() {
         gpui_component::init(cx);
         theme::apply(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
-        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        cx.bind_keys([
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("tab", shell::NextQuestion, Some("QuestionCard")),
+            KeyBinding::new("shift-tab", shell::PreviousQuestion, Some("QuestionCard")),
+        ]);
         cx.set_menus(vec![Menu {
             name: "AgentDeck".into(),
             items: vec![MenuItem::action("退出 AgentDeck", Quit)],
