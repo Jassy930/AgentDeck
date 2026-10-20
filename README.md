@@ -281,8 +281,9 @@ desktop 已经通过 typed local client 接入 daemon 的只读历史，下一�
 1. 桌面只读历史已落地（侧栏真实会话列表 + 会话记录），实现与坑点见
    [只读历史接入记录](docs/plans/2026-09-22-desktop-history-readonly-implementation.md)。
    Codex 列表查询包含全部 provider，正文通过稳定分页接口读取；未验证版本仅 warning。
-   升级后的真实历史读回和桌面点击验收边界见实施记录；Claude Code 的 CLI 命令噪声
-   （`isMeta` 注入、`<command-name>`、命令输出等）已在 daemon 历史解析中收敛（2026-10-20）。
+   升级后的真实历史读回和桌面点击验收边界见实施记录；Claude Code 的 CLI 命令噪声已在 daemon
+   历史解析中收敛（2026-10-20）：用户输入的命令保留，注入上下文与命令输出以 `contextKind`
+   标记、桌面默认折叠。
 2. 持久 CLI 四轮曾在 0.145.0 的临时配置覆盖环境通过，包含累计 streaming、同 PID/threadId
    复用、取消后继续、回收与记录读回；升级后的 lifecycle E2E 尚未重跑，
    证据见 [M0 CLI 实施记录](docs/plans/2026-09-21-backend-m0-cli-implementation.md)。
