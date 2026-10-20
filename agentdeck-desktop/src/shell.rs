@@ -15,10 +15,12 @@ use agentdeck_protocol::{
 };
 use gpui::{
     App, Context, Entity, FocusHandle, IntoElement, ListAlignment, ListState, ParentElement,
-    ScrollStrategy, SharedString, UniformListScrollHandle, Window, div, prelude::*, px,
+    ScrollHandle, ScrollStrategy, SharedString, UniformListScrollHandle, Window, div, prelude::*,
+    px,
 };
 use gpui_component::{
-    ActiveTheme, Colorize, Disableable, Icon, InteractiveElementExt, Sizable, StyledExt,
+    ActiveTheme, Colorize, Disableable, Icon, InteractiveElementExt, Selectable, Sizable,
+    StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -34,6 +36,8 @@ use crate::session_router::SessionRouter;
 use crate::sidebar;
 use crate::transcript;
 use crate::versions;
+
+gpui::actions!(questions, [NextQuestion, PreviousQuestion]);
 
 /// 首屏和每次扩展的显示条数；多读一条用于判断是否还有会话。
 const SIDEBAR_LIMIT: usize = 50;
@@ -647,6 +651,13 @@ pub struct Shell {
     composer: Entity<InputState>,
     /// 选了“跳过所有权限”，等待二次确认。
     bypass_armed: bool,
+    /// 提问卡的键盘焦点；每次新提问自动聚焦一次，按键在卡片上处理。
+    question_focus: FocusHandle,
+    question_scroll: ScrollHandle,
+    /// 已自动聚焦过的提问（requestId, revision）。
+    question_focused: Option<(String, u64)>,
+    /// 下一帧要聚焦的“其他”输入框（题号）；输入框实体只在渲染时拿得到。
+    focus_other: Option<usize>,
 }
 
 impl Shell {
@@ -719,6 +730,10 @@ impl Shell {
             live: Vec::new(),
             composer,
             bypass_armed: false,
+            question_focus: cx.focus_handle(),
+            question_scroll: ScrollHandle::new(),
+            question_focused: None,
+            focus_other: None,
         };
         if connect_daemon {
             shell.add_machine(None, cx);
@@ -964,17 +979,121 @@ impl Shell {
         cx.notify();
     }
 
-    pub fn toggle_pick(&mut self, question: usize, label: &str, cx: &mut Context<Self>) {
-        if let Some((live, _, _)) = self.current_live() {
-            live.toggle_pick(question, label);
+    /// 选一个选项（`None` 是“其他”）。单选题选中即进下一页，只有一题时直接提交；
+    /// 选“其他”把焦点交给它的输入框。
+    pub fn pick_option(&mut self, question: usize, label: Option<String>, cx: &mut Context<Self>) {
+        let Some((live, _, _)) = self.current_live() else {
+            return;
+        };
+        let multi = live
+            .action()
+            .and_then(|action| action.questions.as_ref())
+            .and_then(|questions| questions.get(question))
+            .is_some_and(|asked| asked.multi_select);
+        live.question_tab = question;
+        match &label {
+            Some(label) => live.toggle_pick(question, label),
+            None => live.toggle_other(question),
+        }
+        let single_question = live.tab_count() == 1;
+        let other_on = live.others.get(question).copied().unwrap_or(false);
+        if label.is_none() {
+            if other_on {
+                self.focus_other = Some(question);
+            }
+        } else if !multi {
+            if single_question {
+                self.submit_answers(cx);
+                return;
+            }
+            live.step_tab(true);
+            self.question_scroll.scroll_to_top_of_item(0);
         }
         cx.notify();
     }
 
-    pub fn toggle_other(&mut self, question: usize, cx: &mut Context<Self>) {
-        if let Some((live, _, _)) = self.current_live() {
-            live.toggle_other(question);
+    /// “其他”输入框里按 Enter：回到卡片并前进，和选中单选项一样。
+    fn finish_other(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.question_focus);
+        let Some((live, _, _)) = self.current_live() else {
+            return;
+        };
+        if live.tab_count() == 1 {
+            self.submit_answers(cx);
+        } else {
+            live.step_tab(true);
+            self.question_scroll.scroll_to_top_of_item(0);
+            cx.notify();
         }
+    }
+
+    pub fn question_tab(&mut self, tab: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((live, _, _)) = self.current_live() {
+            live.set_tab(tab);
+        }
+        self.question_scroll.scroll_to_top_of_item(0);
+        window.focus(&self.question_focus);
+        cx.notify();
+    }
+
+    /// 提问卡键盘：←→/Tab 切页，↑↓ 移动，Enter/空格 选中（汇总页为提交），数字键直选。
+    /// 焦点在“其他”输入框里时不处理，按键交给输入框。
+    fn question_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keystroke = &event.keystroke;
+        let modifiers = &keystroke.modifiers;
+        if !self.question_focus.is_focused(window)
+            || modifiers.control
+            || modifiers.alt
+            || modifiers.platform
+        {
+            return;
+        }
+        let Some((live, _, _)) = self.current_live() else {
+            return;
+        };
+        let tab = live.question_tab;
+        let options: Vec<String> = live
+            .action()
+            .and_then(|action| action.questions.as_ref())
+            .and_then(|questions| questions.get(tab))
+            .map(|question| question.options.iter().map(|o| o.label.clone()).collect())
+            .unwrap_or_default();
+        let summary = live.on_summary_tab();
+        // 光标位置 / 数字键对应的选项；等于选项数是“其他”。
+        let choose = |index: usize| (index <= options.len()).then(|| options.get(index).cloned());
+        match keystroke.key.as_str() {
+            key @ ("right" | "left") => {
+                live.step_tab(key == "right");
+                self.question_scroll.scroll_to_top_of_item(0);
+            }
+            key @ ("up" | "down") if !summary => {
+                live.move_cursor(key == "down");
+                let row = live.question_cursor + 1;
+                // 标题占第 0 行；对齐选项顶部，长说明也不会遮住选项名称。
+                self.question_scroll.scroll_to_top_of_item(row);
+            }
+            "enter" | "space" if summary => self.submit_answers(cx),
+            "enter" | "space" => {
+                if let Some(choice) = choose(live.question_cursor) {
+                    self.pick_option(tab, choice, cx);
+                }
+            }
+            key if !summary && key.len() == 1 && key.as_bytes()[0].is_ascii_digit() => {
+                let digit = (key.as_bytes()[0] - b'0') as usize;
+                if let Some(choice) = digit.checked_sub(1).and_then(choose) {
+                    live.question_cursor = digit - 1;
+                    self.question_scroll.scroll_to_top_of_item(digit);
+                    self.pick_option(tab, choice, cx);
+                }
+            }
+            _ => return,
+        }
+        cx.stop_propagation();
         cx.notify();
     }
 
@@ -989,6 +1108,7 @@ impl Shell {
             }
             Err(message) => live.error = Some(message),
         }
+        self.question_scroll.scroll_to_top_of_item(0);
         cx.notify();
     }
 
@@ -2111,7 +2231,7 @@ impl Shell {
                     .max_w(px(760.))
                     .gap_2()
                     .p_2()
-                    .items_end()
+                    .items_center()
                     .rounded_xl()
                     .border_1()
                     .border_color(border)
@@ -2173,7 +2293,10 @@ impl Shell {
         action: &ActionRequest,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
+    ) -> gpui::AnyElement {
+        if action.questions.is_some() {
+            return self.render_questions(session, action, window, cx);
+        }
         let plan = matches!(action.kind, ActionKind::ApprovePlan);
         let can_persist = match &action.vendor {
             ActionRequestVendor::Codex { can_persist, .. }
@@ -2195,125 +2318,6 @@ impl Shell {
                 cx,
             )
         });
-        let questions = action.questions.clone().unwrap_or_default();
-        let asking = !questions.is_empty();
-        let live = self.live.iter().find(|live| session.is(&live.key));
-        let picks = live.map(|live| live.picks.clone()).unwrap_or_default();
-        let others = live.map(|live| live.others.clone()).unwrap_or_default();
-        let answered = live.is_some_and(LiveSession::answered);
-        let revision = live.map_or(0, |live| live.question_revision);
-        let saved_texts = live
-            .map(|live| live.other_texts.as_slice())
-            .unwrap_or_default();
-        let other_inputs: Vec<Entity<InputState>> = (0..questions.len())
-            .map(|ix| {
-                let key = session.key();
-                let request_id = action.request_id.clone();
-                let shell = cx.entity().downgrade();
-                let text = saved_texts.get(ix).cloned().unwrap_or_default();
-                window.use_keyed_state(
-                    SharedString::from(format!(
-                        "question-other-{key:?}-{request_id}-{revision}-{ix}"
-                    )),
-                    cx,
-                    |window, cx| {
-                        let mut input = InputState::new(window, cx).placeholder("输入你的答案");
-                        input.set_value(text, window, cx);
-                        cx.subscribe(&cx.entity(), move |input, _, event: &InputEvent, cx| {
-                            if matches!(event, InputEvent::Change) {
-                                let text = input.value().to_string();
-                                let _ = shell.update(cx, |shell, _| {
-                                    if let Some(live) =
-                                        shell.live.iter_mut().find(|live| live.key == key)
-                                    {
-                                        live.set_other_text(&request_id, revision, ix, text);
-                                    }
-                                });
-                            }
-                        })
-                        .detach();
-                        input
-                    },
-                )
-            })
-            .collect();
-        let question_rows: Vec<_> = questions
-            .into_iter()
-            .enumerate()
-            .map(|(ix, question)| {
-                let chosen = picks.get(ix).cloned().unwrap_or_default();
-                let other = others.get(ix).copied().unwrap_or(false);
-                let other_input = other_inputs[ix].clone();
-                v_flex()
-                    .gap_1p5()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .text_sm()
-                            .when_some(question.header.clone(), |row, header| {
-                                row.child(meta_chip(cx).flex_shrink_0().child(header))
-                            })
-                            .child(div().min_w(px(0.)).child(question.question.clone()))
-                            .when(question.multi_select, |row| {
-                                row.child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child("可多选"),
-                                )
-                            }),
-                    )
-                    .child(
-                        h_flex().flex_wrap().gap_1p5().children(
-                            question
-                                .options
-                                .into_iter()
-                                .enumerate()
-                                .map(|(option_ix, option)| {
-                                    let selected = chosen.contains(&option.label);
-                                    let label = option.label.clone();
-                                    Button::new(SharedString::from(format!(
-                                        "question-{ix}-option-{option_ix}"
-                                    )))
-                                    .small()
-                                    .when(selected, |button| button.primary())
-                                    .when(!selected, |button| button.outline())
-                                    .label(option.label)
-                                    .when_some(option.description, |button, description| {
-                                        button.tooltip(description)
-                                    })
-                                    .on_click(cx.listener(move |shell, _, _, cx| {
-                                        shell.toggle_pick(ix, &label, cx)
-                                    }))
-                                })
-                                .chain(std::iter::once(
-                                    Button::new(SharedString::from(format!("question-{ix}-other")))
-                                        .small()
-                                        .when(other, |button| button.primary())
-                                        .when(!other, |button| button.outline())
-                                        .label("其他")
-                                        .on_click(cx.listener(move |shell, _, _, cx| {
-                                            shell.toggle_other(ix, cx)
-                                        })),
-                                )),
-                        ),
-                    )
-                    .when(other, |row| {
-                        row.child(
-                            div()
-                                .w_full()
-                                .px_2()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(cx.theme().border)
-                                .bg(cx.theme().secondary)
-                                .child(Input::new(&other_input).appearance(false)),
-                        )
-                    })
-            })
-            .collect();
         let theme = cx.theme();
         let (warning, muted) = (theme.warning, theme.muted_foreground);
 
@@ -2363,16 +2367,6 @@ impl Shell {
                         .child(detail.h_auto()),
                 )
             })
-            .when(asking, |card| {
-                card.child(
-                    div()
-                        .id("approval-questions")
-                        .w_full()
-                        .max_h(px(240.))
-                        .overflow_y_scroll()
-                        .child(v_flex().gap_2().children(question_rows)),
-                )
-            })
             .child(
                 h_flex()
                     .flex_shrink_0()
@@ -2384,9 +2378,7 @@ impl Shell {
                             .min_w(px(0.))
                             .text_xs()
                             .text_color(muted)
-                            .child(if asking {
-                                "每题选好后提交；跳过则不回答"
-                            } else if plan {
+                            .child(if plan {
                                 "输入框里的文字会作为修改意见随“继续规划”发出"
                             } else {
                                 "拒绝时输入框里的文字会作为理由发给 agent"
@@ -2396,13 +2388,7 @@ impl Shell {
                         Button::new("deny-action")
                             .small()
                             .outline()
-                            .label(if asking {
-                                "跳过"
-                            } else if plan {
-                                "继续规划"
-                            } else {
-                                "拒绝"
-                            })
+                            .label(if plan { "继续规划" } else { "拒绝" })
                             .on_click(cx.listener(|shell, _, window, cx| {
                                 shell.decide(false, false, window, cx)
                             })),
@@ -2422,25 +2408,436 @@ impl Shell {
                         Button::new("approve-action")
                             .small()
                             .primary()
-                            .label(if asking {
-                                "提交回答"
-                            } else if plan {
-                                "开始执行"
-                            } else {
-                                "允许"
-                            })
-                            .disabled(asking && !answered)
-                            .on_click(cx.listener(move |shell, _, window, cx| {
-                                if asking {
-                                    shell.submit_answers(cx);
-                                } else {
-                                    shell.decide(true, false, window, cx);
-                                }
+                            .label(if plan { "开始执行" } else { "允许" })
+                            .on_click(cx.listener(|shell, _, window, cx| {
+                                shell.decide(true, false, window, cx)
                             })),
                     ),
             )
+            .into_any_element()
     }
 }
+
+impl Shell {
+    /// 提问卡：和 Claude Code TUI 一样一题一页，顶部 tab 切换，多题时最后一页汇总提交。
+    fn render_questions(
+        &self,
+        session: &Session,
+        action: &ActionRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let questions = action.questions.clone().unwrap_or_default();
+        let live = self.live.iter().find(|live| session.is(&live.key));
+        let revision = live.map_or(0, |live| live.question_revision);
+        let saved_texts = live
+            .map(|live| live.other_texts.as_slice())
+            .unwrap_or_default();
+        let other_inputs: Vec<Entity<InputState>> = (0..questions.len())
+            .map(|ix| {
+                let key = session.key();
+                let request_id = action.request_id.clone();
+                let shell = cx.entity().downgrade();
+                let text = saved_texts.get(ix).cloned().unwrap_or_default();
+                window.use_keyed_state(
+                    SharedString::from(format!(
+                        "question-other-{key:?}-{request_id}-{revision}-{ix}"
+                    )),
+                    cx,
+                    |window, cx| {
+                        let mut input =
+                            InputState::new(window, cx).placeholder("输入你的答案，Enter 确认");
+                        input.set_value(text, window, cx);
+                        cx.subscribe_in(
+                            &cx.entity(),
+                            window,
+                            move |input, _, event: &InputEvent, window, cx| match event {
+                                InputEvent::Change => {
+                                    let text = input.value().to_string();
+                                    let _ = shell.update(cx, |shell, _| {
+                                        if let Some(live) =
+                                            shell.live.iter_mut().find(|live| live.key == key)
+                                        {
+                                            live.set_other_text(&request_id, revision, ix, text);
+                                        }
+                                    });
+                                }
+                                InputEvent::PressEnter { .. } => {
+                                    let _ = shell
+                                        .update(cx, |shell, cx| shell.finish_other(window, cx));
+                                }
+                                _ => {}
+                            },
+                        )
+                        .detach();
+                        input
+                    },
+                )
+            })
+            .collect();
+        // 新的提问自动聚焦卡片一次；选了“其他”时聚焦它的输入框。
+        let focus_key = (action.request_id.clone(), revision);
+        if self.question_focused.as_ref() != Some(&focus_key) {
+            cx.defer_in(window, move |shell, window, cx| {
+                window.focus(&shell.question_focus);
+                shell.question_scroll.scroll_to_top_of_item(0);
+                shell.question_focused = Some(focus_key);
+                cx.notify();
+            });
+        }
+        if let Some(input) = self
+            .focus_other
+            .and_then(|ix| other_inputs.get(ix).cloned())
+        {
+            if let Some(question) = self.focus_other.and_then(|ix| questions.get(ix)) {
+                self.question_scroll
+                    .scroll_to_item(question.options.len() + 2);
+            }
+            cx.defer_in(window, move |shell, window, cx| {
+                input.update(cx, |input, cx| input.focus(window, cx));
+                shell.focus_other = None;
+            });
+        }
+        let picks = live.map(|live| live.picks.clone()).unwrap_or_default();
+        let others = live.map(|live| live.others.clone()).unwrap_or_default();
+        let tab = live.map_or(0, |live| live.question_tab);
+        let cursor = live.map_or(0, |live| live.question_cursor);
+        let tab_count = live.map_or(questions.len(), LiveSession::tab_count);
+        let summary = live.is_some_and(LiveSession::on_summary_tab);
+        let answers: Vec<Option<String>> = (0..questions.len())
+            .map(|ix| live.and_then(|live| live.answer_text(ix)))
+            .collect();
+        let all_answered = answers.iter().all(Option::is_some);
+        let theme = cx.theme();
+        let (warning, muted, primary, danger, hover, border) = (
+            theme.warning,
+            theme.muted_foreground,
+            theme.primary,
+            theme.danger,
+            theme.secondary,
+            theme.border,
+        );
+        let tab_label = |ix: usize, question: &agentdeck_protocol::UserQuestion| {
+            question
+                .header
+                .clone()
+                .unwrap_or_else(|| format!("问题 {}", ix + 1))
+        };
+
+        let tabs = (tab_count > 1).then(|| {
+            let last = questions.len();
+            h_flex()
+                .gap_1()
+                .flex_wrap()
+                .children(questions.iter().enumerate().map(|(ix, question)| {
+                    let mark = if answers[ix].is_some() { "✓ " } else { "" };
+                    Button::new(SharedString::from(format!("question-tab-{ix}")))
+                        .small()
+                        .ghost()
+                        .selected(tab == ix)
+                        .label(format!("{mark}{}", tab_label(ix, question)))
+                        .on_click(cx.listener(move |shell, _, window, cx| {
+                            shell.question_tab(ix, window, cx)
+                        }))
+                }))
+                .child(
+                    Button::new("question-tab-submit")
+                        .small()
+                        .ghost()
+                        .selected(summary)
+                        .label("提交")
+                        .on_click(cx.listener(move |shell, _, window, cx| {
+                            shell.question_tab(last, window, cx)
+                        })),
+                )
+        });
+
+        let body =
+            if summary {
+                v_flex()
+                    .id("question-page")
+                    .w_full()
+                    .max_h(px(320.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.question_scroll)
+                    .gap_1()
+                    .children(questions.iter().enumerate().map(|(ix, question)| {
+                        h_flex()
+                            .id(SharedString::from(format!("question-summary-{ix}")))
+                            .gap_2()
+                            .px_2()
+                            .border_1()
+                            .border_color(gpui::transparent_black())
+                            .py_1p5()
+                            .rounded_md()
+                            .items_center()
+                            .text_sm()
+                            .cursor_pointer()
+                            .hover(|row| row.bg(hover))
+                            .child(meta_chip(cx).flex_shrink_0().child(tab_label(ix, question)))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_color(muted)
+                                    .child(question.question.clone()),
+                            )
+                            .child(match &answers[ix] {
+                                Some(answer) => div().flex_shrink_0().child(answer.clone()),
+                                None => div().flex_shrink_0().text_color(danger).child("未回答"),
+                            })
+                            .on_click(cx.listener(move |shell, _, window, cx| {
+                                shell.question_tab(ix, window, cx)
+                            }))
+                    }))
+                    .into_any_element()
+            } else {
+                let question = questions.get(tab).cloned();
+                let chosen = picks.get(tab).cloned().unwrap_or_default();
+                let other_on = others.get(tab).copied().unwrap_or(false);
+                let multi = question.as_ref().is_some_and(|q| q.multi_select);
+                let option_row = |index: usize,
+                                  label: String,
+                                  description: Option<String>,
+                                  selected: bool,
+                                  choice: Option<String>| {
+                    let marker = match (multi, selected) {
+                        (true, true) => "☑",
+                        (true, false) => "☐",
+                        (false, true) => "●",
+                        (false, false) => "○",
+                    };
+                    h_flex()
+                        .id(SharedString::from(format!("question-{tab}-option-{index}")))
+                        .w_full()
+                        .gap_2()
+                        .px_2()
+                        .py_1p5()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(if selected {
+                            primary
+                        } else {
+                            gpui::transparent_black()
+                        })
+                        .when(cursor == index, |row| row.bg(hover))
+                        .cursor_pointer()
+                        .hover(|row| row.bg(hover))
+                        // 序号和标记贴着标题首行，说明再长也不往中间漂。
+                        .items_start()
+                        .text_sm()
+                        .child(
+                            h_flex()
+                                .w(px(OPTION_INDEX_WIDTH))
+                                .h(px(OPTION_LINE_HEIGHT))
+                                .flex_shrink_0()
+                                .items_center()
+                                .text_color(muted)
+                                .child(format!("{}", index + 1)),
+                        )
+                        .child(
+                            h_flex()
+                                .w(px(OPTION_MARKER_WIDTH))
+                                .h(px(OPTION_LINE_HEIGHT))
+                                .flex_shrink_0()
+                                .items_center()
+                                .justify_center()
+                                .text_color(if selected { primary } else { muted })
+                                .child(marker),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .child(
+                                    div()
+                                        .line_height(px(OPTION_LINE_HEIGHT))
+                                        .when(selected, |d| d.font_semibold())
+                                        .child(label),
+                                )
+                                .when_some(description, |col, description| {
+                                    col.child(div().text_xs().text_color(muted).child(description))
+                                }),
+                        )
+                        .on_click(cx.listener(move |shell, _, _, cx| {
+                            shell.pick_option(tab, choice.clone(), cx)
+                        }))
+                };
+                v_flex()
+                    .id("question-page")
+                    .w_full()
+                    .max_h(px(320.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.question_scroll)
+                    .gap_1()
+                    .when_some(question, |page, question| {
+                        let option_count = question.options.len();
+                        page.child(
+                            h_flex()
+                                // 与选项行的边框 + 内边距对齐，题目文字和序号列齐平。
+                                .px(px(OPTION_ROW_INSET))
+                                .gap_2()
+                                .items_center()
+                                .text_sm()
+                                .font_semibold()
+                                .child(question.question.clone())
+                                .when(multi, |row| {
+                                    row.child(
+                                        div()
+                                            .text_xs()
+                                            .font_normal()
+                                            .text_color(muted)
+                                            .child("可多选"),
+                                    )
+                                }),
+                        )
+                        .children(question.options.into_iter().enumerate().map(
+                            |(index, option)| {
+                                let selected = chosen.contains(&option.label);
+                                option_row(
+                                    index,
+                                    option.label.clone(),
+                                    option.description,
+                                    selected,
+                                    Some(option.label),
+                                )
+                            },
+                        ))
+                        .child(option_row(
+                            option_count,
+                            "其他".into(),
+                            Some("自己输入答案".into()),
+                            other_on,
+                            None,
+                        ))
+                        .when_some(
+                            other_inputs.get(tab).filter(|_| other_on).cloned(),
+                            |page, input| {
+                                page.child(
+                                    div().w_full().pl(px(OPTION_TEXT_INSET)).child(
+                                        div()
+                                            .w_full()
+                                            .px_2()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(border)
+                                            .bg(hover)
+                                            .child(Input::new(&input).appearance(false)),
+                                    ),
+                                )
+                            },
+                        )
+                    })
+                    .into_any_element()
+            };
+
+        let primary_button =
+            if summary || tab_count == 1 {
+                Button::new("submit-answers")
+                    .small()
+                    .primary()
+                    .label("提交回答")
+                    .disabled(!all_answered)
+                    .on_click(cx.listener(|shell, _, _, cx| shell.submit_answers(cx)))
+            } else {
+                Button::new("next-question")
+                    .small()
+                    .primary()
+                    .label("下一题")
+                    .on_click(cx.listener(move |shell, _, window, cx| {
+                        shell.question_tab(tab + 1, window, cx)
+                    }))
+            };
+
+        v_flex()
+            .id("question-card")
+            .track_focus(&self.question_focus)
+            .when(self.question_focus.is_focused(window), |card| {
+                card.key_context("QuestionCard")
+            })
+            .on_action(cx.listener(|shell, _: &NextQuestion, window, cx| {
+                if let Some((live, _, _)) = shell.current_live() {
+                    let tab = live.question_tab + 1;
+                    shell.question_tab(tab, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|shell, _: &PreviousQuestion, window, cx| {
+                if let Some((live, _, _)) = shell.current_live() {
+                    let tab = live.question_tab.saturating_sub(1);
+                    shell.question_tab(tab, window, cx);
+                }
+            }))
+            .on_key_down(
+                cx.listener(|shell, event: &gpui::KeyDownEvent, window, cx| {
+                    shell.question_key(event, window, cx)
+                }),
+            )
+            .w_full()
+            .max_w(px(760.))
+            .gap_2()
+            .px_3()
+            .py_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(warning.opacity(0.5))
+            .bg(warning.opacity(0.08))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .text_sm()
+                    .child(
+                        Icon::empty()
+                            .xsmall()
+                            .path(crate::ALERT_ICON)
+                            .text_color(warning),
+                    )
+                    .child(div().flex_shrink_0().font_semibold().child("回答问题"))
+                    .children(tabs),
+            )
+            .child(body)
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_xs()
+                            .text_color(muted)
+                            .child(if tab_count > 1 {
+                                "←→ 或 Tab 切换 · ↑↓ 选择 · Enter 选中 · 数字键直选"
+                            } else {
+                                "↑↓ 选择 · Enter 选中 · 数字键直选"
+                            }),
+                    )
+                    .child(
+                        Button::new("skip-questions")
+                            .small()
+                            .outline()
+                            .label("跳过")
+                            .on_click(cx.listener(|shell, _, window, cx| {
+                                shell.decide(false, false, window, cx)
+                            })),
+                    )
+                    .child(primary_button),
+            )
+            .into_any_element()
+    }
+}
+
+/// 提问卡选项行的列宽：序号列、标记列和标题行高，“其他”输入框按同一组数对齐文字列。
+const OPTION_LINE_HEIGHT: f32 = 20.;
+const OPTION_INDEX_WIDTH: f32 = 16.;
+const OPTION_MARKER_WIDTH: f32 = 16.;
+/// 选项行边框(1) + 内边距 px_2(8)。
+const OPTION_ROW_INSET: f32 = 1. + 8.;
+/// 行内缩进 + 序号列 + gap_2(8) + 标记列 + gap_2(8)。
+const OPTION_TEXT_INSET: f32 =
+    OPTION_ROW_INSET + OPTION_INDEX_WIDTH + 8. + OPTION_MARKER_WIDTH + 8.;
 
 fn action_label(kind: &ActionKind) -> &'static str {
     match kind {
