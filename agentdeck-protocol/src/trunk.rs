@@ -253,6 +253,8 @@ pub enum ActionKind {
     ExecuteCommand,
     EditFiles,
     GrantExtraPermission,
+    /// The agent finished planning and asks to start executing the plan.
+    ApprovePlan,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -273,6 +275,9 @@ pub enum ActionRequestVendor {
         permission_mode_at_decision: crate::vendor::claude_code::ClaudeCodePermissionMode,
         #[serde(rename = "toolName")]
         tool_name: String,
+        /// CC offered permission suggestions, so an approval can be persisted.
+        #[serde(rename = "canPersist", default)]
+        can_persist: bool,
     },
 }
 
@@ -282,6 +287,10 @@ pub struct ActionRequest {
     pub request_id: String,
     pub kind: ActionKind,
     pub summary: String,
+    /// Full content to review: command text, patch, file content or plan
+    /// markdown. Not truncated; clients clip for display.
+    #[serde(default)]
+    pub detail: Option<String>,
     pub vendor: ActionRequestVendor,
 }
 
@@ -291,6 +300,9 @@ pub struct ActionDecision {
     pub request_id: String,
     pub decision: ActionDecisionKind,
     pub persist: bool,
+    /// Feedback for the agent on deny (e.g. how to revise a plan).
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

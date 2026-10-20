@@ -17,7 +17,7 @@ final class ApprovalCardPresentationTests: XCTestCase {
     func testClaudeCodeVendorLine() {
         let request = ActionRequest(
             requestId: "r2", kind: .editFiles, summary: "写入 3 个文件",
-            vendor: .claudeCode(permissionModeAtDecision: .acceptEdits, toolName: "Write"))
+            vendor: .claudeCode(permissionModeAtDecision: .acceptEdits, toolName: "Write", canPersist: false))
         let p = ApprovalCardPresentation.make(from: request)
         XCTAssertTrue(p.vendorLine.contains(ClaudeCodePermissionMode.acceptEdits.rawValue))
         XCTAssertTrue(p.vendorLine.contains("Write"))

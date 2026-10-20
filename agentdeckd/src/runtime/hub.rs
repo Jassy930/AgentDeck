@@ -335,21 +335,6 @@ impl RuntimeHub {
                     send_lifecycle_error(events_tx, retiring_sessions, session_id, error).await;
                 }
             }
-            ClientCommand::VendorControl {
-                session_id,
-                payload,
-            } => {
-                if is_session_retiring(retiring_sessions, &session_id).await {
-                    return;
-                }
-                if let Err(error) = self
-                    .router
-                    .submit_vendor_control(&session_id, payload)
-                    .await
-                {
-                    send_lifecycle_error(events_tx, retiring_sessions, session_id, error).await;
-                }
-            }
             ClientCommand::AgentList => {
                 let kinds: Vec<String> = self
                     .router
@@ -447,6 +432,10 @@ impl RuntimeHub {
             }
             ClientCommand::SessionClose { session_id } => {
                 let _ = lifecycle_tx.send(ClientCommand::SessionClose { session_id });
+            }
+            // A mode switch sent right after SessionStart must not overtake it.
+            command @ ClientCommand::VendorControl { .. } => {
+                let _ = lifecycle_tx.send(command);
             }
             ClientCommand::History(req) => {
                 // Task 4C — Phase 4 finalization: route through the
@@ -588,6 +577,19 @@ async fn lifecycle_worker(
                     continue;
                 }
                 if let Err(error) = router.cancel_turn(&session_id, &turn_id).await {
+                    send_lifecycle_error(&events_tx, &retiring_sessions, session_id, error).await;
+                }
+            }
+            ClientCommand::VendorControl {
+                session_id,
+                payload,
+            } => {
+                if closing.contains(&session_id)
+                    || is_session_retiring(&retiring_sessions, &session_id).await
+                {
+                    continue;
+                }
+                if let Err(error) = router.submit_vendor_control(&session_id, payload).await {
                     send_lifecycle_error(&events_tx, &retiring_sessions, session_id, error).await;
                 }
             }
@@ -2038,6 +2040,7 @@ mod tests {
                     request_id: "after-terminal-action".into(),
                     decision: ActionDecisionKind::Approve,
                     persist: false,
+                    message: None,
                 },
             },
         )

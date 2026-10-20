@@ -12,7 +12,7 @@ struct ApprovalCardPresentation: Equatable {
         case .codex(let policy, let sandbox, let canPersist):
             vendorLine = "codex · \(policy.rawValue) · \(sandbox.rawValue)"
                 + (canPersist ? " · can persist" : "")
-        case .claudeCode(let mode, let toolName):
+        case .claudeCode(let mode, let toolName, _):
             vendorLine = "claude code · \(mode.rawValue) · \(toolName)"
         }
         let kindLabel: String
@@ -23,6 +23,8 @@ struct ApprovalCardPresentation: Equatable {
             kindLabel = "编辑文件"
         case .grantExtraPermission:
             kindLabel = "授予额外权限"
+        case .approvePlan:
+            kindLabel = "批准计划"
         }
         return ApprovalCardPresentation(summary: request.summary, vendorLine: vendorLine, kindLabel: kindLabel)
     }

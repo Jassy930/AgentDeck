@@ -164,6 +164,7 @@ impl LiveSession {
                     ActionDecisionKind::Deny
                 },
                 persist: false,
+                message: None,
             },
         })
     }
@@ -389,9 +390,11 @@ mod tests {
                 request_id: "perm-1".into(),
                 kind: ActionKind::ExecuteCommand,
                 summary: "Bash: ls".into(),
+                detail: Some("ls".into()),
                 vendor: ActionRequestVendor::ClaudeCode {
                     permission_mode_at_decision: ClaudeCodePermissionMode::Default,
                     tool_name: "Bash".into(),
+                    can_persist: true,
                 },
             },
         });

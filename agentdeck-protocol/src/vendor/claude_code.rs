@@ -70,6 +70,10 @@ pub enum ClaudeCodeVendorControl {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum ClaudeCodeVendorPanelEvent {
+    /// The session's effective permission mode changed — after a client
+    /// `UpdatePermissionMode`, a plan approval, or a persisted `setMode`
+    /// suggestion. Clients display the mode from this event only.
+    PermissionModeChanged { mode: ClaudeCodePermissionMode },
     /// Hook fire events from `claude --include-hook-events`.
     HookFired {
         matcher: String,
