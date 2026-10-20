@@ -85,12 +85,11 @@ claude --print --input-format stream-json --output-format stream-json \
 
 ## 已知边界
 
-- **行为回退**：CLI one-shot `agentdeck run` 在 `default` 模式下，以前需要审批的工具会被自动拒绝，
-  现在会无限等待决定。交互审批请改用 `session live`，或显式指定 `--permission acceptEdits` / bypass。
+- CLI one-shot `agentdeck run` 的 CC 默认权限改为 `acceptEdits`（2026-10-20），文件编辑不再等审批；
+  Bash 等其他工具仍会等待决定，交互审批请改用 `session live`，或显式指定 `--permission bypass-permissions`。
 - `continue_thread`（旧 CLI 入口）仍然硬编码 `bypassPermissions`。
-- **P2 前置**：CC 历史的 cwd 是从 `~/.claude/projects` 的编码目录名还原的，路径含 `-` 时会还原错
-  （门控 E2E `e2e_cc_history_archive_then_rename` 因此 ENOENT）。桌面续聊 resume 依赖正确的 cwd，
-  需要先改为读取 JSONL 行内的 `cwd` 字段。
+- CC 历史 cwd 原先从 `~/.claude/projects` 的编码目录名还原，路径含 `-` 时会还原错；已改为读取 JSONL 行内
+  记录的 `cwd`，读不到才回退目录名（2026-10-20）。
 - 累计快照每个 delta 都下发全文，和 Codex 的语义对齐；超长回复的带宽开销是 O(n²)。
 
 ## 验证
@@ -105,5 +104,4 @@ claude --print --input-format stream-json --output-format stream-json \
   - 会话内切 acceptEdits 后第三轮写文件无需审批 → succeeded；
   - `SessionClosed(closed)`，共 56 个 streaming 快照；
   - 另起 daemon 用 `resumeThreadId` 续聊，模型记得前文，`persist=true` 后同类 Bash 不再询问。
-  - `AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_claude_code`：9 项中 8 项通过（含 run/continue）；
-    `history_archive_then_rename` 因上述 cwd 还原问题失败，属既有问题。
+  - `AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_claude_code`：修复 cwd 后 9/9 通过。

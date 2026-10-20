@@ -252,12 +252,14 @@ fn list_history_from_jsonl_root(
         if is_memory_agent_session(&candidate.path) {
             continue;
         }
-        let title = scan_title(&candidate.path);
+        let (title, recorded_cwd) = scan_session(&candidate.path);
         items.push(HistoryListItem {
             thread_id: candidate.thread_id,
             agent_kind: AgentKind::ClaudeCode,
             title,
-            cwd: candidate.cwd,
+            // The directory name is lossy (`-` and `/` collide); the cwd CC
+            // records on each line is exact.
+            cwd: recorded_cwd.unwrap_or(candidate.cwd),
             last_active_ms: candidate.last_active_ms,
             archived: false,
         });
@@ -275,14 +277,16 @@ fn file_mtime_ms(p: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// Scan a jsonl for the last `custom-title` line (CC's rename
-/// artefact) and, failing that, the first user message excerpt.
-fn scan_title(path: &Path) -> Option<String> {
+/// Scan a jsonl for its title — the last `custom-title` line (CC's rename
+/// artefact) or, failing that, the first user message excerpt — and the
+/// first `cwd` CC recorded for the session.
+fn scan_session(path: &Path) -> (Option<String>, Option<PathBuf>) {
     let Ok(content) = std::fs::read_to_string(path) else {
-        return None;
+        return (None, None);
     };
     let mut custom: Option<String> = None;
     let mut first_user: Option<String> = None;
+    let mut cwd: Option<PathBuf> = None;
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -292,6 +296,9 @@ fn scan_title(path: &Path) -> Option<String> {
             Ok(v) => v,
             Err(_) => continue,
         };
+        if cwd.is_none() {
+            cwd = v.get("cwd").and_then(Value::as_str).map(PathBuf::from);
+        }
         let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
         match kind {
             "custom-title" => {
@@ -326,7 +333,7 @@ fn scan_title(path: &Path) -> Option<String> {
             _ => {}
         }
     }
-    custom.or(first_user)
+    (custom.or(first_user), cwd)
 }
 
 fn is_memory_agent_session(path: &Path) -> bool {
@@ -1281,9 +1288,29 @@ mod tests {
 "#,
         )
         .unwrap();
-        let title = scan_title(&path);
+        let (title, _) = scan_session(&path);
         assert_eq!(title.as_deref(), Some("My Renamed Session"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_session_reads_the_recorded_cwd_instead_of_the_lossy_dirname() {
+        let home = tempdir_unique();
+        let root = home.join(".claude").join("projects");
+        let real_cwd = Path::new("/tmp/agent-deck/my.app");
+        let project = root.join(encode_cwd(real_cwd));
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("aaaaaaaa-0000-0000-0000-000000000001.jsonl"),
+            r#"{"type":"mode","mode":"normal"}
+{"type":"user","cwd":"/tmp/agent-deck/my.app","message":{"role":"user","content":"hi"}}
+"#,
+        )
+        .unwrap();
+        let items = list_history_from_jsonl_root(&root, None, 10).unwrap();
+        assert_eq!(items[0].cwd, real_cwd);
+        assert_ne!(decode_cwd(&encode_cwd(real_cwd)), real_cwd);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -1297,7 +1324,7 @@ mod tests {
 "#,
         )
         .unwrap();
-        let title = scan_title(&path);
+        let (title, _) = scan_session(&path);
         assert_eq!(title.as_deref(), Some("first prompt content here"));
         let _ = std::fs::remove_dir_all(&dir);
     }

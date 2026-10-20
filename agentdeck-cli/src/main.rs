@@ -110,6 +110,7 @@ enum SessionOp {
         #[arg(long)]
         reasoning_effort: Option<EffortArg>,
         // CC-only flags
+        /// Claude Code permission mode (default: accept-edits)
         #[arg(long)]
         permission: Option<PermissionArg>,
         #[arg(long)]
