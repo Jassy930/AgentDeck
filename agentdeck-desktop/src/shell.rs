@@ -958,6 +958,28 @@ impl Shell {
         cx.notify();
     }
 
+    pub fn toggle_other(&mut self, question: usize, cx: &mut Context<Self>) {
+        if let Some((live, _, _)) = self.current_live() {
+            live.toggle_other(question);
+        }
+        cx.notify();
+    }
+
+    /// 提交提问的回答；`others` 是各题“其他”输入框的内容。
+    pub fn submit_answers(&mut self, others: Vec<String>, cx: &mut Context<Self>) {
+        let Some((live, _, client)) = self.current_live() else {
+            return;
+        };
+        match live.answer(&others) {
+            Ok(command) => {
+                live.error = None;
+                self.dispatch(client, command, cx);
+            }
+            Err(message) => live.error = Some(message),
+        }
+        cx.notify();
+    }
+
     pub fn cancel_bypass(&mut self, cx: &mut Context<Self>) {
         self.bypass_armed = false;
         cx.notify();
@@ -2075,18 +2097,30 @@ impl Shell {
         });
         let questions = action.questions.clone().unwrap_or_default();
         let asking = !questions.is_empty();
-        let picks = self
+        let live = self
             .live
             .iter()
-            .find(|live| live.action.as_ref().map(|a| &a.request_id) == Some(&action.request_id))
-            .map(|live| live.picks.clone())
-            .unwrap_or_default();
-        let answered = (0..questions.len()).all(|ix| picks.get(ix).is_some_and(|p| !p.is_empty()));
+            .find(|live| live.action.as_ref().map(|a| &a.request_id) == Some(&action.request_id));
+        let picks = live.map(|live| live.picks.clone()).unwrap_or_default();
+        let others = live.map(|live| live.others.clone()).unwrap_or_default();
+        let answered = live.is_some_and(LiveSession::answered);
+        // “其他”输入框跟着这次提问走，换一次提问就是新的输入框。
+        let other_inputs: Vec<Entity<InputState>> = (0..questions.len())
+            .map(|ix| {
+                window.use_keyed_state(
+                    SharedString::from(format!("question-other-{}-{ix}", action.request_id)),
+                    cx,
+                    |window, cx| InputState::new(window, cx).placeholder("输入你的答案"),
+                )
+            })
+            .collect();
         let question_rows: Vec<_> = questions
             .into_iter()
             .enumerate()
             .map(|(ix, question)| {
                 let chosen = picks.get(ix).cloned().unwrap_or_default();
+                let other = others.get(ix).copied().unwrap_or(false);
+                let other_input = other_inputs[ix].clone();
                 v_flex()
                     .gap_1p5()
                     .child(
@@ -2130,9 +2164,31 @@ impl Shell {
                                     .on_click(cx.listener(move |shell, _, _, cx| {
                                         shell.toggle_pick(ix, &label, cx)
                                     }))
-                                }),
+                                })
+                                .chain(std::iter::once(
+                                    Button::new(SharedString::from(format!("question-{ix}-other")))
+                                        .small()
+                                        .when(other, |button| button.primary())
+                                        .when(!other, |button| button.outline())
+                                        .label("其他")
+                                        .on_click(cx.listener(move |shell, _, _, cx| {
+                                            shell.toggle_other(ix, cx)
+                                        })),
+                                )),
                         ),
                     )
+                    .when(other, |row| {
+                        row.child(
+                            div()
+                                .w_full()
+                                .px_2()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .bg(cx.theme().secondary)
+                                .child(Input::new(&other_input).appearance(false)),
+                        )
+                    })
             })
             .collect();
         let theme = cx.theme();
@@ -2241,8 +2297,16 @@ impl Shell {
                                 "允许"
                             })
                             .disabled(asking && !answered)
-                            .on_click(cx.listener(|shell, _, window, cx| {
-                                shell.decide(true, false, window, cx)
+                            .on_click(cx.listener(move |shell, _, window, cx| {
+                                if asking {
+                                    let texts = other_inputs
+                                        .iter()
+                                        .map(|input| input.read(cx).value().to_string())
+                                        .collect();
+                                    shell.submit_answers(texts, cx);
+                                } else {
+                                    shell.decide(true, false, window, cx);
+                                }
                             })),
                     ),
             )

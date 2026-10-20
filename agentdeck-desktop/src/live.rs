@@ -107,6 +107,8 @@ pub struct LiveSession {
     pub mode: ClaudeCodePermissionMode,
     /// 待决提问每题已选的选项标签。
     pub picks: Vec<Vec<String>>,
+    /// 待决提问每题是否选了“其他”（自由输入）。
+    pub others: Vec<bool>,
 }
 
 impl LiveSession {
@@ -121,7 +123,43 @@ impl LiveSession {
             error: None,
             mode: ClaudeCodePermissionMode::Default,
             picks: Vec::new(),
+            others: Vec::new(),
         }
+    }
+
+    fn question_is_multi(&self, question: usize) -> Option<bool> {
+        self.action
+            .as_ref()?
+            .questions
+            .as_ref()?
+            .get(question)
+            .map(|asked| asked.multi_select)
+    }
+
+    /// 单选题选“其他”会清掉已选选项；多选题与选项并存。
+    pub fn toggle_other(&mut self, question: usize) {
+        let Some(multi) = self.question_is_multi(question) else {
+            return;
+        };
+        let (Some(other), Some(picks)) =
+            (self.others.get_mut(question), self.picks.get_mut(question))
+        else {
+            return;
+        };
+        if multi {
+            *other = !*other;
+        } else {
+            *other = true;
+            picks.clear();
+        }
+    }
+
+    /// 每题都有选择（选项或“其他”）才算答完。
+    pub fn answered(&self) -> bool {
+        self.picks
+            .iter()
+            .zip(&self.others)
+            .all(|(picks, other)| !picks.is_empty() || *other)
     }
 
     /// 单选题点选即替换，多选题点选即切换。
@@ -135,9 +173,14 @@ impl LiveSession {
             return;
         };
         let multi = asked.multi_select;
-        let Some(picks) = self.picks.get_mut(question) else {
+        let (Some(picks), Some(other)) =
+            (self.picks.get_mut(question), self.others.get_mut(question))
+        else {
             return;
         };
+        if !multi {
+            *other = false;
+        }
         match picks.iter().position(|pick| pick == label) {
             Some(index) if multi => {
                 picks.remove(index);
@@ -148,22 +191,44 @@ impl LiveSession {
         }
     }
 
-    /// 每题都选了才能提交；多选按选项原顺序用 ", " 连接。
-    pub fn answers(&self) -> Option<std::collections::BTreeMap<String, String>> {
-        let questions = self.action.as_ref()?.questions.as_ref()?;
-        questions
-            .iter()
-            .zip(&self.picks)
-            .map(|(question, picks)| {
-                let chosen: Vec<&str> = question
-                    .options
-                    .iter()
-                    .map(|option| option.label.as_str())
-                    .filter(|label| picks.iter().any(|pick| pick == label))
-                    .collect();
-                (!chosen.is_empty()).then(|| (question.question.clone(), chosen.join(", ")))
-            })
-            .collect()
+    /// 作答：每题的选项按原顺序，加上“其他”里填的文字，用 ", " 连接。
+    /// `others` 是各题“其他”输入框的内容；有题没答或“其他”没填时返回给用户看的提示。
+    pub fn answer(&mut self, others: &[String]) -> Result<ClientCommand, String> {
+        let session_id = self.session_id.clone().ok_or("会话已结束")?;
+        let action = self.action.as_ref().ok_or("没有待回答的问题")?;
+        let questions = action.questions.as_ref().ok_or("没有待回答的问题")?;
+        let mut answers = std::collections::BTreeMap::new();
+        for (ix, question) in questions.iter().enumerate() {
+            let picks = self.picks.get(ix).map(Vec::as_slice).unwrap_or_default();
+            let mut chosen: Vec<String> = question
+                .options
+                .iter()
+                .filter(|option| picks.contains(&option.label))
+                .map(|option| option.label.clone())
+                .collect();
+            if self.others.get(ix).copied().unwrap_or(false) {
+                let text = others.get(ix).map(|text| text.trim()).unwrap_or_default();
+                if text.is_empty() {
+                    return Err(format!("“{}”选了其他，请填写内容", question.question));
+                }
+                chosen.push(text.to_string());
+            }
+            if chosen.is_empty() {
+                return Err(format!("还没回答“{}”", question.question));
+            }
+            answers.insert(question.question.clone(), chosen.join(", "));
+        }
+        let request = self.action.take().expect("checked above");
+        Ok(ClientCommand::ActionDecision {
+            session_id,
+            decision: ActionDecision {
+                request_id: request.request_id,
+                decision: ActionDecisionKind::Approve,
+                persist: false,
+                message: None,
+                answers: Some(answers),
+            },
+        })
     }
 
     /// 登记一轮并返回要发给 daemon 的命令：会话没开就带 initial turn 续上原 thread。
@@ -226,8 +291,8 @@ impl LiveSession {
         persist: bool,
         message: Option<String>,
     ) -> Option<ClientCommand> {
-        let answers = if approve { self.answers() } else { None };
-        if approve && self.action.as_ref()?.questions.is_some() && answers.is_none() {
+        // 提问的“提交”走 `answer`，这里只处理批准/拒绝和跳过提问。
+        if approve && self.action.as_ref()?.questions.is_some() {
             return None;
         }
         let request = self.action.take()?;
@@ -242,7 +307,7 @@ impl LiveSession {
                 },
                 persist,
                 message,
-                answers,
+                answers: None,
             },
         })
     }
@@ -281,7 +346,9 @@ impl LiveSession {
                 }
             }
             ServerEvent::ActionRequest { request, .. } => {
-                self.picks = vec![Vec::new(); request.questions.as_ref().map_or(0, Vec::len)];
+                let count = request.questions.as_ref().map_or(0, Vec::len);
+                self.picks = vec![Vec::new(); count];
+                self.others = vec![false; count];
                 self.action = Some(request);
             }
             ServerEvent::VendorPanelEvent {
@@ -540,22 +607,37 @@ mod tests {
             },
         });
         live.toggle_pick(0, "红");
-        live.toggle_pick(0, "蓝");
+        live.toggle_other(0);
         assert!(
-            live.decide(true, false, None).is_none(),
-            "fruit is unanswered"
+            live.picks[0].is_empty(),
+            "single select: other replaces the option"
         );
+        live.toggle_pick(0, "蓝");
+        assert!(!live.others[0], "single select: an option replaces other");
+        assert!(!live.answered());
+        assert!(live.answer(&[]).unwrap_err().contains("水果"));
+
         live.toggle_pick(1, "橙子");
         live.toggle_pick(1, "香蕉");
         live.toggle_pick(1, "苹果");
         live.toggle_pick(1, "香蕉");
-        let Some(ClientCommand::ActionDecision { decision, .. }) = live.decide(true, false, None)
+        live.toggle_other(1);
+        assert!(live.answered());
+        assert!(
+            live.answer(&["".into(), "  ".into()])
+                .unwrap_err()
+                .contains("其他"),
+            "an empty other is rejected"
+        );
+        let Ok(ClientCommand::ActionDecision { decision, .. }) =
+            live.answer(&["".into(), " 芒果 ".into()])
         else {
             panic!("every question is answered");
         };
         let answers = decision.answers.unwrap();
         assert_eq!(answers["颜色"], "蓝");
-        assert_eq!(answers["水果"], "苹果, 橙子");
+        assert_eq!(answers["水果"], "苹果, 橙子, 芒果");
+        assert!(live.action.is_none());
     }
 
     #[test]
