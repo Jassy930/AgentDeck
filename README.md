@@ -85,7 +85,7 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
 当前明确不包含：
 
 - vendor 控制面板。
-- 用户消息中注入上下文块（如 `<system-reminder>`）的识别与折叠、会话正文全文搜索与按项目分组。
+- 会话正文全文搜索与按项目分组。
 - daemon 网络监听和配对流程。
 - 对旧 AppKit 界面或行为的兼容层。
 

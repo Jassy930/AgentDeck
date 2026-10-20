@@ -321,16 +321,36 @@ fn scan_session(path: &Path) -> (Option<String>, Option<PathBuf>) {
                 }
             }
             "user" if first_user.is_none() && !is_injected(&v) => {
-                if let Some(s) = v
-                    .get("message")
-                    .and_then(|m| m.get("content"))
+                let content = v.get("message").and_then(|m| m.get("content"));
+                first_user = content
                     .and_then(Value::as_str)
+                    .into_iter()
+                    .chain(
+                        content
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter(|block| {
+                                block.get("type").and_then(Value::as_str) == Some("text")
+                            })
+                            .filter_map(|block| block.get("text").and_then(Value::as_str)),
+                    )
                     // Slash/bash command echoes are not a usable title.
-                    .filter(|s| !s.trim_start().starts_with('<'))
-                {
-                    let snippet: String = s.chars().take(80).collect();
-                    first_user = Some(snippet);
-                }
+                    .filter(|s| {
+                        !split_command_caveat(s)
+                            .map_or(*s, |(_, rest)| rest)
+                            .trim_start()
+                            .starts_with('<')
+                    })
+                    .flat_map(|s| user_items(s, false))
+                    .find_map(|item| match item {
+                        AgentItem::UserMessage { text, meta }
+                            if !meta.vendor_extensions.contains_key(CONTEXT_KIND_KEY) =>
+                        {
+                            Some(text.chars().take(80).collect())
+                        }
+                        _ => None,
+                    });
             }
             _ => {}
         }
@@ -347,6 +367,22 @@ fn is_injected(v: &Value) -> bool {
         .any(|k| v.get(*k).and_then(Value::as_bool).unwrap_or(false))
 }
 
+fn split_command_caveat(text: &str) -> Option<(&str, &str)> {
+    text.trim_start()
+        .strip_prefix("<local-command-caveat>")?
+        .split_once("</local-command-caveat>")
+}
+
+fn user_items(raw: &str, injected: bool) -> Vec<AgentItem> {
+    if let Some((caveat, rest)) = split_command_caveat(raw) {
+        return context_item("context", caveat)
+            .into_iter()
+            .chain(user_item(rest.trim(), injected))
+            .collect();
+    }
+    user_item(raw, injected).into_iter().collect()
+}
+
 /// Map a CC user line to a neutral item. What the user typed stays a plain
 /// `UserMessage` (slash commands as `/name args`, `!` shell as `! cmd`); CLI
 /// echoes and injected context carry [`CONTEXT_KIND_KEY`] so clients fold them.
@@ -354,9 +390,6 @@ fn user_item(raw: &str, injected: bool) -> Option<AgentItem> {
     let text = raw.trim();
     if text.is_empty() {
         return None;
-    }
-    if text.starts_with("<local-command-caveat>") {
-        return context_item("context", tag_inner(text, "local-command-caveat")?);
     }
     if text.starts_with("<task-notification>") {
         let body: Vec<&str> = ["summary", "result"]
@@ -443,8 +476,8 @@ fn unwrap_tag(text: &str) -> &str {
     else {
         return text;
     };
-    match tag_inner(text, tag) {
-        Some(inner) if text.ends_with(&format!("</{tag}>")) => inner,
+    match text[tag.len() + 2..].split_once(&format!("</{tag}>")) {
+        Some((inner, "")) => inner.trim(),
         _ => text,
     }
 }
@@ -573,7 +606,7 @@ pub fn parse_session_jsonl(
                 let content_val = v.get("message").and_then(|m| m.get("content"));
                 let injected = is_injected(&v);
                 if let Some(text) = content_val.and_then(Value::as_str) {
-                    if let Some(item) = user_item(text, injected) {
+                    for item in user_items(text, injected) {
                         push_user_item(item, &mut current, &mut turns);
                     }
                 } else if let Some(arr) = content_val.and_then(Value::as_array) {
@@ -601,12 +634,10 @@ pub fn parse_session_jsonl(
                             }
                         } else if block.get("type").and_then(Value::as_str) == Some("text") {
                             // Plain user prompt that arrived as a block array.
-                            if let Some(item) = block
-                                .get("text")
-                                .and_then(Value::as_str)
-                                .and_then(|t| user_item(t, injected))
-                            {
-                                push_user_item(item, &mut current, &mut turns);
+                            if let Some(text) = block.get("text").and_then(Value::as_str) {
+                                for item in user_items(text, injected) {
+                                    push_user_item(item, &mut current, &mut turns);
+                                }
                             }
                         }
                     }
@@ -1436,6 +1467,63 @@ mod tests {
             Some("why does <command-name> leak")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mixed_caveat_keeps_context_user_text_and_title() {
+        let raw = "<local-command-caveat>Caveat: x</local-command-caveat>\n\n请继续处理剩下的问题";
+        for content in [
+            serde_json::json!(raw),
+            serde_json::json!([{ "type": "text", "text": raw }]),
+        ] {
+            let jsonl = serde_json::json!({
+                "type": "user",
+                "message": { "role": "user", "content": content },
+            })
+            .to_string();
+            let response = parse_session_jsonl(&jsonl, ThreadId("mixed".into())).unwrap();
+            let items: Vec<_> = response.turns.iter().flat_map(|turn| &turn.items).collect();
+            assert_eq!(items.len(), 2, "caveat 和真实正文都必须保留");
+            assert!(matches!(items[0], AgentItem::UserMessage { text, meta }
+                if text == "Caveat: x" && meta.vendor_extensions[CONTEXT_KIND_KEY] == "context"));
+            assert!(matches!(items[1], AgentItem::UserMessage { text, meta }
+                if text == "请继续处理剩下的问题" && !meta.vendor_extensions.contains_key(CONTEXT_KIND_KEY)));
+
+            let dir = tempdir_unique();
+            let path = dir.join("mixed.jsonl");
+            std::fs::write(&path, jsonl).unwrap();
+            assert_eq!(
+                scan_session(&path).0.as_deref(),
+                Some("请继续处理剩下的问题")
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn folded_context_and_command_output_preserve_sibling_tags() {
+        let siblings =
+            "<system-reminder>first</system-reminder>\n<system-reminder>second</system-reminder>";
+        for (raw, injected, kind) in [
+            (siblings.to_string(), true, "context"),
+            (
+                format!("<local-command-stdout>{siblings}</local-command-stdout>"),
+                false,
+                "output",
+            ),
+        ] {
+            assert!(
+                matches!(user_item(&raw, injected), Some(AgentItem::UserMessage { text, meta })
+                if text == siblings && meta.vendor_extensions[CONTEXT_KIND_KEY] == kind)
+            );
+        }
+        assert_eq!(
+            unwrap_tag("<system-reminder> note </system-reminder>"),
+            "note"
+        );
+        let nested =
+            "<system-reminder>first<system-reminder>second</system-reminder>end</system-reminder>";
+        assert_eq!(unwrap_tag(nested), nested);
     }
 
     #[test]
