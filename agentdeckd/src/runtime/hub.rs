@@ -410,16 +410,8 @@ impl RuntimeHub {
             ClientCommand::SessionStart(start) => {
                 let _ = lifecycle_tx.send(ClientCommand::SessionStart(start));
             }
-            ClientCommand::TurnStart {
-                session_id,
-                turn_id,
-                prompt,
-            } => {
-                let _ = lifecycle_tx.send(ClientCommand::TurnStart {
-                    session_id,
-                    turn_id,
-                    prompt,
-                });
+            command @ ClientCommand::TurnStart { .. } => {
+                let _ = lifecycle_tx.send(command);
             }
             ClientCommand::TurnCancel {
                 session_id,
@@ -557,13 +549,17 @@ async fn lifecycle_worker(
                 session_id,
                 turn_id,
                 prompt,
+                images,
             } => {
                 if closing.contains(&session_id)
                     || is_session_retiring(&retiring_sessions, &session_id).await
                 {
                     continue;
                 }
-                if let Err(error) = router.start_turn(&session_id, turn_id, prompt).await {
+                if let Err(error) = router
+                    .start_turn(&session_id, turn_id, prompt, images)
+                    .await
+                {
                     send_lifecycle_error(&events_tx, &retiring_sessions, session_id, error).await;
                 }
             }
@@ -2028,6 +2024,7 @@ mod tests {
                 session_id: session_id.clone(),
                 turn_id: TurnId("after-terminal".into()),
                 prompt: "must be ignored".into(),
+                images: Vec::new(),
             },
         )
         .await;
@@ -2695,6 +2692,7 @@ mod tests {
                 _: &SessionId,
                 _: TurnId,
                 _: String,
+                _: Vec<ImageAttachment>,
             ) -> Result<(), ProtocolError> {
                 self.block("turnStart").await;
                 Ok(())
@@ -2811,6 +2809,7 @@ mod tests {
                     session_id: session_id.clone(),
                     turn_id: TurnId("slow-turn".into()),
                     prompt: "hello".into(),
+                    images: Vec::new(),
                 },
             ),
             (
@@ -2869,6 +2868,7 @@ mod tests {
                 session_id: session_id.clone(),
                 turn_id: TurnId("after-close".into()),
                 prompt: "must fail".into(),
+                images: Vec::new(),
             },
         )
         .await;

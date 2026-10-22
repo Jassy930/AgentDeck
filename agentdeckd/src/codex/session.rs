@@ -14,9 +14,9 @@ use crate::codex::capabilities::build_codex_capabilities;
 use crate::codex::translate::CodexTranslator;
 use crate::diag::{self, DiagnosticEvent};
 use agentdeck_protocol::{
-    AgentKind, CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode, InitialTurn,
-    ProtocolError, ServerEvent, SessionId, SessionOutcome, SessionStart, ThreadId, TurnId,
-    TurnNextState, TurnOutcome, TurnSummary,
+    AgentKind, CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode, ImageAttachment,
+    InitialTurn, ProtocolError, ServerEvent, SessionId, SessionOutcome, SessionStart, ThreadId,
+    TurnId, TurnNextState, TurnOutcome, TurnSummary, valid_turn_input,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -46,6 +46,7 @@ pub(crate) enum SessionCommand {
     StartTurn {
         turn_id: TurnId,
         prompt: String,
+        images: Vec<ImageAttachment>,
         reply: CommandReply,
     },
     CancelTurn {
@@ -730,9 +731,10 @@ impl RunningOwner {
             SessionCommand::StartTurn {
                 turn_id,
                 prompt,
+                images,
                 reply,
             } => {
-                let result = self.accept_turn(connection, turn_id, prompt).await;
+                let result = self.accept_turn(connection, turn_id, prompt, images).await;
                 match result {
                     Ok(()) => {
                         let _ = reply.send(Ok(()));
@@ -1075,7 +1077,12 @@ impl RunningOwner {
                 self.diagnostic("codex_session_ready", json!({}));
                 if let Some(initial_turn) = self.initial_turn.take() {
                     if let Err(error) = self
-                        .accept_turn(connection, initial_turn.turn_id, initial_turn.prompt)
+                        .accept_turn(
+                            connection,
+                            initial_turn.turn_id,
+                            initial_turn.prompt,
+                            initial_turn.images,
+                        )
                         .await
                     {
                         return Some(self.fatal(error).await);
@@ -1273,6 +1280,7 @@ impl RunningOwner {
         connection: &mut OpenedAppServer,
         turn_id: TurnId,
         prompt: String,
+        images: Vec<ImageAttachment>,
     ) -> Result<(), ProtocolError> {
         if self.turn.is_some() {
             return Err(ProtocolError {
@@ -1288,10 +1296,10 @@ impl RunningOwner {
                 diagnostic_ref: None,
             });
         }
-        if turn_id.0.trim().is_empty() || prompt.trim().is_empty() {
+        if turn_id.0.trim().is_empty() || !valid_turn_input(&prompt, &images) {
             return Err(ProtocolError {
                 code: "invalid-turn".into(),
-                message: "turnId and prompt must be non-empty".into(),
+                message: "turn needs a turnId and text or supported images".into(),
                 diagnostic_ref: None,
             });
         }
@@ -1330,7 +1338,7 @@ impl RunningOwner {
             PendingKind::TurnStart,
             json!({
                 "threadId": thread_id.0,
-                "input": [{ "type": "text", "text": prompt }],
+                "input": codex_input(&prompt, &images),
                 "effort": reasoning_effort_str(CodexReasoningEffort::Medium),
             }),
         )
@@ -1701,6 +1709,18 @@ fn with_diagnostic_ref(mut error: ProtocolError, session_id: &SessionId) -> Prot
     error
 }
 
+/// app-server 的 `UserInput`：文字在前，图片以 data URL 跟在后面。
+fn codex_input(prompt: &str, images: &[ImageAttachment]) -> Value {
+    let mut input = Vec::new();
+    if !prompt.trim().is_empty() {
+        input.push(json!({ "type": "text", "text": prompt }));
+    }
+    input.extend(images.iter().map(|image| {
+        json!({ "type": "image", "url": format!("data:{};base64,{}", image.media_type, image.data) })
+    }));
+    Value::Array(input)
+}
+
 fn reasoning_effort_str(effort: CodexReasoningEffort) -> &'static str {
     match effort {
         CodexReasoningEffort::Minimal => "minimal",
@@ -1750,6 +1770,22 @@ async fn read_line(reader: &mut BufReader<BoxReader>) -> Result<Option<Value>, P
 mod tests {
     use super::*;
     use agentdeck_protocol::{CodexSessionOptions, RuntimeOptions, VendorSessionOptions};
+
+    #[test]
+    fn codex_input_appends_images_as_data_urls() {
+        let png = ImageAttachment {
+            media_type: "image/png".into(),
+            data: "AAAA".into(),
+        };
+        assert_eq!(
+            codex_input("看图", std::slice::from_ref(&png)),
+            json!([
+                {"type": "text", "text": "看图"},
+                {"type": "image", "url": "data:image/png;base64,AAAA"},
+            ])
+        );
+        assert_eq!(codex_input("", &[png]).as_array().unwrap().len(), 1);
+    }
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, DuplexStream, duplex};
@@ -2139,6 +2175,7 @@ mod tests {
         let mut request = start(Some(InitialTurn {
             turn_id: TurnId("turn-1".into()),
             prompt: "first".into(),
+            images: Vec::new(),
         }));
         request.session_id = SessionId(run_id.clone());
         let owner = CodexSessionOwner::new(request, events_tx, commands_rx, factory.clone());
@@ -2225,6 +2262,7 @@ mod tests {
             .send(SessionCommand::StartTurn {
                 turn_id: TurnId("turn-1".into()),
                 prompt: "duplicate".into(),
+                images: Vec::new(),
                 reply: reply_tx,
             })
             .await
@@ -2237,6 +2275,7 @@ mod tests {
             .send(SessionCommand::StartTurn {
                 turn_id: TurnId("turn-2".into()),
                 prompt: "second".into(),
+                images: Vec::new(),
                 reply: reply_tx,
             })
             .await
@@ -2431,6 +2470,7 @@ mod tests {
                     .send(SessionCommand::StartTurn {
                         turn_id: TurnId("turn-during-open".into()),
                         prompt: "must not start".into(),
+                        images: Vec::new(),
                         reply: reply_tx,
                     })
                     .await
@@ -2524,6 +2564,7 @@ mod tests {
             .send(SessionCommand::StartTurn {
                 turn_id: TurnId("turn-during-stop".into()),
                 prompt: "must not wait for cleanup".into(),
+                images: Vec::new(),
                 reply: reply_tx,
             })
             .await
@@ -2635,6 +2676,7 @@ mod tests {
             start(Some(InitialTurn {
                 turn_id: TurnId("turn-cancel".into()),
                 prompt: "cancel me".into(),
+                images: Vec::new(),
             })),
             events_tx,
             commands_rx,
@@ -2729,6 +2771,7 @@ mod tests {
             .send(SessionCommand::StartTurn {
                 turn_id: TurnId("turn-after-cancel".into()),
                 prompt: "second".into(),
+                images: Vec::new(),
                 reply: reply_tx,
             })
             .await
@@ -2778,6 +2821,7 @@ mod tests {
             start(Some(InitialTurn {
                 turn_id: TurnId("turn-cancel-race".into()),
                 prompt: "cancel me".into(),
+                images: Vec::new(),
             })),
             events_tx,
             commands_rx,
@@ -2882,6 +2926,7 @@ mod tests {
             .send(SessionCommand::StartTurn {
                 turn_id: TurnId("turn-after-race".into()),
                 prompt: "second".into(),
+                images: Vec::new(),
                 reply: reply_tx,
             })
             .await
@@ -2932,6 +2977,7 @@ mod tests {
             start(Some(InitialTurn {
                 turn_id: TurnId("turn-close".into()),
                 prompt: "close me".into(),
+                images: Vec::new(),
             })),
             events_tx,
             commands_rx,
@@ -3014,6 +3060,7 @@ mod tests {
             start(Some(InitialTurn {
                 turn_id: TurnId("turn-close-race".into()),
                 prompt: "close me".into(),
+                images: Vec::new(),
             })),
             events_tx,
             commands_rx,
@@ -3114,6 +3161,7 @@ mod tests {
             start(Some(InitialTurn {
                 turn_id: TurnId("turn-close-timeout".into()),
                 prompt: "close me".into(),
+                images: Vec::new(),
             })),
             events_tx,
             commands_rx,
@@ -3196,6 +3244,7 @@ mod tests {
             start(Some(InitialTurn {
                 turn_id: TurnId("turn-cancel-timeout".into()),
                 prompt: "cancel me".into(),
+                images: Vec::new(),
             })),
             events_tx,
             commands_rx,
@@ -3281,6 +3330,7 @@ mod tests {
             start(Some(InitialTurn {
                 turn_id: TurnId("turn-active".into()),
                 prompt: "first".into(),
+                images: Vec::new(),
             })),
             events_tx,
             commands_rx,
@@ -3336,6 +3386,7 @@ mod tests {
             .send(SessionCommand::StartTurn {
                 turn_id: TurnId("turn-rejected".into()),
                 prompt: "second".into(),
+                images: Vec::new(),
                 reply: reply_tx,
             })
             .await
@@ -3439,6 +3490,7 @@ mod tests {
             start(Some(InitialTurn {
                 turn_id: TurnId("turn-malformed".into()),
                 prompt: "hello".into(),
+                images: Vec::new(),
             })),
             events_tx,
             commands_rx,
@@ -3511,6 +3563,7 @@ mod tests {
             start(Some(InitialTurn {
                 turn_id: TurnId("turn-unmatched".into()),
                 prompt: "hello".into(),
+                images: Vec::new(),
             })),
             events_tx,
             commands_rx,
@@ -3727,6 +3780,7 @@ mod tests {
             start(Some(InitialTurn {
                 turn_id: TurnId("turn-eof".into()),
                 prompt: "hello".into(),
+                images: Vec::new(),
             })),
             events_tx,
             commands_rx,
@@ -3792,6 +3846,7 @@ mod tests {
             start(Some(InitialTurn {
                 turn_id: TurnId("turn-request".into()),
                 prompt: "hello".into(),
+                images: Vec::new(),
             })),
             events_tx,
             commands_rx,

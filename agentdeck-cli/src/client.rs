@@ -485,6 +485,7 @@ pub fn turn_start_cmd(session_id: String, turn_id: String, prompt: String) -> Cl
         session_id: SessionId(session_id),
         turn_id: TurnId(turn_id),
         prompt,
+        images: Vec::new(),
     }
 }
 
@@ -518,6 +519,7 @@ fn session_start_or_resume_cmd(
         initial_turn: Some(InitialTurn {
             turn_id: TurnId(next_cli_id("turn")),
             prompt,
+            images: Vec::new(),
         }),
         vendor_options,
         runtime_options: Default::default(),

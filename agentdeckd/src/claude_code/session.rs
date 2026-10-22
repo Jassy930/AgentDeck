@@ -21,8 +21,9 @@
 use crate::agent::{AgentEventSender, AgentSessionExit};
 use crate::claude_code::translate::{ClaudeCodeTranslator, PermissionRoute};
 use agentdeck_protocol::{
-    ActionDecision, ActionDecisionKind, AgentKind, ClaudeCodePermissionMode, ProtocolError,
-    ServerEvent, SessionId, SessionOutcome, ThreadId, TurnId, TurnNextState, TurnOutcome,
+    ActionDecision, ActionDecisionKind, AgentKind, ClaudeCodePermissionMode, ImageAttachment,
+    InitialTurn, ProtocolError, ServerEvent, SessionId, SessionOutcome, ThreadId, TurnId,
+    TurnNextState, TurnOutcome,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -42,6 +43,7 @@ pub(crate) enum SessionCommand {
     StartTurn {
         turn_id: TurnId,
         prompt: String,
+        images: Vec<ImageAttachment>,
         reply: Reply,
     },
     CancelTurn {
@@ -65,7 +67,7 @@ pub(crate) struct OwnerStart {
     pub session_id: SessionId,
     pub thread_id: ThreadId,
     pub permission_mode: ClaudeCodePermissionMode,
-    pub initial_turn: Option<(TurnId, String)>,
+    pub initial_turn: Option<InitialTurn>,
 }
 
 /// Spawn the owner task for an already-spawned child (stdin/stdout/stderr
@@ -138,7 +140,7 @@ impl Owner {
         stdout: BufReader<tokio::process::ChildStdout>,
         mut stderr_tail: Option<tokio::task::JoinHandle<String>>,
         mut commands: mpsc::Receiver<SessionCommand>,
-        initial_turn: Option<(TurnId, String)>,
+        initial_turn: Option<InitialTurn>,
         exit: oneshot::Sender<AgentSessionExit>,
     ) {
         // `Child::id()` becomes None once an unexpected exit has been reaped.
@@ -150,9 +152,12 @@ impl Owner {
             .await
             .err();
         if failure.is_none()
-            && let Some((turn_id, prompt)) = initial_turn
+            && let Some(turn) = initial_turn
         {
-            failure = self.begin_turn(turn_id, prompt).await.err();
+            failure = self
+                .begin_turn(turn.turn_id, turn.prompt, turn.images)
+                .await
+                .err();
         }
 
         // Live phase: commands and CC output interleave.
@@ -237,9 +242,10 @@ impl Owner {
             SessionCommand::StartTurn {
                 turn_id,
                 prompt,
+                images,
                 reply,
             } => {
-                let _ = reply.send(self.begin_turn(turn_id, prompt).await);
+                let _ = reply.send(self.begin_turn(turn_id, prompt, images).await);
             }
             SessionCommand::CancelTurn { turn_id, reply } => {
                 let result = if self.active_turn.as_ref() != Some(&turn_id) {
@@ -276,7 +282,12 @@ impl Owner {
         }
     }
 
-    async fn begin_turn(&mut self, turn_id: TurnId, prompt: String) -> Result<(), ProtocolError> {
+    async fn begin_turn(
+        &mut self,
+        turn_id: TurnId,
+        prompt: String,
+        images: Vec<ImageAttachment>,
+    ) -> Result<(), ProtocolError> {
         if let Some(active) = &self.active_turn {
             return Err(error(
                 "turn-already-running",
@@ -285,7 +296,7 @@ impl Owner {
         }
         self.write_line(&json!({
             "type": "user",
-            "message": {"role": "user", "content": prompt},
+            "message": {"role": "user", "content": user_content(prompt, &images)},
         }))
         .await?;
         self.translator.set_turn_id(turn_id.clone());
@@ -531,6 +542,24 @@ fn reject(command: SessionCommand, code: &str, message: &str) {
     let _ = reply.send(Err(error(code, message)));
 }
 
+/// stream-json 用户消息内容：纯文字保持字符串，带图时改成 content block 数组。
+fn user_content(prompt: String, images: &[ImageAttachment]) -> Value {
+    if images.is_empty() {
+        return json!(prompt);
+    }
+    let mut blocks = Vec::new();
+    if !prompt.trim().is_empty() {
+        blocks.push(json!({"type": "text", "text": prompt}));
+    }
+    blocks.extend(images.iter().map(|image| {
+        json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": image.media_type, "data": image.data},
+        })
+    }));
+    Value::Array(blocks)
+}
+
 fn error(code: &str, message: impl Into<String>) -> ProtocolError {
     ProtocolError {
         code: code.into(),
@@ -640,6 +669,23 @@ done
         TurnId(id.into())
     }
 
+    #[test]
+    fn user_content_keeps_plain_text_and_adds_image_blocks() {
+        assert_eq!(user_content("hi".into(), &[]), json!("hi"));
+        let png = ImageAttachment {
+            media_type: "image/png".into(),
+            data: "AAAA".into(),
+        };
+        assert_eq!(
+            user_content("看图".into(), std::slice::from_ref(&png)),
+            json!([
+                {"type": "text", "text": "看图"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+            ])
+        );
+        assert_eq!(user_content(" ".into(), &[png])[0]["type"], "image");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn reaped_child_still_cleans_its_background_process_group() {
@@ -690,7 +736,11 @@ done
                 session_id: SessionId("s".into()),
                 thread_id: ThreadId("thread-x".into()),
                 permission_mode: ClaudeCodePermissionMode::Default,
-                initial_turn: Some((turn("t1"), "hello".into())),
+                initial_turn: Some(InitialTurn {
+                    turn_id: turn("t1"),
+                    prompt: "hello".into(),
+                    images: Vec::new(),
+                }),
             },
             events_tx,
             exit_tx,
@@ -712,6 +762,7 @@ done
         call(&commands, |reply| SessionCommand::StartTurn {
             turn_id: turn("t2"),
             prompt: "approve".into(),
+            images: Vec::new(),
             reply,
         })
         .await
@@ -764,6 +815,7 @@ done
         call(&commands, |reply| SessionCommand::StartTurn {
             turn_id: turn("t3"),
             prompt: "slow".into(),
+            images: Vec::new(),
             reply,
         })
         .await
@@ -775,6 +827,7 @@ done
             call(&commands, |reply| SessionCommand::StartTurn {
                 turn_id: turn("t4"),
                 prompt: "x".into(),
+                images: Vec::new(),
                 reply
             })
             .await
@@ -874,7 +927,11 @@ done
                 session_id: SessionId("s".into()),
                 thread_id: ThreadId("thread-x".into()),
                 permission_mode: ClaudeCodePermissionMode::Default,
-                initial_turn: Some((turn("t1"), "ask-me".into())),
+                initial_turn: Some(InitialTurn {
+                    turn_id: turn("t1"),
+                    prompt: "ask-me".into(),
+                    images: Vec::new(),
+                }),
             },
             events_tx,
             exit_tx,
@@ -924,7 +981,11 @@ done
                 session_id: SessionId("s".into()),
                 thread_id: ThreadId("thread-x".into()),
                 permission_mode: ClaudeCodePermissionMode::Default,
-                initial_turn: Some((turn("t1"), "hello".into())),
+                initial_turn: Some(InitialTurn {
+                    turn_id: turn("t1"),
+                    prompt: "hello".into(),
+                    images: Vec::new(),
+                }),
             },
             events_tx,
             exit_tx,

@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 agentdeck-protocol = { path = "../agentdeck-protocol" }
 async-channel = "2"
+base64 = "0.22"
 gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
 gpui-component = { version = "=0.5.1", features = ["tree-sitter-languages"] }
 markdown = "=1.0.0"

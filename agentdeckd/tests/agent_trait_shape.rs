@@ -87,7 +87,7 @@ async fn default_live_lifecycle_methods_return_structured_not_supported_errors()
     let turn_id = TurnId("legacy-turn".into());
 
     let start_error = agent
-        .start_turn(&session_id, turn_id.clone(), "hello".into())
+        .start_turn(&session_id, turn_id.clone(), "hello".into(), Vec::new())
         .await
         .unwrap_err();
     assert_eq!(start_error.code, "turn-start-not-supported");

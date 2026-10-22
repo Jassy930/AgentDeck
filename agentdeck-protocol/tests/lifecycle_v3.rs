@@ -40,6 +40,7 @@ fn lifecycle_commands_round_trip() {
             session_id: SessionId("session-1".into()),
             turn_id: TurnId("turn-1".into()),
             prompt: "hello".into(),
+            images: Vec::new(),
         }),
         ClientCommand::TurnStart { .. }
     ));

@@ -6,15 +6,19 @@
 
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::Arc;
 
 mod markdown_fallback;
 
+use base64::{Engine, prelude::BASE64_STANDARD};
+
 use agentdeck_protocol::{
-    AgentItem, AgentKind, CONTEXT_KIND_KEY, HistoryTurn, PlanStepStatus, ShellStatus,
+    AgentItem, AgentKind, CONTEXT_KIND_KEY, HistoryTurn, ImageAttachment, PlanStepStatus,
+    ShellStatus,
 };
 use gpui::{
-    ClipboardItem, ElementId, IntoElement, ListOffset, ListState, ParentElement, SharedString,
-    Window, div, list, prelude::*, px, relative,
+    ClipboardItem, ElementId, Image, ImageFormat, IntoElement, ListOffset, ListState, ObjectFit,
+    ParentElement, SharedString, Window, div, img, list, prelude::*, px, relative,
 };
 use gpui_component::{
     ActiveTheme, Icon, Sizable, StyledExt,
@@ -53,6 +57,8 @@ pub struct Block {
     pub group: Option<(usize, usize)>,
     /// 只存于组首块，避免滚动时重新统计整个组。
     group_summary: Option<(SharedString, usize)>,
+    /// 用户消息随轮发出的图片；只有本次打开后发出的轮次才有，历史重读不回显图片。
+    pub images: Vec<Arc<Image>>,
 }
 
 impl Block {
@@ -74,6 +80,7 @@ impl Block {
             failed: false,
             group: None,
             group_summary: None,
+            images: Vec::new(),
         }
     }
 
@@ -89,6 +96,7 @@ impl Block {
             failed: false,
             group: None,
             group_summary: None,
+            images: Vec::new(),
         }
     }
 
@@ -108,7 +116,7 @@ fn status_tail(state: Option<String>, duration_ms: Option<u64>) -> Option<Shared
 
 pub fn describe(item: &AgentItem) -> Block {
     match item {
-        AgentItem::UserMessage { text, meta } => {
+        AgentItem::UserMessage { text, images, meta } => {
             match meta
                 .vendor_extensions
                 .get(CONTEXT_KIND_KEY)
@@ -132,7 +140,10 @@ pub fn describe(item: &AgentItem) -> Block {
                         )
                     }
                 }
-                None => Block::message("你", text, false),
+                None => Block {
+                    images: decode_images(images),
+                    ..Block::message("你", text, false)
+                },
             }
         }
         AgentItem::AssistantMessage { text, .. } => Block::message("助手", text, true),
@@ -286,6 +297,18 @@ pub fn describe(item: &AgentItem) -> Block {
     }
 }
 
+/// 历史里内联的用户图片解码成可渲染的原图；解不开的静默跳过。
+fn decode_images(images: &[ImageAttachment]) -> Vec<Arc<Image>> {
+    images
+        .iter()
+        .filter_map(|image| {
+            let format = ImageFormat::from_mime_type(&image.media_type)?;
+            let bytes = BASE64_STANDARD.decode(&image.data).ok()?;
+            Some(Arc::new(Image::from_bytes(format, bytes)))
+        })
+        .collect()
+}
+
 /// 工具参数里最能代表这次调用的字段，放进折叠摘要。
 fn arg_hint(args: &serde_json::Value) -> Option<String> {
     const KEYS: [&str; 9] = [
@@ -369,12 +392,20 @@ pub(crate) fn truncate(body: &str) -> String {
 }
 
 pub fn prepare(turns: Vec<HistoryTurn>) -> Vec<Block> {
+    prepare_live(turns.into_iter().map(|turn| (turn, Vec::new())).collect())
+}
+
+/// live 轮次：图片挂在每轮首条（用户输入）上，只发图片的空文字消息也保留。
+pub fn prepare_live(turns: Vec<(HistoryTurn, Vec<Arc<Image>>)>) -> Vec<Block> {
     let mut blocks = Vec::new();
-    for turn in turns {
+    for (turn, mut images) in turns {
         let mut previous_assistant = false;
         for item in turn.items {
             let mut block = describe(&item);
-            if block.is_empty() {
+            if !images.is_empty() {
+                block.images = std::mem::take(&mut images);
+            }
+            if block.is_empty() && block.images.is_empty() {
                 continue;
             }
             if block.summary.is_none() {
@@ -679,7 +710,18 @@ pub fn render(
                                 .border_1()
                                 .border_color(border)
                                 .text_sm()
-                                .child(body),
+                                .when(!block.images.is_empty(), |bubble| {
+                                    bubble.child(h_flex().flex_wrap().gap_2().mb_1().children(
+                                        block.images.iter().map(|image| {
+                                            img(image.clone())
+                                                .h(px(160.))
+                                                .max_w(px(320.))
+                                                .rounded_md()
+                                                .object_fit(ObjectFit::Contain)
+                                        }),
+                                    ))
+                                })
+                                .when(!block.body.is_empty(), |bubble| bubble.child(body)),
                         )
                         .into_any_element()
                 } else if block.markdown {
@@ -874,13 +916,14 @@ fn edge_fade(top: bool, cx: &gpui::App) -> gpui::Div {
 mod tests {
     use super::{
         BODY_LIMIT, Block, CONTEXT_KIND_KEY, VisibleRows, append, collapsed_indices, describe,
-        fence, is_binary, prepare, row_for_block, truncate,
+        fence, is_binary, prepare, prepare_live, row_for_block, truncate,
     };
     use agentdeck_protocol::{
         AgentItem, AgentItemMeta, HistoryTurn, PlanStep, PlanStepStatus, ShellStatus,
     };
-    use gpui::{ListAlignment, ListOffset, ListState, px};
+    use gpui::{Image, ListAlignment, ListOffset, ListState, px};
     use std::rc::Rc;
+    use std::sync::Arc;
 
     fn meta() -> AgentItemMeta {
         AgentItemMeta::default()
@@ -933,6 +976,7 @@ mod tests {
                 items: vec![
                     AgentItem::UserMessage {
                         text: " ".into(),
+                        images: Vec::new(),
                         meta: meta(),
                     },
                     assistant(),
@@ -949,7 +993,11 @@ mod tests {
 
     #[test]
     fn prepare_preserves_order_and_drops_empty_items() {
-        let message = |text: String| AgentItem::UserMessage { text, meta: meta() };
+        let message = |text: String| AgentItem::UserMessage {
+            images: Vec::new(),
+            text,
+            meta: meta(),
+        };
         let blocks = prepare(vec![
             HistoryTurn {
                 items: vec![message("  首条\n".into()), message(" \n\t".into())],
@@ -1128,6 +1176,7 @@ mod tests {
     fn consecutive_process_blocks_form_groups() {
         let user = |text: &str| AgentItem::UserMessage {
             text: text.into(),
+            images: Vec::new(),
             meta: meta(),
         };
         let think = |text: &str| AgentItem::Reasoning {
@@ -1179,11 +1228,13 @@ mod tests {
                 .insert(CONTEXT_KIND_KEY.into(), kind.into());
             describe(&AgentItem::UserMessage {
                 text: text.into(),
+                images: Vec::new(),
                 meta,
             })
         };
         let typed = describe(&AgentItem::UserMessage {
             text: "/model opus".into(),
+            images: Vec::new(),
             meta: meta(),
         });
         assert_eq!((typed.label, typed.summary), ("你", None));
@@ -1204,6 +1255,7 @@ mod tests {
     fn collapsed_groups_remove_hidden_rows_and_preserve_following_scroll_anchor() {
         let message = || AgentItem::UserMessage {
             text: "消息".into(),
+            images: Vec::new(),
             meta: meta(),
         };
         let process = || AgentItem::Reasoning {
@@ -1252,6 +1304,40 @@ mod tests {
     }
 
     #[test]
+    fn live_images_attach_to_the_prompt_even_without_text() {
+        let image = Arc::new(Image::from_bytes(gpui::ImageFormat::Png, b"png".to_vec()));
+        let turn = |text: &str| HistoryTurn {
+            items: vec![
+                AgentItem::UserMessage {
+                    text: text.into(),
+                    images: Vec::new(),
+                    meta: meta(),
+                },
+                AgentItem::AssistantMessage {
+                    text: "好".into(),
+                    meta: meta(),
+                },
+            ],
+        };
+        let blocks = prepare_live(vec![(turn(""), vec![image.clone()]), (turn("hi"), vec![])]);
+        let history = prepare(vec![HistoryTurn {
+            items: vec![AgentItem::UserMessage {
+                text: String::new(),
+                images: vec![agentdeck_protocol::ImageAttachment {
+                    media_type: "image/png".into(),
+                    data: "cG5n".into(),
+                }],
+                meta: meta(),
+            }],
+        }]);
+        assert_eq!(history.len(), 1, "image-only history prompt stays visible");
+        assert_eq!(history[0].images[0].bytes, b"png");
+        let labels: Vec<_> = blocks.iter().map(|b| (b.label, b.images.len())).collect();
+        assert_eq!(labels, [("你", 1), ("助手", 0), ("你", 0), ("助手", 0)]);
+        assert_eq!(blocks[0].images[0], image);
+    }
+
+    #[test]
     fn scroll_anchor_follows_block_across_regrouping() {
         // 块 3 原本单独成行，重算后并进了从 2 开始的组。
         assert_eq!(row_for_block(&[0, 1, 2, 3, 6], 3), 3);
@@ -1268,6 +1354,7 @@ mod tests {
         };
         let message = |text: &str| AgentItem::UserMessage {
             text: text.into(),
+            images: Vec::new(),
             meta: meta(),
         };
         let history: Rc<[Block]> = prepare(vec![HistoryTurn {

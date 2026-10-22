@@ -90,6 +90,29 @@ pub struct TurnId(pub String);
 pub struct InitialTurn {
     pub turn_id: TurnId,
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageAttachment>,
+}
+
+/// 随一轮发送的图片，base64 内联：远端机器经 ssh 连接，本地路径传过去没用。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImageAttachment {
+    /// `SUPPORTED_IMAGE_TYPES` 之一。
+    pub media_type: String,
+    /// 标准 base64（无 data: 前缀）。
+    pub data: String,
+}
+
+/// 两家 vendor 都接受的图片格式。
+pub const SUPPORTED_IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// 一轮至少要有文字或图片，图片格式必须受支持。
+pub fn valid_turn_input(prompt: &str, images: &[ImageAttachment]) -> bool {
+    (!prompt.trim().is_empty() || !images.is_empty())
+        && images.iter().all(|image| {
+            SUPPORTED_IMAGE_TYPES.contains(&image.media_type.as_str()) && !image.data.is_empty()
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -133,6 +156,9 @@ pub struct AgentItemMeta {
 pub enum AgentItem {
     UserMessage {
         text: String,
+        /// 用户随消息发送的图片（历史回放时由 vendor 记录内联带出）。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageAttachment>,
         #[serde(default)]
         meta: AgentItemMeta,
     },
@@ -561,6 +587,8 @@ pub enum ClientCommand {
         #[serde(rename = "turnId")]
         turn_id: TurnId,
         prompt: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageAttachment>,
     },
     TurnCancel {
         #[serde(rename = "sessionId")]

@@ -376,6 +376,7 @@ fn cli_live_record_append_and_close_failure_preserve_lifecycle() {
         session_id: SessionId("cli-live-m0".into()),
         turn_id: TurnId("turn-2".into()),
         prompt: "hello again".into(),
+        images: Vec::new(),
     });
     loop {
         let event = cli.next();

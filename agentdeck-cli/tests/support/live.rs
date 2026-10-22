@@ -139,6 +139,7 @@ pub fn session_start(cwd: &Path) -> ClientCommand {
         initial_turn: Some(InitialTurn {
             turn_id: TurnId("turn-1".into()),
             prompt: "Write three short sentences about trees. Do not use tools.".into(),
+            images: Vec::new(),
         }),
         vendor_options: VendorSessionOptions::Codex(CodexSessionOptions {
             approval_policy: CodexApprovalPolicy::Never,
@@ -166,6 +167,7 @@ pub fn four_turn_scenario(command: Command, root: &Path, timeout: Duration) {
                 session_id: SessionId("cli-live-m0".into()), turn_id: TurnId(turn_id.clone()),
                 prompt: if turn == 3 { "Write a long numbered list of 200 facts about trees, one sentence each. Start immediately. Do not use tools." }
                     else { "Write three short sentences about the ocean. Do not use tools." }.into(),
+                images: Vec::new(),
             });
         }
         let event = cli.next();

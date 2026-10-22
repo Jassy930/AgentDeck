@@ -5,8 +5,8 @@
 //! 方法，或 daemon 层。
 
 use agentdeck_protocol::{
-    ActionDecision, AgentKind, HistoryReply, HistoryRequest, ProtocolError, ServerEvent,
-    SessionCapabilities, SessionId, SessionOutcome, SessionStart, ThreadId, TurnId,
+    ActionDecision, AgentKind, HistoryReply, HistoryRequest, ImageAttachment, ProtocolError,
+    ServerEvent, SessionCapabilities, SessionId, SessionOutcome, SessionStart, ThreadId, TurnId,
     VendorControlPayload,
 };
 use std::sync::Arc;
@@ -115,6 +115,7 @@ pub trait Agent: Send + Sync + 'static {
         _session_id: &SessionId,
         _turn_id: TurnId,
         _prompt: String,
+        _images: Vec<ImageAttachment>,
     ) -> Result<(), ProtocolError> {
         Err(ProtocolError {
             code: "turn-start-not-supported".into(),

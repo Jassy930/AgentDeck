@@ -1,18 +1,21 @@
 //! 会话交互的 live 状态：在已读历史之后发出的轮次、运行中的 turn 和待决审批。
 //!
-//! 纯数据结构，不依赖 GPUI；Shell 负责把 daemon 事件按 sessionId 交给对应会话，
+//! 纯数据结构，只借用 `gpui::Image` 保存发出的图片原图；Shell 负责把 daemon 事件按 sessionId 交给对应会话，
 //! 再把 `turns()` 渲染在历史记录之后。
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentdeck_protocol::{
     ActionDecision, ActionDecisionKind, ActionRequest, AgentItem, AgentItemMeta,
     ClaudeCodePermissionMode, ClaudeCodeVendorPanelEvent, ClientCommand, HistoryListItem,
-    HistoryTurn, InitialTurn, ServerEvent, SessionCapabilities, SessionId, SessionStart, TurnId,
-    TurnOutcome, VendorPanelPayload,
+    HistoryTurn, ImageAttachment, InitialTurn, SUPPORTED_IMAGE_TYPES, ServerEvent,
+    SessionCapabilities, SessionId, SessionStart, TurnId, TurnOutcome, VendorPanelPayload,
 };
+use base64::{Engine, prelude::BASE64_STANDARD};
+use gpui::Image;
 
 use crate::session_router::SessionRouter;
 use crate::shell::SessionKey;
@@ -67,6 +70,8 @@ pub enum Activity {
 
 pub struct LiveTurn {
     prompt: String,
+    /// 随本轮发出的图片原图，记录里直接显示；同一个 Arc 保证滚动时不重复解码。
+    images: Vec<Arc<Image>>,
     /// 按 itemId upsert：流式快照和工具开始/完成共用同一个 id。
     items: Vec<(String, AgentItem)>,
     finished: bool,
@@ -321,6 +326,7 @@ impl LiveSession {
     pub fn send(
         &mut self,
         prompt: String,
+        images: Vec<(Arc<Image>, ImageAttachment)>,
         cwd: std::path::PathBuf,
         initial: Option<&SessionCapabilities>,
     ) -> Option<ClientCommand> {
@@ -335,8 +341,10 @@ impl LiveSession {
         let turn_id = TurnId(next_id("turn"));
         self.running = Some(turn_id.clone());
         self.error = None;
+        let (thumbnails, images): (Vec<_>, Vec<_>) = images.into_iter().unzip();
         self.turns.push(LiveTurn {
             prompt: prompt.clone(),
+            images: thumbnails,
             items: Vec::new(),
             finished: false,
         });
@@ -345,6 +353,7 @@ impl LiveSession {
                 session_id: session_id.clone(),
                 turn_id,
                 prompt,
+                images,
             });
         }
         let session_id = SessionId(next_id("session"));
@@ -357,7 +366,11 @@ impl LiveSession {
             agent_kind: *kind,
             cwd,
             resume_thread_id: self.draft.is_none().then(|| thread_id.clone()),
-            initial_turn: Some(InitialTurn { turn_id, prompt }),
+            initial_turn: Some(InitialTurn {
+                turn_id,
+                prompt,
+                images,
+            }),
             vendor_options: options?,
             runtime_options: Default::default(),
         }))
@@ -578,19 +591,44 @@ impl LiveSession {
             && self.turns.last().is_some_and(|turn| turn.items.is_empty())
     }
 
-    pub fn turns(&self) -> Vec<HistoryTurn> {
+    /// 每轮连同首条用户输入附带的图片。
+    pub fn turns(&self) -> Vec<(HistoryTurn, Vec<Arc<Image>>)> {
         self.turns
             .iter()
-            .map(|turn| HistoryTurn {
-                items: std::iter::once(AgentItem::UserMessage {
+            .map(|turn| {
+                let items = std::iter::once(AgentItem::UserMessage {
                     text: turn.prompt.clone(),
+                    images: Vec::new(),
                     meta: AgentItemMeta::default(),
                 })
                 .chain(turn.items.iter().map(|(_, item)| item.clone()))
-                .collect(),
+                .collect();
+                (HistoryTurn { items }, turn.images.clone())
             })
             .collect()
     }
+}
+
+/// 单张图片原始字节上限：base64 后仍在 Claude 单图 5MB 限制内。
+/// ponytail: 超限直接拒绝；全屏 Retina 截图这类大图需要时再做缩放重编码。
+const MAX_IMAGE_BYTES: usize = 3_750_000;
+
+/// 粘贴来的图片转成随轮发送的附件；格式或大小不合适时给出可显示的原因。
+pub fn image_attachment(media_type: &str, bytes: &[u8]) -> Result<ImageAttachment, String> {
+    if !SUPPORTED_IMAGE_TYPES.contains(&media_type) {
+        return Err("只支持粘贴 PNG、JPEG、GIF、WebP 图片".into());
+    }
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "图片 {:.1} MB，超过 {:.2} MB 上限",
+            bytes.len() as f64 / 1e6,
+            MAX_IMAGE_BYTES as f64 / 1e6
+        ));
+    }
+    Ok(ImageAttachment {
+        media_type: media_type.into(),
+        data: BASE64_STANDARD.encode(bytes),
+    })
 }
 
 #[cfg(test)]
@@ -616,7 +654,7 @@ mod tests {
     fn send(live: &mut LiveSession, prompt: &str) -> ClientCommand {
         let caps = crate::session_router::test_capabilities(AgentKind::ClaudeCode);
         let command = live
-            .send(prompt.into(), "/repo".into(), Some(&caps))
+            .send(prompt.into(), Vec::new(), "/repo".into(), Some(&caps))
             .unwrap();
         live.apply(capabilities_event(caps));
         command
@@ -776,9 +814,9 @@ mod tests {
         live.apply(message("m:0", "Hello"));
         live.apply(message("m:1", "next"));
         let turns = live.turns();
-        assert_eq!(turns[0].items.len(), 3, "prompt + two distinct items");
+        assert_eq!(turns[0].0.items.len(), 3, "prompt + two distinct items");
         assert!(
-            matches!(&turns[0].items[1], AgentItem::AssistantMessage { text, .. } if text == "Hello")
+            matches!(&turns[0].0.items[1], AgentItem::AssistantMessage { text, .. } if text == "Hello")
         );
     }
 
@@ -811,7 +849,7 @@ mod tests {
                 .is_none()
         );
         let ClientCommand::SessionStart(start) = live
-            .send("plan".into(), "/repo".into(), Some(&caps))
+            .send("plan".into(), Vec::new(), "/repo".into(), Some(&caps))
             .unwrap()
         else {
             panic!("expected session start");
@@ -1139,10 +1177,13 @@ mod tests {
     fn session_handshake_controls_sending_cancellation_and_approval() {
         let mut live = session();
         let mut caps = crate::session_router::test_capabilities(AgentKind::ClaudeCode);
-        assert!(live.send("hi".into(), "/repo".into(), None).is_none());
+        assert!(
+            live.send("hi".into(), Vec::new(), "/repo".into(), None)
+                .is_none()
+        );
         assert!(live.turns.is_empty());
         assert!(
-            live.send("hi".into(), "/repo".into(), Some(&caps))
+            live.send("hi".into(), Vec::new(), "/repo".into(), Some(&caps))
                 .is_some()
         );
         assert!(
@@ -1165,9 +1206,36 @@ mod tests {
             "session capabilities override preflight"
         );
         assert!(
-            live.send("next".into(), "/repo".into(), Some(&initial))
+            live.send("next".into(), Vec::new(), "/repo".into(), Some(&initial))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn pasted_images_are_validated_and_sent_with_the_turn() {
+        assert!(image_attachment("image/tiff", b"x").is_err());
+        assert!(image_attachment("image/png", &vec![0; MAX_IMAGE_BYTES + 1]).is_err());
+        let png = image_attachment("image/png", b"png").unwrap();
+        assert_eq!(png.data, "cG5n");
+
+        let mut live = session();
+        let caps = crate::session_router::test_capabilities(AgentKind::ClaudeCode);
+        let thumbnail = Arc::new(Image::from_bytes(gpui::ImageFormat::Png, b"png".to_vec()));
+        let command = live
+            .send(
+                String::new(),
+                vec![(thumbnail.clone(), png.clone())],
+                "/repo".into(),
+                Some(&caps),
+            )
+            .unwrap();
+        let ClientCommand::SessionStart(start) = command else {
+            panic!("first turn starts the session");
+        };
+        assert_eq!(start.initial_turn.unwrap().images, vec![png]);
+        let (turn, images) = &live.turns()[0];
+        assert!(matches!(&turn.items[0], AgentItem::UserMessage { text, .. } if text.is_empty()));
+        assert_eq!(images, &vec![thumbnail]);
     }
 
     #[test]
@@ -1179,6 +1247,8 @@ mod tests {
         live.forget_finished();
         let turns = live.turns();
         assert_eq!(turns.len(), 1);
-        assert!(matches!(&turns[0].items[0], AgentItem::UserMessage { text, .. } if text == "two"));
+        assert!(
+            matches!(&turns[0].0.items[0], AgentItem::UserMessage { text, .. } if text == "two")
+        );
     }
 }

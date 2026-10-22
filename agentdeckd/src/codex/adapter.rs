@@ -11,9 +11,9 @@ use crate::codex::session::{
 };
 use agentdeck_protocol::{
     ActionDecision, AgentKind, CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode,
-    CodexSessionOptions, HistoryReply, HistoryRequest, HistoryResponse, ProtocolError,
-    SessionCapabilities, SessionId, SessionStart, ThreadId, TurnId, VendorControlPayload,
-    VendorSessionOptions,
+    CodexSessionOptions, HistoryReply, HistoryRequest, HistoryResponse, ImageAttachment,
+    ProtocolError, SessionCapabilities, SessionId, SessionStart, ThreadId, TurnId,
+    VendorControlPayload, VendorSessionOptions, valid_turn_input,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -87,10 +87,12 @@ impl CodexAdapter {
             ));
         }
         if let Some(initial_turn) = &start.initial_turn {
-            if initial_turn.turn_id.0.trim().is_empty() || initial_turn.prompt.trim().is_empty() {
+            if initial_turn.turn_id.0.trim().is_empty()
+                || !valid_turn_input(&initial_turn.prompt, &initial_turn.images)
+            {
                 return Err(error(
                     "invalid-turn",
-                    "initialTurn.turnId and prompt must be non-empty",
+                    "initialTurn needs a turnId and text or supported images",
                 ));
             }
         }
@@ -239,10 +241,12 @@ impl Agent for CodexAdapter {
         session_id: &SessionId,
         turn_id: TurnId,
         prompt: String,
+        images: Vec<ImageAttachment>,
     ) -> Result<(), ProtocolError> {
         self.dispatch_command(session_id, |reply| SessionCommand::StartTurn {
             turn_id,
             prompt,
+            images,
             reply,
         })
         .await
@@ -511,6 +515,7 @@ mod tests {
             initial_turn: Some(InitialTurn {
                 turn_id: TurnId("turn-1".into()),
                 prompt: "hello".into(),
+                images: Vec::new(),
             }),
             vendor_options: VendorSessionOptions::Codex(CodexSessionOptions {
                 approval_policy: CodexApprovalPolicy::Never,
