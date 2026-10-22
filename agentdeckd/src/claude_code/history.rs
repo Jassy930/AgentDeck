@@ -41,7 +41,7 @@ use std::time::SystemTime;
 use super::is_collaboration_tool_name;
 use agentdeck_protocol::{
     AgentItem, AgentItemMeta, AgentKind, CONTEXT_KIND_KEY, DiffFile, DiffStatus, HistoryListItem,
-    HistoryReadResponse, HistoryTurn, ProtocolError, ShellStatus, ThreadId,
+    HistoryReadResponse, HistoryTurn, ImageAttachment, ProtocolError, ShellStatus, ThreadId,
     effective_history_list_limit,
 };
 use serde::Deserialize;
@@ -344,7 +344,7 @@ fn scan_session(path: &Path) -> (Option<String>, Option<PathBuf>) {
                     })
                     .flat_map(|s| user_items(s, false))
                     .find_map(|item| match item {
-                        AgentItem::UserMessage { text, meta }
+                        AgentItem::UserMessage { text, meta, .. }
                             if !meta.vendor_extensions.contains_key(CONTEXT_KIND_KEY) =>
                         {
                             Some(text.chars().take(80).collect())
@@ -404,6 +404,7 @@ fn user_item(raw: &str, injected: bool) -> Option<AgentItem> {
     }
     let typed = |text: String| AgentItem::UserMessage {
         text,
+        images: Vec::new(),
         meta: AgentItemMeta::default(),
     };
     // Skill invocations lead with `<command-message>`; prose that merely
@@ -447,8 +448,58 @@ fn context_item(kind: &str, text: &str) -> Option<AgentItem> {
         .insert(CONTEXT_KIND_KEY.into(), Value::from(kind));
     Some(AgentItem::UserMessage {
         text: text.into(),
+        images: Vec::new(),
         meta,
     })
+}
+
+/// 用户随消息粘贴的 base64 图片挂到本行的用户消息上；只发图片时没有 text
+/// block，单独开一轮空文字消息。
+/// ponytail: 图片随 history read 内联返回，图多的长会话回复会很大；需要时改成按需取图。
+fn attach_images(
+    blocks: &[Value],
+    injected: bool,
+    current: &mut Vec<AgentItem>,
+    turns: &mut Vec<HistoryTurn>,
+) {
+    let images: Vec<ImageAttachment> = blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("image"))
+        .filter_map(|block| {
+            let source = block.get("source")?;
+            (source.get("type").and_then(Value::as_str) == Some("base64")).then_some(())?;
+            Some(ImageAttachment {
+                media_type: source.get("media_type")?.as_str()?.into(),
+                data: source.get("data")?.as_str()?.into(),
+            })
+        })
+        .collect();
+    if images.is_empty() || injected {
+        return;
+    }
+    let has_text = blocks
+        .iter()
+        .any(|block| block.get("type").and_then(Value::as_str) == Some("text"));
+    if has_text
+        && let Some(AgentItem::UserMessage {
+            images: attached,
+            meta,
+            ..
+        }) = current.last_mut()
+        && !meta.vendor_extensions.contains_key(CONTEXT_KIND_KEY)
+    {
+        attached.extend(images);
+        return;
+    }
+    push_user_item(
+        AgentItem::UserMessage {
+            text: String::new(),
+            images,
+            meta: AgentItemMeta::default(),
+        },
+        current,
+        turns,
+    );
 }
 
 /// Typed input opens a new turn; folded context joins the current one.
@@ -641,6 +692,7 @@ pub fn parse_session_jsonl(
                             }
                         }
                     }
+                    attach_images(arr, injected, &mut current, &mut turns);
                 }
             }
             "assistant" => {
@@ -1259,6 +1311,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_session_jsonl_image_prompts_keep_text_and_open_turns() {
+        let content = r#"
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"看图"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"一只猫"}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"一只狗"}]}}
+"#;
+        let resp = parse_session_jsonl(content, ThreadId("abc".into())).unwrap();
+        let users: Vec<_> = resp
+            .turns
+            .iter()
+            .map(|turn| match &turn.items[0] {
+                AgentItem::UserMessage { text, images, .. } => (text.as_str(), images.len()),
+                other => panic!("turn must start with the prompt, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(users, [("看图", 1), ("", 1)]);
+    }
+
+    #[test]
     fn parse_session_jsonl_user_then_assistant_groups_into_one_turn() {
         let content = r#"
 {"type":"user","message":{"role":"user","content":"hello"},"sessionId":"abc"}
@@ -1431,7 +1503,7 @@ mod tests {
                 t.items
                     .iter()
                     .map(|i| match i {
-                        AgentItem::UserMessage { text, meta } => {
+                        AgentItem::UserMessage { text, meta, .. } => {
                             match meta.vendor_extensions.get(CONTEXT_KIND_KEY) {
                                 Some(kind) => format!("[{}] {text}", kind.as_str().unwrap()),
                                 None => text.clone(),
@@ -1484,9 +1556,9 @@ mod tests {
             let response = parse_session_jsonl(&jsonl, ThreadId("mixed".into())).unwrap();
             let items: Vec<_> = response.turns.iter().flat_map(|turn| &turn.items).collect();
             assert_eq!(items.len(), 2, "caveat 和真实正文都必须保留");
-            assert!(matches!(items[0], AgentItem::UserMessage { text, meta }
+            assert!(matches!(items[0], AgentItem::UserMessage { text, meta, .. }
                 if text == "Caveat: x" && meta.vendor_extensions[CONTEXT_KIND_KEY] == "context"));
-            assert!(matches!(items[1], AgentItem::UserMessage { text, meta }
+            assert!(matches!(items[1], AgentItem::UserMessage { text, meta, .. }
                 if text == "请继续处理剩下的问题" && !meta.vendor_extensions.contains_key(CONTEXT_KIND_KEY)));
 
             let dir = tempdir_unique();
@@ -1513,7 +1585,7 @@ mod tests {
             ),
         ] {
             assert!(
-                matches!(user_item(&raw, injected), Some(AgentItem::UserMessage { text, meta })
+                matches!(user_item(&raw, injected), Some(AgentItem::UserMessage { text, meta, .. })
                 if text == siblings && meta.vendor_extensions[CONTEXT_KIND_KEY] == kind)
             );
         }

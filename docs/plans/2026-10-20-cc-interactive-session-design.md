@@ -259,3 +259,21 @@ desktop live 测试（开始前本地、开始后事件驱动）；经 daemon �
 - 验证：desktop 93 项测试（含 draft 不带 resume、adopt 换 key、慢历史快照保留活动会话与去重）、desktop selfcheck、真实 bundle verify、Swift XCTest 77 项与 Swift Testing 31 项均通过。
   隔离 fake daemon 的实窗验证覆盖 Codex 与 CC 从空历史新建、工作目录编辑与空值禁用、真实 threadId 入侧栏、重开后同 session 第二轮、启动失败后重试，以及刷新不重复；命令记录确认新建不带 resumeThreadId，重试使用新 sessionId。
   作者已记录本机 CC 新会话的真实回复、侧栏条目与选中态；本轮未运行真实 vendor，fake daemon 验证不能替代真实链路。Codex 与远端新会话仍待真实链路验收。
+
+## P5 输入框粘贴图片（2026-10-20，协议 v9）
+
+- 协议：`TurnStart` / `InitialTurn` 增加可缺省的 `images: ImageAttachment[]`（`mediaType` + base64 `data`）。
+  base64 内联而不是传本地路径，因为远端机器经 ssh 连接，Mac 路径在对端不存在。`valid_turn_input`
+  要求文字或图片至少一项、格式限 png/jpeg/gif/webp；router（后续轮）与 Codex owner/adapter（首轮）都校验。
+- 翻译：Codex 发 `{"type":"image","url":"data:<mime>;base64,…"}`；CC 带图时 `content` 为 text + image(base64)
+  block 数组，纯文字仍是字符串。历史回放：`AgentItem::UserMessage.images` 带出图片——CC 取 user 行里
+  `source.type=base64` 的 image block（纯图片轮次单独开一轮空文字消息），Codex 把 data URL 图片输入还原成附件，
+  文字里不再出现 base64。桌面端历史 prepare 时解码一次成 `Arc<Image>`，在用户气泡里显示。
+  ponytail：图片随 history read 内联返回，图多的长会话回复会变大；需要时改成按需取图。
+- 桌面：输入框外层 `capture_action(Paste)` 截获剪贴板图片，其余交给 Input 粘贴文字。gpui 先读文本，
+  所以同时带文字和图片的剪贴板只粘贴文字。单张原始字节 ≤3.75 MB（base64 后在 Claude 5MB 单图限制内），
+  超限或格式不支持在输入框上方提示；大图缩放重编码暂不做。
+- 有意省略：不加 `images` 能力位（两家 vendor 都支持，N2 路由无需分支）；live 轮次的缩略图来自
+  `LiveTurn` 保留的原图 `Arc<Image>`（`transcript::prepare_live` 挂到用户气泡）；Swift 镜像暂不加 `images`（iOS 不发 TurnStart）。
+- 验证：协议/daemon/desktop 离线单测、offline gate、selfcheck、bundle verify。真实窗口 ⌘V 与真实 vendor
+  收图 E2E 未跑。

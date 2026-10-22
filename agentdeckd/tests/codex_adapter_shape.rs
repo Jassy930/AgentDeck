@@ -142,7 +142,7 @@ async fn live_turn_commands_require_the_exact_active_session_id() {
     let a = CodexAdapter::new_for_test();
     let sid = SessionId("phantom".into());
     let error = a
-        .start_turn(&sid, TurnId("turn-1".into()), "hello".into())
+        .start_turn(&sid, TurnId("turn-1".into()), "hello".into(), Vec::new())
         .await
         .unwrap_err();
     assert_eq!(error.code, "session-not-found");

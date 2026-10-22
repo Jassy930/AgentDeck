@@ -11,6 +11,7 @@ fn codex_session_start_round_trip() {
         initial_turn: Some(InitialTurn {
             turn_id: TurnId("turn-1".into()),
             prompt: "fix auth".into(),
+            images: Vec::new(),
         }),
         vendor_options: VendorSessionOptions::Codex(CodexSessionOptions {
             approval_policy: CodexApprovalPolicy::OnRequest,
@@ -85,4 +86,17 @@ fn vendor_options_tag_deserializes_independently_from_outer_agent_kind() {
     ));
     // Serde proves the wire shape only. The shared daemon router rejects this
     // semantic mismatch before dispatching to either vendor adapter.
+}
+
+#[test]
+fn turn_input_needs_text_or_supported_images() {
+    use agentdeck_protocol::{ImageAttachment, valid_turn_input};
+    let image = |media_type: &str| ImageAttachment {
+        media_type: media_type.into(),
+        data: "AAAA".into(),
+    };
+    assert!(valid_turn_input("hi", &[]));
+    assert!(valid_turn_input(" ", &[image("image/png")]));
+    assert!(!valid_turn_input(" ", &[]));
+    assert!(!valid_turn_input("hi", &[image("image/tiff")]));
 }

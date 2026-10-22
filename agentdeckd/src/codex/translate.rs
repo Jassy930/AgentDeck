@@ -45,8 +45,8 @@ use serde_json::{Value, json};
 
 use agentdeck_protocol::{
     ActionKind, ActionRequest, ActionRequestVendor, AgentItem, AgentItemMeta, AgentItemState,
-    AgentKind, CodexApprovalPolicy, CodexSandboxMode, DiffFile, DiffStatus, PlanStep,
-    PlanStepStatus, ProtocolError, ServerEvent, SessionId, ShellStatus, ThreadId, TurnId,
+    AgentKind, CodexApprovalPolicy, CodexSandboxMode, DiffFile, DiffStatus, ImageAttachment,
+    PlanStep, PlanStepStatus, ProtocolError, ServerEvent, SessionId, ShellStatus, ThreadId, TurnId,
     TurnSummary,
 };
 
@@ -847,6 +847,7 @@ fn completed_item_to_agent_item(item: &Value, kind: InFlightKind, accumulated: &
         },
         InFlightKind::UserMessage => AgentItem::UserMessage {
             text: user_message_text(item),
+            images: user_message_images(item),
             meta: AgentItemMeta::default(),
         },
         InFlightKind::Raw => AgentItem::Raw {
@@ -1037,6 +1038,24 @@ fn reasoning_text(item: &Value) -> String {
     join(item.get("content"))
 }
 
+/// `data:<mime>;base64,<data>` 形式的图片输入还原成附件。
+fn user_message_images(item: &Value) -> Vec<ImageAttachment> {
+    item.get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("image"))
+        .filter_map(|part| {
+            let url = part.get("url")?.as_str()?.strip_prefix("data:")?;
+            let (media_type, data) = url.split_once(";base64,")?;
+            Some(ImageAttachment {
+                media_type: media_type.into(),
+                data: data.into(),
+            })
+        })
+        .collect()
+}
+
 fn user_message_text(item: &Value) -> String {
     item.get("content")
         .and_then(Value::as_array)
@@ -1057,9 +1076,11 @@ fn user_input_text(part: &Value) -> Option<String> {
     let kind = part.get("type").and_then(Value::as_str)?;
     match kind {
         "text" => part.get("text").and_then(Value::as_str).map(str::to_string),
+        // 粘贴的图片是 base64 data URL，走 `images` 显示，不把几 MB 文本塞进记录。
         "image" => part
             .get("url")
             .and_then(Value::as_str)
+            .filter(|value| !value.starts_with("data:"))
             .map(|value| format!("[image: {value}]")),
         "localImage" => part
             .get("path")
@@ -1804,6 +1825,7 @@ mod tests {
             "content": [
                 { "type": "text", "text": "hello" },
                 { "type": "image", "url": "https://example.test/a.png" },
+                { "type": "image", "url": "data:image/png;base64,AAAA" },
                 { "type": "localImage", "path": "/tmp/a.png" },
                 { "type": "audio", "url": "https://example.test/a.wav" },
                 { "type": "localAudio", "path": "/tmp/a.wav" },
@@ -1811,9 +1833,16 @@ mod tests {
                 { "type": "mention", "name": "README", "path": "/repo/README.md" }
             ]
         }));
-        let AgentItem::UserMessage { text, .. } = item else {
+        let AgentItem::UserMessage { text, images, .. } = item else {
             panic!("expected UserMessage");
         };
+        assert_eq!(
+            images,
+            [ImageAttachment {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            }]
+        );
         for expected in [
             "hello",
             "[image: https://example.test/a.png]",
@@ -1825,6 +1854,10 @@ mod tests {
         ] {
             assert!(text.contains(expected), "missing {expected:?} in {text:?}");
         }
+        assert!(
+            !text.contains("AAAA"),
+            "data URL payload must not leak into text"
+        );
     }
 
     #[test]

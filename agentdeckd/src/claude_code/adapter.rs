@@ -13,9 +13,9 @@ use crate::agent::{Agent, AgentEventSender, AgentSessionHandle};
 use crate::claude_code::session::{self, OwnerStart, SessionCommand, spawn_owner};
 use agentdeck_protocol::{
     ActionDecision, AgentKind, ClaudeCodePermissionMode, ClaudeCodeSessionOptions,
-    ClaudeCodeVendorControl, HistoryReply, HistoryRequest, HistoryResponse, InitialTurn,
-    ProtocolError, ServerEvent, SessionCapabilities, SessionId, SessionStart, ThreadId, TurnId,
-    VendorControlPayload, VendorSessionOptions,
+    ClaudeCodeVendorControl, HistoryReply, HistoryRequest, HistoryResponse, ImageAttachment,
+    InitialTurn, ProtocolError, ServerEvent, SessionCapabilities, SessionId, SessionStart,
+    ThreadId, TurnId, VendorControlPayload, VendorSessionOptions,
 };
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -283,7 +283,7 @@ impl ClaudeCodeAdapter {
                 session_id: session_id.clone(),
                 thread_id: thread_id.clone(),
                 permission_mode,
-                initial_turn: start.initial_turn.map(|turn| (turn.turn_id, turn.prompt)),
+                initial_turn: start.initial_turn,
             },
             events,
             exit_tx,
@@ -422,6 +422,7 @@ impl Agent for ClaudeCodeAdapter {
             initial_turn: Some(InitialTurn {
                 turn_id: TurnId(uuid::Uuid::new_v4().to_string()),
                 prompt,
+                images: Vec::new(),
             }),
             vendor_options: VendorSessionOptions::ClaudeCode(opts),
             runtime_options: Default::default(),
@@ -434,10 +435,12 @@ impl Agent for ClaudeCodeAdapter {
         session_id: &SessionId,
         turn_id: TurnId,
         prompt: String,
+        images: Vec<ImageAttachment>,
     ) -> Result<(), ProtocolError> {
         self.dispatch(session_id, |reply| SessionCommand::StartTurn {
             turn_id,
             prompt,
+            images,
             reply,
         })
         .await

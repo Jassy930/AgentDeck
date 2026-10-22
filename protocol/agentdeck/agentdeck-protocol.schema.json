@@ -285,9 +285,34 @@
             }
           ]
         },
+        "ImageAttachment": {
+          "additionalProperties": false,
+          "description": "随一轮发送的图片，base64 内联：远端机器经 ssh 连接，本地路径传过去没用。",
+          "properties": {
+            "data": {
+              "description": "标准 base64（无 data: 前缀）。",
+              "type": "string"
+            },
+            "mediaType": {
+              "description": "`SUPPORTED_IMAGE_TYPES` 之一。",
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "mediaType"
+          ],
+          "type": "object"
+        },
         "InitialTurn": {
           "additionalProperties": false,
           "properties": {
+            "images": {
+              "items": {
+                "$ref": "#/definitions/ImageAttachment"
+              },
+              "type": "array"
+            },
             "prompt": {
               "type": "string"
             },
@@ -612,6 +637,12 @@
                 "turnStart"
               ],
               "type": "string"
+            },
+            "images": {
+              "items": {
+                "$ref": "#/definitions/ImageAttachment"
+              },
+              "type": "array"
             },
             "prompt": {
               "type": "string"
@@ -1065,6 +1096,13 @@
             {
               "additionalProperties": false,
               "properties": {
+                "images": {
+                  "description": "用户随消息发送的图片（历史回放时由 vendor 记录内联带出）。",
+                  "items": {
+                    "$ref": "#/definitions/ImageAttachment"
+                  },
+                  "type": "array"
+                },
                 "kind": {
                   "enum": [
                     "userMessage"
@@ -1430,6 +1468,25 @@
           ],
           "type": "object"
         },
+        "ImageAttachment": {
+          "additionalProperties": false,
+          "description": "随一轮发送的图片，base64 内联：远端机器经 ssh 连接，本地路径传过去没用。",
+          "properties": {
+            "data": {
+              "description": "标准 base64（无 data: 前缀）。",
+              "type": "string"
+            },
+            "mediaType": {
+              "description": "`SUPPORTED_IMAGE_TYPES` 之一。",
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "mediaType"
+          ],
+          "type": "object"
+        },
         "PlanStep": {
           "additionalProperties": false,
           "properties": {
@@ -1501,6 +1558,13 @@
             {
               "additionalProperties": false,
               "properties": {
+                "images": {
+                  "description": "用户随消息发送的图片（历史回放时由 vendor 记录内联带出）。",
+                  "items": {
+                    "$ref": "#/definitions/ImageAttachment"
+                  },
+                  "type": "array"
+                },
                 "kind": {
                   "enum": [
                     "userMessage"
@@ -2008,6 +2072,25 @@
           ],
           "type": "object"
         },
+        "ImageAttachment": {
+          "additionalProperties": false,
+          "description": "随一轮发送的图片，base64 内联：远端机器经 ssh 连接，本地路径传过去没用。",
+          "properties": {
+            "data": {
+              "description": "标准 base64（无 data: 前缀）。",
+              "type": "string"
+            },
+            "mediaType": {
+              "description": "`SUPPORTED_IMAGE_TYPES` 之一。",
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "mediaType"
+          ],
+          "type": "object"
+        },
         "PlanStep": {
           "additionalProperties": false,
           "properties": {
@@ -2256,6 +2339,13 @@
             {
               "additionalProperties": false,
               "properties": {
+                "images": {
+                  "description": "用户随消息发送的图片（历史回放时由 vendor 记录内联带出）。",
+                  "items": {
+                    "$ref": "#/definitions/ImageAttachment"
+                  },
+                  "type": "array"
+                },
                 "kind": {
                   "enum": [
                     "userMessage"
@@ -2681,6 +2771,25 @@
           ],
           "type": "object"
         },
+        "ImageAttachment": {
+          "additionalProperties": false,
+          "description": "随一轮发送的图片，base64 内联：远端机器经 ssh 连接，本地路径传过去没用。",
+          "properties": {
+            "data": {
+              "description": "标准 base64（无 data: 前缀）。",
+              "type": "string"
+            },
+            "mediaType": {
+              "description": "`SUPPORTED_IMAGE_TYPES` 之一。",
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "mediaType"
+          ],
+          "type": "object"
+        },
         "PlanStep": {
           "additionalProperties": false,
           "properties": {
@@ -2951,6 +3060,13 @@
             {
               "additionalProperties": false,
               "properties": {
+                "images": {
+                  "description": "用户随消息发送的图片（历史回放时由 vendor 记录内联带出）。",
+                  "items": {
+                    "$ref": "#/definitions/ImageAttachment"
+                  },
+                  "type": "array"
+                },
                 "kind": {
                   "enum": [
                     "userMessage"
@@ -3701,6 +3817,25 @@
             "renamed"
           ],
           "type": "string"
+        },
+        "ImageAttachment": {
+          "additionalProperties": false,
+          "description": "随一轮发送的图片，base64 内联：远端机器经 ssh 连接，本地路径传过去没用。",
+          "properties": {
+            "data": {
+              "description": "标准 base64（无 data: 前缀）。",
+              "type": "string"
+            },
+            "mediaType": {
+              "description": "`SUPPORTED_IMAGE_TYPES` 之一。",
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "mediaType"
+          ],
+          "type": "object"
         },
         "PlanStep": {
           "additionalProperties": false,
@@ -4678,9 +4813,34 @@
           ],
           "type": "string"
         },
+        "ImageAttachment": {
+          "additionalProperties": false,
+          "description": "随一轮发送的图片，base64 内联：远端机器经 ssh 连接，本地路径传过去没用。",
+          "properties": {
+            "data": {
+              "description": "标准 base64（无 data: 前缀）。",
+              "type": "string"
+            },
+            "mediaType": {
+              "description": "`SUPPORTED_IMAGE_TYPES` 之一。",
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "mediaType"
+          ],
+          "type": "object"
+        },
         "InitialTurn": {
           "additionalProperties": false,
           "properties": {
+            "images": {
+              "items": {
+                "$ref": "#/definitions/ImageAttachment"
+              },
+              "type": "array"
+            },
             "prompt": {
               "type": "string"
             },
@@ -4917,6 +5077,6 @@
       "type": "object"
     }
   },
-  "title": "AgentDeck Protocol v8",
+  "title": "AgentDeck Protocol v9",
   "type": "object"
 }

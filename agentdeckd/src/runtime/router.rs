@@ -6,9 +6,9 @@ use crate::agent::{AgentEventSender, AgentSessionHandle, DynAgent};
 use crate::diag::{self, DiagnosticEvent};
 use crate::record::RunRecord;
 use agentdeck_protocol::{
-    ActionDecision, AgentKind, HistoryReply, HistoryRequest, HistoryResponse, ProtocolError,
-    SessionCapabilities, SessionId, SessionStart, ThreadId, TurnId, VendorControlPayload,
-    effective_history_list_limit,
+    ActionDecision, AgentKind, HistoryReply, HistoryRequest, HistoryResponse, ImageAttachment,
+    ProtocolError, SessionCapabilities, SessionId, SessionStart, ThreadId, TurnId,
+    VendorControlPayload, effective_history_list_limit, valid_turn_input,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -283,12 +283,20 @@ impl AgentRouter {
         session_id: &SessionId,
         turn_id: TurnId,
         prompt: String,
+        images: Vec<ImageAttachment>,
     ) -> Result<(), ProtocolError> {
+        if !valid_turn_input(&prompt, &images) {
+            return Err(ProtocolError {
+                code: "invalid-turn".into(),
+                message: "a turn needs text or images, and images must be png/jpeg/gif/webp".into(),
+                diagnostic_ref: None,
+            });
+        }
         let kind = self.lookup_session(session_id).await?;
         self.agents
             .get(&kind)
             .expect("registered session must retain its adapter")
-            .start_turn(session_id, turn_id, prompt)
+            .start_turn(session_id, turn_id, prompt, images)
             .await
     }
 
@@ -614,7 +622,8 @@ fn validate_session_start(start: &SessionStart) -> Result<(), ProtocolError> {
         });
     }
     if let Some(initial_turn) = &start.initial_turn
-        && (initial_turn.turn_id.0.trim().is_empty() || initial_turn.prompt.trim().is_empty())
+        && (initial_turn.turn_id.0.trim().is_empty()
+            || !valid_turn_input(&initial_turn.prompt, &initial_turn.images))
     {
         return Err(ProtocolError {
             code: "invalid-turn".into(),
@@ -1083,6 +1092,7 @@ esac
             session_id: &SessionId,
             turn_id: TurnId,
             prompt: String,
+            _images: Vec<ImageAttachment>,
         ) -> Result<(), ProtocolError> {
             self.calls.lock().unwrap().push(LifecycleCall::TurnStart(
                 session_id.clone(),
@@ -1168,7 +1178,7 @@ esac
             .await
             .expect("stub session starts");
         router
-            .start_turn(&session_id, turn_id.clone(), "hello".into())
+            .start_turn(&session_id, turn_id.clone(), "hello".into(), Vec::new())
             .await
             .expect("turn routes");
         router
@@ -1236,6 +1246,7 @@ esac
         empty_session.initial_turn = Some(InitialTurn {
             turn_id: TurnId("turn-1".into()),
             prompt: "hello".into(),
+            images: Vec::new(),
         });
         cases.push((empty_session, "invalid-session"));
 
@@ -1247,6 +1258,7 @@ esac
         empty_turn_id.initial_turn = Some(InitialTurn {
             turn_id: TurnId(" ".into()),
             prompt: "hello".into(),
+            images: Vec::new(),
         });
         cases.push((empty_turn_id, "invalid-turn"));
 
@@ -1254,6 +1266,7 @@ esac
         empty_prompt.initial_turn = Some(InitialTurn {
             turn_id: TurnId("turn-1".into()),
             prompt: " ".into(),
+            images: Vec::new(),
         });
         cases.push((empty_prompt, "invalid-turn"));
 
@@ -1308,7 +1321,12 @@ esac
         assert_eq!(error.code, "stub-start-failed");
 
         let route_error = router
-            .start_turn(&session_id, TurnId("late-turn".into()), "nope".into())
+            .start_turn(
+                &session_id,
+                TurnId("late-turn".into()),
+                "nope".into(),
+                Vec::new(),
+            )
             .await
             .expect_err("failed start must not leave a routable session");
         assert_eq!(route_error.code, "session-not-found");

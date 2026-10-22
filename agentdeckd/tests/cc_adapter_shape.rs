@@ -196,6 +196,7 @@ async fn real_claude_emits_started_then_capabilities() {
         initial_turn: Some(InitialTurn {
             turn_id: TurnId("cc-real-turn".into()),
             prompt: "just say hi in 3 words and stop".into(),
+            images: Vec::new(),
         }),
         vendor_options: VendorSessionOptions::ClaudeCode(cc_opts()),
         runtime_options: Default::default(),
@@ -320,6 +321,7 @@ async fn real_claude_streams_at_least_one_assistant_or_turn_complete() {
         initial_turn: Some(InitialTurn {
             turn_id: TurnId("cc-real-stream-turn".into()),
             prompt: "reply with the single word: pong".into(),
+            images: Vec::new(),
         }),
         vendor_options: VendorSessionOptions::ClaudeCode(cc_opts()),
         runtime_options: Default::default(),

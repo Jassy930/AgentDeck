@@ -28,6 +28,7 @@ pub use trunk::{
     HistoryListItem, HistoryReadResponse, HistoryReply, HistoryRequest, HistoryResponse,
     HistoryTurn, HistoryWarning,
 };
+pub use trunk::{ImageAttachment, SUPPORTED_IMAGE_TYPES, valid_turn_input};
 pub use trunk::{InitialTurn, RuntimeOptions, SessionStart, VendorSessionOptions};
 pub use vendor::claude_code::{ClaudeCodeCapabilities, ClaudeCodePermissionMode};
 pub use vendor::claude_code::{ClaudeCodeHookConfig, ClaudeCodeSessionOptions};
@@ -39,9 +40,9 @@ pub use vendor::codex::{CodexSessionOptions, McpOverride};
 pub use vendor::codex::{CodexVendorControl, CodexVendorPanelEvent};
 
 /// 契约产物版本。改动协议形态时手动 +1，并重生成快照。
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
-/// Aggregate JSON Schema for all v8 wire types. Snapshot-tested against
+/// Aggregate JSON Schema for all v9 wire types. Snapshot-tested against
 /// `protocol/agentdeck/agentdeck-protocol.schema.json`.
 pub fn protocol_schema() -> serde_json::Value {
     use schemars::schema_for;

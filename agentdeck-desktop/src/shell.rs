@@ -6,24 +6,25 @@
 
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentdeck_protocol::{
     ActionKind, ActionRequest, ActionRequestVendor, AgentKind, ClaudeCodePermissionMode,
-    ClientCommand, HistoryListItem, HistoryWarning, MAX_HISTORY_LIST_LIMIT, ServerEvent,
-    SessionCapabilities, ThreadId,
+    ClientCommand, HistoryListItem, HistoryWarning, ImageAttachment, MAX_HISTORY_LIST_LIMIT,
+    ServerEvent, SessionCapabilities, ThreadId,
 };
 use gpui::{
-    App, Context, Entity, FocusHandle, IntoElement, ListAlignment, ListState, ParentElement,
-    ScrollHandle, ScrollStrategy, SharedString, UniformListScrollHandle, Window, div, prelude::*,
-    px,
+    App, ClipboardEntry, Context, Entity, FocusHandle, Image, IntoElement, ListAlignment,
+    ListState, ObjectFit, ParentElement, ScrollHandle, ScrollStrategy, SharedString,
+    UniformListScrollHandle, Window, div, img, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme, Colorize, Disableable, Icon, InteractiveElementExt, Selectable, Sizable,
     StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
-    input::{Input, InputEvent, InputState},
+    input::{Input, InputEvent, InputState, Paste},
     menu::{DropdownMenu, PopupMenuItem},
     v_flex,
 };
@@ -687,6 +688,10 @@ pub struct Shell {
     live: Vec<LiveSession>,
     /// 会话页底部输入框：Enter 发送，⌘Enter 换行。
     composer: Entity<InputState>,
+    /// 粘贴进输入框、随下一轮发出的图片；缩略图用原图渲染。
+    attachments: Vec<(Arc<Image>, ImageAttachment)>,
+    /// 上一次粘贴图片被拒的原因，下次粘贴或发送时清掉。
+    attach_error: Option<String>,
     /// 新建会话的工作目录。
     cwd_input: Entity<InputState>,
     /// 选了“跳过所有权限”，等待二次确认。
@@ -776,6 +781,8 @@ impl Shell {
             update_armed: None,
             live: Vec::new(),
             composer,
+            attachments: Vec::new(),
+            attach_error: None,
             cwd_input,
             bypass_armed: false,
             question_focus: cx.focus_handle(),
@@ -901,7 +908,7 @@ impl Shell {
                 .live
                 .iter()
                 .find(|live| session.is(&live.key))
-                .map(|live| transcript::prepare(live.turns()))
+                .map(|live| transcript::prepare_live(live.turns()))
                 .unwrap_or_default();
             *blocks = if live.is_empty() {
                 history.clone()
@@ -971,9 +978,31 @@ impl Shell {
         .detach();
     }
 
+    /// ⌘V 先经过这里：剪贴板是图片就收作附件，否则交给输入框粘贴文字。
+    /// gpui 优先读文本，所以同时带文字和图片的剪贴板（如网页复制）只会粘贴文字。
+    fn paste_image(&mut self, cx: &mut Context<Self>) {
+        let Some(image) = cx.read_from_clipboard().and_then(|item| {
+            item.entries().iter().find_map(|entry| match entry {
+                ClipboardEntry::Image(image) => Some(image.clone()),
+                _ => None,
+            })
+        }) else {
+            return;
+        };
+        cx.stop_propagation();
+        match crate::live::image_attachment(image.format.mime_type(), &image.bytes) {
+            Ok(attachment) => {
+                self.attachments.push((Arc::new(image), attachment));
+                self.attach_error = None;
+            }
+            Err(error) => self.attach_error = Some(error),
+        }
+        cx.notify();
+    }
+
     pub fn send_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).value().trim().to_string();
-        if text.is_empty() {
+        if text.is_empty() && self.attachments.is_empty() {
             return;
         }
         let draft = match &mut self.stage {
@@ -987,7 +1016,11 @@ impl Shell {
                     return;
                 }
                 session.item.cwd = cwd.into();
-                session.item.title = text.lines().next().map(str::to_string);
+                session.item.title = text
+                    .lines()
+                    .next()
+                    .map(str::to_string)
+                    .or_else(|| Some("图片".into()));
                 Some(session.item.clone())
             }
             _ => None,
@@ -999,15 +1032,18 @@ impl Shell {
                 .cloned(),
             _ => None,
         };
+        let images = self.attachments.clone();
         let Some((live, cwd, client)) = self.current_live() else {
             return;
         };
         if draft.is_some() && live.session_id.is_none() {
             live.draft = draft;
         }
-        let Some(command) = live.send(text, cwd, initial.as_ref()) else {
+        let Some(command) = live.send(text, images, cwd, initial.as_ref()) else {
             return;
         };
+        self.attachments.clear();
+        self.attach_error = None;
         self.composer
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.dispatch(client, command, cx);
@@ -2404,7 +2440,7 @@ impl Shell {
                         .child("等待 agent 响应…"),
                 )
             })
-            .when_some(error, |section, error| {
+            .when_some(error.or(self.attach_error.clone()), |section, error| {
                 section.child(
                     div()
                         .w_full()
@@ -2413,6 +2449,40 @@ impl Shell {
                         .text_color(danger)
                         .line_clamp(3)
                         .child(error),
+                )
+            })
+            .when(!self.attachments.is_empty(), |section| {
+                section.child(
+                    h_flex().w_full().max_w(px(760.)).gap_2().children(
+                        self.attachments
+                            .iter()
+                            .enumerate()
+                            .map(|(index, (image, _))| {
+                                div()
+                                    .relative()
+                                    .size(px(64.))
+                                    .rounded_md()
+                                    .overflow_hidden()
+                                    .border_1()
+                                    .border_color(border)
+                                    .child(
+                                        img(image.clone()).size_full().object_fit(ObjectFit::Cover),
+                                    )
+                                    .child(
+                                        Button::new(("remove-image", index))
+                                            .absolute()
+                                            .top_0()
+                                            .right_0()
+                                            .xsmall()
+                                            .ghost()
+                                            .label("×")
+                                            .on_click(cx.listener(move |shell, _, _, cx| {
+                                                shell.attachments.remove(index);
+                                                cx.notify();
+                                            })),
+                                    )
+                            }),
+                    ),
                 )
             })
             .child(
@@ -2455,7 +2525,14 @@ impl Shell {
                                 ),
                         )
                     })
-                    .child(Input::new(&self.composer).appearance(false).flex_1())
+                    .child(
+                        div()
+                            .flex_1()
+                            .capture_action(
+                                cx.listener(|shell, _: &Paste, _, cx| shell.paste_image(cx)),
+                            )
+                            .child(Input::new(&self.composer).appearance(false).w_full()),
+                    )
                     .child(if running {
                         Button::new("stop-turn")
                             .disabled(!can_cancel)
