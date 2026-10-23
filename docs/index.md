@@ -14,6 +14,7 @@
 - `AGENT_DIAGNOSTICS.md`：自检命令、诊断日志位置、failure code 和排查流程。
 - `AGENTDECKD_STATUS.md`：daemon 当前能力矩阵、完整度、证据边界和 desktop 接入前缺口。
 - `QUALITY.md`：按变更范围选择验证命令，以及文档结构检查入口。
+- `LINUX_DESKTOP.md`：Linux 桌面端现状、X11 + ibus 中文输入崩溃的根因与 `xim-ctext` 补丁、`scripts/linux-ime/` 无头输入法回归。
 - `RUST_BUILD_STORAGE.md`：Rust 构建产物、sccache 容量上限和分 worktree 清理流程。
 
 ## 计划与历史

@@ -211,6 +211,7 @@ macOS 桌面不得重新依赖 Swift target；共享 Core 测试也不得重新�
 | Swift Core / iOS 共享模型 | `swift test`；涉及 iOS 时再跑 iOS Simulator 测试 |
 | daemon、adapter、record、diagnostics | `scripts/verify-offline-tests.sh`、对应 focused test，以及通过 `AGENTDECK_DAEMON_BIN` 绑定当前 checkout 的 CLI selfcheck |
 | agentdeck-protocol | `cargo test -p agentdeck-protocol`；漂移时按下文重生成 schema |
+| Linux 输入法、`third_party/xim-ctext`、gpui 升级 | `cargo test -p xim-ctext`；在 dt 用 `scripts/linux-ime/x11.sh`（ibus/fcitx5，zh_CN）和 `wayland.sh` 无头回归，见 `LINUX_DESKTOP.md` |
 | 文档、AGENTS、计划规则 | `scripts/verify-agent-docs.sh` |
 | 全局依赖或 workspace | `scripts/verify-offline-tests.sh`、`swift test`、desktop selfcheck 和 doc check；真实 vendor E2E 仍需单独授权和记录 |
 

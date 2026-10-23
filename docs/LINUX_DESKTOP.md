@@ -1,0 +1,74 @@
+# Linux 桌面端
+
+GPUI 桌面端在 Linux 上可以从源码构建运行，但还没有发布包（见 issue #53）。平台适配缺口统一记录在 issue #52。
+
+## 中文输入法崩溃（X11 + ibus，已修复）
+
+**现象**：Ubuntu 上用 ibus 输入中文时，一出现预编辑文本，桌面端就退出。backtrace 停在
+`zed-xim-0.4.0-zed/src/client.rs:237`，报错信息是 `Encoding Error: UnsupportedEncoding`。
+
+**根因**：
+
+- gpui 0.2.2 在 X11 上通过 XIM 和输入法通信，用的是 `zed-xim 0.4.0-zed`。它依赖的 `xim-ctext 0.3.0` 负责解码 COMPOUND_TEXT，但只支持「整段 UTF-8」和「以 JIS X 0208 开头」这两种情况。
+- ibus-x11 用 Xlib 把预编辑和上屏文本编码成 ISO-2022 形式的 COMPOUND_TEXT，字符集由 locale 决定：
+  - `zh_CN.UTF-8` 下整段编码为 GB2312（`ESC $ ( A`）。
+  - `en_US.UTF-8` 下 JIS X 0208 段和 GB2312 段交替出现，例如「中文输入法」。
+- 遇到上面这些编码时，`xim-ctext` 返回错误，`zed-xim` 再对结果调用 `expect`，主线程就 panic 了。
+
+**不受影响的情况**：
+
+- fcitx5 走 XIM 时发送 UTF-8 段（`ESC % G`），所以不会崩。
+- Wayland 会话下，gpui 走 text-input-v3，不经过 XIM，也不会崩。
+
+**修复**：
+
+- 根 `Cargo.toml` 里的 `[patch.crates-io]` 把 `xim-ctext` 指向 `third_party/xim-ctext`。
+- 这个本地版本保留 0.3.0 的公开 API，把解码重写成完整的 ISO-2022 状态机：
+  - 字符集：GL/GR 指派、ASCII、ISO-8859 系列、GB2312、JIS X 0208、KS C 5601，以及 UTF-8 段。
+  - 遇到无法识别的内容时，用 U+FFFD 替代，保证不会返回 Err。这样 zed-xim 里那 3 处 `expect` 永远不会触发。
+- 不直接换成上游 `xim-ctext 0.4.1` 的原因有两个：一是 zed-xim 要求 `^0.3`，0.4.1 没法直接 patch 进来；二是 0.4.1 遇到未知转义时仍会返回 `Err(InvalidEncoding)`，zed-xim 的 `expect` 照样会 panic。另外，0.4.1 只识别 GL 形式的 GB2312（`ESC $ ( A`），GR 形式（`ESC $ ) A`）会被当成 Latin-1 解码，产生乱码。
+- 实测中 ibus 发来的都是 GL 形式。补丁里对 GR 形式的处理是防御性的，只有单测覆盖。
+- 等 gpui 依赖的 zed-xim 不再对解码结果 `expect`，并且换用了能正确解中文的 xim-ctext，就可以删掉这个补丁。
+
+单测见 `third_party/xim-ctext/src/lib.rs`，其中包含在 Ubuntu 上实际抓到的 ibus 字节：
+
+```bash
+cargo test -p xim-ctext
+```
+
+## 无头输入法回归（dt）
+
+`scripts/linux-ime/` 下的脚本在 Linux 主机上无头运行桌面端，并模拟拼音输入。脚本不触碰真实桌面会话，隔离方式如下：
+
+- 私有 `dbus-run-session`
+- 独立的 HOME 和 XDG 目录
+- 独立的 X display 或 Wayland socket
+
+| 脚本 | 会话 | 按键注入 | 截图 |
+|---|---|---|---|
+| `x11.sh <ibus\|fcitx5> [display]` | Xvfb + XIM | xdotool | ImageMagick `import`，每步一张 |
+| `wayland.sh [名称]` | `gnome-shell --headless --no-x11` + ibus | Mutter RemoteDesktop D-Bus | Mutter ScreenCast + PipeWire，每秒一帧 |
+
+```bash
+# 在 dt 的仓库副本里
+cargo build -p agentdeck-desktop
+LANG=zh_CN.UTF-8 scripts/linux-ime/x11.sh ibus 90      # 输出 ALIVE 或 APP DIED at step N
+LANG=zh_CN.UTF-8 scripts/linux-ime/x11.sh fcitx5 91
+LANG=zh_CN.UTF-8 scripts/linux-ime/wayland.sh zh
+```
+
+坑点：
+
+- **Vulkan**：Xvfb 不支持 DRI3，默认的硬件 Vulkan ICD 会报 `Failed to create surface: PlatformNotSupported`。脚本通过 `VK_DRIVER_FILES` 强制使用 lavapipe 软件渲染。
+- **locale**：COMPOUND_TEXT 的字符集取决于 locale，必须覆盖 `zh_CN.UTF-8`（需要先 `sudo locale-gen zh_CN.UTF-8`）。只测 en_US 不能代表中文用户的实际编码路径。
+- **fcitx5**：需要 `[Behavior] ActiveByDefault=True`，否则按键直接以英文上屏，等于没测输入法。
+- **Wayland 截图**：GNOME 的 `org.gnome.Shell.Screenshot` 在 headless 模式下拒绝调用，所以改用 ScreenCast。
+- **Wayland 按键**：RemoteDesktop 的按键必须在同一个会话里连续发送，每次新建会话发出的按键会丢失。
+- **改脚本时**：脚本里覆盖了 HOME，引用仓库外的文件要用绝对路径。
+
+依赖（Ubuntu 24.04）：`xvfb xdotool imagemagick mesa-vulkan-drivers ibus-libpinyin fcitx5 fcitx5-chinese-addons`；Wayland 还需要 `pipewire wireplumber gstreamer1.0-pipewire python3-gi`。
+
+2026-10-23 在 dt（Ubuntu 24.04.4）上的验证结果：
+
+- **未打补丁的 master**：zh_CN + ibus 在第 3 步（第一次出现中文预编辑）就崩溃；en_US + ibus 在第 5 步崩溃。
+- **打补丁后**：zh_CN 和 en_US 下，ibus 和 fcitx5 的 X11 组合，以及 zh_CN 下 ibus 的 Wayland 组合，都跑完了全部步骤，截图里的预编辑和上屏文字正确。

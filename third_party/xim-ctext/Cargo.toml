@@ -1,0 +1,19 @@
+# 本地补丁版 xim-ctext（上游 https://github.com/Riey/xim-rs ，MIT，作者 Riey）。
+# gpui 0.2.2 → zed-xim 0.4.0-zed 依赖 xim-ctext ^0.3.0，0.3.0 解不了 GB2312 等 COMPOUND_TEXT，
+# zed-xim 对解码结果直接 expect，ibus 经 XIM 发中文预编辑时整个进程 panic（issue #52）。
+# 版本号必须保持 0.3.x 才能被 [patch.crates-io] 命中；公开 API 与 0.3.0 一致。
+[package]
+edition = "2018"
+name = "xim-ctext"
+version = "0.3.0"
+authors = ["Riey <creeper844@gmail.com>"]
+description = "compound text en/decoder (AgentDeck patched: full ISO-2022 decode, never fails)"
+license = "MIT"
+publish = false
+
+[dependencies]
+encoding_rs = "0.8.28"
+
+[features]
+default = ["std"]
+std = []

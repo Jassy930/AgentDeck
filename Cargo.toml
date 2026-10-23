@@ -4,6 +4,7 @@ members = [
     "agentdeck-protocol",
     "agentdeck-cli",
     "agentdeck-desktop",
+    "third_party/xim-ctext",
 ]
 resolver = "3"
 
@@ -29,3 +30,9 @@ incremental = false
 
 [profile.test.package."*"]
 debug = 0
+
+# gpui 0.2.2 的 X11 输入法依赖 zed-xim → xim-ctext 0.3，0.3 解不了中文 COMPOUND_TEXT，
+# zed-xim 对解码结果 expect，Linux X11 + ibus 输入中文时直接 panic（issue #52）。
+# 上游 gpui 升级到修复版本后可删除此补丁与 third_party/xim-ctext。
+[patch.crates-io]
+xim-ctext = { path = "third_party/xim-ctext" }
