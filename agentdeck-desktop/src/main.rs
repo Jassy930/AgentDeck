@@ -110,6 +110,7 @@ fn main() {
         theme::apply(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([
+            // secondary 在 macOS 是 ⌘，其他平台是 Ctrl；Linux 上 set_menus 不生效，退出只靠快捷键或关窗。
             KeyBinding::new("secondary-q", Quit, None),
             KeyBinding::new("tab", shell::NextQuestion, Some("QuestionCard")),
             KeyBinding::new("shift-tab", shell::PreviousQuestion, Some("QuestionCard")),

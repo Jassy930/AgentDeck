@@ -683,7 +683,7 @@ pub struct Shell {
     /// 续聊过的会话；切走后 daemon 上的会话继续跑，回来还能看到进度。
     /// ponytail: 从不发 SessionClose，vendor 进程随 daemon 退出回收；会话多了再按空闲关闭。
     live: Vec<LiveSession>,
-    /// 会话页底部输入框：Enter 发送，⌘Enter 换行。
+    /// 会话页底部输入框：Enter 发送，⌘Enter（Linux 为 Ctrl+Enter）换行。
     composer: Entity<InputState>,
     /// 粘贴进输入框、随下一轮发出的图片；缩略图用原图渲染。
     attachments: Vec<(Arc<Image>, ImageAttachment)>,
@@ -979,7 +979,7 @@ impl Shell {
         .detach();
     }
 
-    /// ⌘V 先经过这里：剪贴板是图片就收作附件，否则交给输入框粘贴文字。
+    /// ⌘V（Linux 为 Ctrl+V）先经过这里：剪贴板是图片就收作附件，否则交给输入框粘贴文字。
     /// gpui 优先读文本，所以同时带文字和图片的剪贴板（如网页复制）只会粘贴文字。
     fn paste_image(&mut self, cx: &mut Context<Self>) {
         let Some(image) = cx.read_from_clipboard().and_then(|item| {
