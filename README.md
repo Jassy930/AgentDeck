@@ -227,6 +227,10 @@ cargo run -p agentdeck-desktop -- --selfcheck
 `agentdeck-desktop` 与 `agentdeckd`、装配 `dist/AgentDeck.app`、写入 macOS 15 最低版本并
 启动最新产物。桌面维持到 bundle 内自带 `agentdeckd` 的本机连接，复用它读取历史。
 
+脚本默认用钥匙串里的 Apple Development 证书签名（`AGENTDECK_SIGN_IDENTITY` 可覆盖），
+让 macOS「本地网络」授权跨构建保持有效；该权限按 AgentDeck.app 判定，覆盖 app 启动的
+ssh 和 agent 会话。没有证书时退回 ad-hoc，每次重新构建都需重新授权（#56）。
+
 macOS 应用图标和侧栏品牌行使用统一的 04C 图标；iOS companion 使用同款满版
 AppIcon。正式资源和重新生成 `.icns` 的方式见 [图标资源](assets/brand/README.md)。
 

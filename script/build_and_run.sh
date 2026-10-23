@@ -119,9 +119,24 @@ cat >"$INFO_PLIST" <<PLIST
   <string>$MIN_SYSTEM_VERSION</string>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>AgentDeck 通过 SSH 连接局域网内的远端机器。</string>
 </dict>
 </plist>
 PLIST
+
+# macOS 本地网络权限按签名身份记录，ad-hoc 签名每次构建都会变，授权随之失效；
+# 默认取钥匙串里第一个 Apple Development 证书，AGENTDECK_SIGN_IDENTITY 可覆盖。
+SIGN_IDENTITY="${AGENTDECK_SIGN_IDENTITY:-$(
+  /usr/bin/security find-identity -v -p codesigning 2>/dev/null \
+    | /usr/bin/awk -F'"' '/Apple Development/ { print $2; exit }'
+)}"
+if [[ -z "$SIGN_IDENTITY" ]]; then
+  echo "warning: 未找到 Apple Development 证书，改用 ad-hoc 签名；本地网络授权在重新构建后会失效" >&2
+  SIGN_IDENTITY="-"
+fi
+/usr/bin/codesign --force --sign "$SIGN_IDENTITY" --identifier "$BUNDLE_ID.$DAEMON_NAME" "$APP_DAEMON"
+/usr/bin/codesign --force --sign "$SIGN_IDENTITY" "$APP_BUNDLE"
 
 open_app() {
   /usr/bin/open -n "$APP_BUNDLE"
@@ -153,6 +168,12 @@ verify_running_bundle() {
   )"
   if [[ "$binary_min_system_version" != "$MIN_SYSTEM_VERSION" ]]; then
     echo "verify failed: Mach-O minos=$binary_min_system_version, expected $MIN_SYSTEM_VERSION" >&2
+    return 1
+  fi
+
+  if ! /usr/bin/codesign --verify --strict "$APP_BUNDLE" \
+    || [[ "$(/usr/bin/codesign -dv "$APP_BUNDLE" 2>&1 | sed -n 's/^Identifier=//p')" != "$BUNDLE_ID" ]]; then
+    echo "verify failed: bundle signature is invalid or identifier is not $BUNDLE_ID" >&2
     return 1
   fi
 
