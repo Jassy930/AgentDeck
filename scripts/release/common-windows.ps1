@@ -56,6 +56,7 @@ function Assert-WindowsBinary {
         if ($_ -match '^\s+([A-Za-z0-9_.-]+\.dll)\s*$') { $Matches[1].ToLowerInvariant() }
     })
     if ($dependencies.Count -eq 0) { throw "No import table found: $Path" }
+    Write-Host "$([IO.Path]::GetFileName($Path)): x64 PE; imported DLLs: $($dependencies -join ', ')"
     foreach ($dll in $dependencies) {
         if ($dll -match '^(api-ms-win-|ext-ms-win-)') { continue }
         if ([IO.Path]::GetFileNameWithoutExtension($dll) -notin $systemDlls) {
@@ -65,7 +66,6 @@ function Assert-WindowsBinary {
             throw "Required Windows DLL is missing: $dll"
         }
     }
-    Write-Host "$([IO.Path]::GetFileName($Path)): x64 PE; Windows DLLs: $($dependencies -join ', ')"
 }
 
 function Initialize-SmokeRunner {
