@@ -14,6 +14,7 @@
 - `AGENT_DIAGNOSTICS.md`：自检命令、诊断日志位置、failure code 和排查流程。
 - `AGENTDECKD_STATUS.md`：daemon 当前能力矩阵、完整度、证据边界和 desktop 接入前缺口。
 - `QUALITY.md`：按变更范围选择验证命令，以及文档结构检查入口。
+- `RELEASE.md`：多平台 release 构建、安装、SHA256 校验、macOS 签名限制和统一发布门禁。
 - `LINUX_DESKTOP.md`：Linux 桌面端现状、X11 + ibus 中文输入崩溃的根因与 `xim-ctext` 补丁、`scripts/linux-ime/` 无头输入法回归。
 - `RUST_BUILD_STORAGE.md`：Rust 构建产物、sccache 容量上限和分 worktree 清理流程。
 
@@ -22,6 +23,7 @@
 - `plans/README.md`：设计文档和实施计划的命名、内容和归档规则。
 - `plans/*-design.md`：功能设计、架构取舍和验收标准。
 - `plans/*-implementation.md`：可执行实施步骤、验证命令和收口记录。
+- `plans/2026-10-25-release-phase-one-design.md` / `plans/2026-10-25-release-phase-one-implementation.md`：第一期多平台打包边界与实施入口。
 
 ### GPUI 桌面端重启（2026-08-17，当前）
 

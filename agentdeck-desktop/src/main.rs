@@ -89,6 +89,10 @@ fn open_main_window(cx: &mut App, show: bool) {
 }
 
 fn main() {
+    if env::args_os().any(|arg| arg == "--version" || arg == "-V") {
+        println!("agentdeck-desktop {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let selfcheck = env::args_os().any(|arg| arg == "--selfcheck");
 
     Application::new().with_assets(Assets).run(move |cx| {
@@ -108,7 +112,8 @@ fn main() {
         if selfcheck {
             open_main_window(cx, false);
             println!("{SELFCHECK_REPORT}");
-            cx.quit();
+            // Linux 的启动回调先于事件循环，直接 quit 会被丢弃；等前台任务运行再退出。
+            cx.spawn(async |cx| cx.update(|cx| cx.quit())).detach();
             return;
         }
 
