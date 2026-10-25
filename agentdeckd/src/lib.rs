@@ -11,5 +11,7 @@ pub mod claude_code;
 pub mod codex;
 pub mod diag;
 pub mod ipc;
+pub(crate) mod platform;
+pub(crate) mod process;
 pub mod record;
 pub mod runtime;

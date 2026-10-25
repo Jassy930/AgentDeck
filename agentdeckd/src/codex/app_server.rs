@@ -8,8 +8,10 @@
 use crate::codex::capabilities::{
     VERSION_PROBE_TIMEOUT, check_probe_deadline, probe_codex_version_at, supported_codex_version,
 };
+use crate::process::Child;
 use agentdeck_protocol::{AgentKind, HistoryWarning, ProtocolError};
 use serde_json::{Value, json};
+#[cfg(any(unix, test))]
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -19,7 +21,7 @@ use std::sync::{
 };
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -110,8 +112,13 @@ impl CodexBinary {
             }
         }
         let message = if mismatches.is_empty() {
+            let windows_hint = if cfg!(windows) {
+                " Windows 仅支持原生 .exe，不支持 npm .cmd / .bat shim；请使用 https://chatgpt.com/codex/install.ps1 原生安装器。"
+            } else {
+                ""
+            };
             format!(
-                "未找到 Codex 运行时。请安装 Codex 桌面端或 CLI（已验证版本：{}），或用 AGENTDECK_CODEX_BIN 指定可执行文件的绝对路径，然后重试。",
+                "未找到 Codex 运行时。请安装 Codex 桌面端或 CLI（已验证版本：{}），或用 AGENTDECK_CODEX_BIN 指定可执行文件的绝对路径，然后重试。{windows_hint}",
                 supported_codex_version()
             )
         } else {
@@ -275,10 +282,10 @@ pub(super) async fn join_stderr_drain(
 /// from installed desktop apps that cannot be shadowed through PATH.
 fn codex_candidates(explicit: Option<PathBuf>) -> Result<Vec<PathBuf>, ProtocolError> {
     if let Some(path) = explicit {
-        if !path.is_absolute() || !path.is_file() {
+        if !path.is_absolute() || !path.is_file() || !crate::platform::native_executable(&path) {
             return Err(ProtocolError {
                 code: "codex-version-probe-failed".into(),
-                message: "AGENTDECK_CODEX_BIN 必须指向已存在的 Codex 可执行文件的绝对路径".into(),
+                message: "AGENTDECK_CODEX_BIN 必须指向已存在的 Codex 原生可执行文件的绝对路径；Windows 仅支持 .exe，不支持 npm .cmd / .bat shim，请使用官方原生安装器".into(),
                 diagnostic_ref: None,
             });
         }
@@ -289,57 +296,35 @@ fn codex_candidates(explicit: Option<PathBuf>) -> Result<Vec<PathBuf>, ProtocolE
     candidates.push(PathBuf::from(
         "/Applications/ChatGPT.app/Contents/Resources/codex",
     ));
-    if let Some(path) = std::env::var_os("PATH") {
-        candidates.extend(std::env::split_paths(&path).map(|directory| directory.join("codex")));
-    }
-
+    candidates.extend(crate::platform::executable_candidates("codex"));
+    #[cfg(unix)]
     candidates.extend([
         Path::new("/opt/homebrew/bin/codex").to_path_buf(),
         Path::new("/usr/local/bin/codex").to_path_buf(),
         Path::new("/usr/bin/codex").to_path_buf(),
     ]);
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = Path::new(&home);
-        candidates.push(home.join(".local/bin/codex"));
-        candidates.push(home.join(".bun/bin/codex"));
+    #[cfg(windows)]
+    if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty()) {
+        // Official PowerShell installer target; a GUI process may retain the old PATH.
+        candidates.push(PathBuf::from(local).join("Programs/OpenAI/Codex/bin/codex.exe"));
     }
     Ok(candidates)
 }
 
 fn canonical_executable(candidate: &Path) -> Option<PathBuf> {
+    if !crate::platform::native_executable(candidate) {
+        return None;
+    }
     candidate
         .is_file()
         .then(|| candidate.canonicalize().ok())
         .flatten()
         .filter(|path| path.is_absolute())
+        .filter(|path| crate::platform::native_executable(path))
 }
 
-fn child_path_env(base: Option<&str>) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = Path::new(&home);
-        for path in [home.join(".local/bin"), home.join(".bun/bin")] {
-            parts.push(path.to_string_lossy().into_owned());
-        }
-    }
-    for path in [
-        "/usr/local/bin",
-        "/opt/homebrew/bin",
-        "/usr/bin",
-        "/bin",
-        "/usr/sbin",
-        "/sbin",
-    ] {
-        parts.push(path.into());
-    }
-    if let Some(base) = base {
-        for path in base.split(':').filter(|path| !path.is_empty()) {
-            if !parts.iter().any(|existing| existing == path) {
-                parts.push(path.into());
-            }
-        }
-    }
-    parts.join(":")
+fn child_path_env(base: Option<&std::ffi::OsStr>) -> std::ffi::OsString {
+    crate::platform::child_path(base)
 }
 
 /// Spawn one app-server using the exact executable already version-validated
@@ -348,7 +333,7 @@ pub(crate) fn spawn_child_with_binary(
     cwd: &Path,
     codex: &CodexBinary,
 ) -> Result<Child, ProtocolError> {
-    let child_path = child_path_env(std::env::var("PATH").ok().as_deref());
+    let child_path = child_path_env(std::env::var_os("PATH").as_deref());
     let mut command = Command::new(codex.path());
     command
         .args(["app-server", "--listen", "stdio://"])
@@ -362,7 +347,7 @@ pub(crate) fn spawn_child_with_binary(
     {
         command.process_group(0);
     }
-    command.spawn().map_err(|error| ProtocolError {
+    crate::process::spawn(&mut command).map_err(|error| ProtocolError {
         code: "codex-spawn-failed".into(),
         message: format!("failed to spawn codex app-server: {error}"),
         diagnostic_ref: None,
@@ -382,6 +367,8 @@ pub(super) fn kill_process_group(child: &mut Child) {
             let _ = signal_process_group(pid);
         }
     }
+    #[cfg(windows)]
+    let _ = child.terminate_tree();
     let _ = child.start_kill();
 }
 
@@ -402,11 +389,6 @@ pub(super) fn signal_process_group(process_group_id: u32) -> io::Result<()> {
     }
 }
 
-#[cfg(not(unix))]
-pub(super) fn signal_process_group(_process_group_id: u32) -> io::Result<()> {
-    Ok(())
-}
-
 /// Check whether any process still belongs to a previously captured process
 /// group. Live-session cleanup polls this after signaling until `ESRCH`
 /// confirms that the group has disappeared.
@@ -425,11 +407,6 @@ pub(super) fn process_group_exists(process_group_id: u32) -> io::Result<bool> {
     } else {
         Err(error)
     }
-}
-
-#[cfg(not(unix))]
-pub(super) fn process_group_exists(_process_group_id: u32) -> io::Result<bool> {
-    Ok(false)
 }
 
 /// Write one newline-delimited Codex JSON-RPC frame.
@@ -674,17 +651,38 @@ impl ShortLivedAppServer {
         })
     }
 
-    pub(super) async fn shutdown(&mut self) {
+    pub(super) async fn shutdown(&mut self) -> Result<(), ProtocolError> {
         let Some(mut child) = self.child.take() else {
-            let _ = join_stderr_drain(&mut self.stderr_drain, false).await;
-            return;
+            return join_stderr_drain(&mut self.stderr_drain, false).await;
         };
-        kill_process_group(&mut child);
-        let reaped = matches!(
-            tokio::time::timeout(SHORT_LIVED_SHUTDOWN_TIMEOUT, child.wait()).await,
-            Ok(Ok(_))
-        );
-        let _ = join_stderr_drain(&mut self.stderr_drain, reaped).await;
+        #[cfg(windows)]
+        let cleanup = child
+            .terminate_tree_and_wait(SHORT_LIVED_SHUTDOWN_TIMEOUT)
+            .await
+            .map_err(|error| ProtocolError {
+                code: "codex-cleanup-failed".into(),
+                message: format!("failed to clean up Codex app-server job: {error}"),
+                diagnostic_ref: None,
+            });
+        #[cfg(unix)]
+        let cleanup = {
+            kill_process_group(&mut child);
+            let reaped = matches!(
+                tokio::time::timeout(SHORT_LIVED_SHUTDOWN_TIMEOUT, child.wait()).await,
+                Ok(Ok(_))
+            );
+            if reaped {
+                Ok(())
+            } else {
+                Err(ProtocolError {
+                    code: "codex-cleanup-failed".into(),
+                    message: "failed to reap Codex app-server".into(),
+                    diagnostic_ref: None,
+                })
+            }
+        };
+        let drain = join_stderr_drain(&mut self.stderr_drain, cleanup.is_ok()).await;
+        cleanup.and(drain)
     }
 }
 
@@ -723,6 +721,26 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::ReadBuf;
+
+    #[cfg(windows)]
+    #[test]
+    fn explicit_windows_codex_requires_a_native_executable() {
+        let root = std::env::temp_dir().join(format!("codex-native-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        for name in ["codex.cmd", "codex.bat", "codex.ps1", "codex.exe"] {
+            let path = root.join(name);
+            std::fs::write(&path, "fixture; never executed").unwrap();
+            if name.ends_with(".exe") {
+                assert_eq!(codex_candidates(Some(path.clone())).unwrap(), [path]);
+            } else {
+                let error = codex_candidates(Some(path.clone())).unwrap_err();
+                assert_eq!(error.code, "codex-version-probe-failed");
+                assert!(error.message.contains(".exe"));
+                assert!(canonical_executable(&path).is_none());
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[cfg(unix)]
     use std::fs;
@@ -903,7 +921,7 @@ done
             client.request("fake/ping", json!({})).await.unwrap(),
             json!({ "ok": true })
         );
-        client.shutdown().await;
+        client.shutdown().await.unwrap();
 
         let calls = fake.calls();
         assert_eq!(calls.len(), 5, "unexpected fake Codex calls: {calls:?}");
@@ -1013,7 +1031,7 @@ done
         assert!(warning.message.contains(binary.version()));
         assert!(warning.message.contains(supported_codex_version()));
         assert!(warning.message.contains(binary.path().to_str().unwrap()));
-        client.shutdown().await;
+        client.shutdown().await.unwrap();
         let spawn_error =
             ShortLivedAppServer::spawn_with_binary(&desktop.root.join("missing-cwd"), &binary)
                 .err()

@@ -1,10 +1,14 @@
 mod support;
 
 use std::ffi::OsStr;
+#[cfg(unix)]
 use std::process::Command;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
-use support::{RunError, e2e_gate_value, run_command};
+use support::e2e_gate_value;
+#[cfg(unix)]
+use support::{RunError, run_command};
 
 #[test]
 fn e2e_gate_requires_exactly_one() {
@@ -21,6 +25,8 @@ fn e2e_gate_requires_exactly_one() {
     assert!(e2e_gate_value(Some(OsStr::new("1"))));
 }
 
+// These timeout fixtures use /bin/sh; the gate above is platform independent.
+#[cfg(unix)]
 #[test]
 fn hard_timeout_interrupts_process_with_no_output() {
     let mut command = Command::new("/bin/sh");
@@ -32,6 +38,7 @@ fn hard_timeout_interrupts_process_with_no_output() {
     assert!(started.elapsed() < Duration::from_secs(3));
 }
 
+#[cfg(unix)]
 #[test]
 fn hard_timeout_preserves_partial_output_for_diagnostics() {
     let mut command = Command::new("/bin/sh");

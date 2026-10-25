@@ -38,11 +38,13 @@ dependencies = [
  "agentdeck-protocol",
  "async-channel 2.5.0",
  "base64",
+ "chrono",
  "gpui",
  "gpui-component",
  "libc",
  "markdown",
  "serde_json",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -67,6 +69,7 @@ dependencies = [
  "tokio",
  "uuid",
  "which",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

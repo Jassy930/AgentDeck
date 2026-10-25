@@ -153,9 +153,14 @@ impl Agent for CodexAdapter {
     }
 
     async fn install_command(&self) -> Result<tokio::process::Command, ProtocolError> {
+        #[cfg(windows)]
+        let mut command =
+            crate::platform::powershell_installer("https://chatgpt.com/codex/install.ps1");
+        #[cfg(not(windows))]
         let mut command = tokio::process::Command::new("bash");
         // 官方脚本会直接读 /dev/tty，并询问是否启动 Codex；后台安装必须跳过交互。
         command.env("CODEX_NON_INTERACTIVE", "1");
+        #[cfg(not(windows))]
         command.args([
             "-o",
             "pipefail",

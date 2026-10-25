@@ -11,6 +11,7 @@ use agentdeck_protocol::{
     VendorControlPayload, effective_history_list_limit, valid_turn_input,
 };
 use std::collections::{BTreeMap, HashMap};
+#[cfg(unix)]
 use std::io;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -68,9 +69,9 @@ async fn run_agent_setup(
         .kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
-    let mut child = command
-        .spawn()
+    let mut child = crate::process::spawn(&mut command)
         .map_err(|error| action.failed(format!("无法启动{label}命令：{error}")))?;
+    #[cfg(unix)]
     let pid = child.id().expect("newly spawned updater has a pid");
     let mut stdout = child.stdout.take().expect("updater stdout is piped");
     let mut stderr = child.stderr.take().expect("updater stderr is piped");
@@ -87,6 +88,7 @@ async fn run_agent_setup(
         Ok(status) => status,
         Err(message) => {
             // 包管理器会再启动安装脚本；只杀 CLI 会留下仍在写文件的后代。
+            #[cfg(unix)]
             let cleanup = async {
                 signal_update_group(pid, 9)?;
                 if child.id().is_some() {
@@ -98,6 +100,8 @@ async fn run_agent_setup(
                 }
                 Ok::<_, io::Error>(())
             };
+            #[cfg(windows)]
+            let cleanup = child.terminate_tree_and_wait(Duration::from_secs(1));
             return Err(action.failed(
                 match tokio::time::timeout(Duration::from_secs(1), cleanup).await {
                     Ok(Ok(())) => format!("{message}，已终止"),
@@ -107,6 +111,20 @@ async fn run_agent_setup(
             ));
         }
     };
+    #[cfg(windows)]
+    {
+        // A launcher exit alone cannot prove its background installer finished.
+        let unfinished = !child
+            .tree_is_empty()
+            .map_err(|error| action.failed(format!("{label}进程检查失败：{error}")))?;
+        child
+            .terminate_tree_and_wait(Duration::from_secs(1))
+            .await
+            .map_err(|error| action.failed(format!("{label}进程清理失败：{error}")))?;
+        if unfinished {
+            return Err(action.failed(format!("{label}命令退出后仍有子进程；已终止，未确认完成")));
+        }
+    }
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out),
@@ -139,11 +157,6 @@ fn signal_update_group(pid: u32, signal: i32) -> io::Result<bool> {
     } else {
         Err(error)
     }
-}
-
-#[cfg(not(unix))]
-fn signal_update_group(_pid: u32, _signal: i32) -> io::Result<bool> {
-    Ok(false)
 }
 
 /// Routes by AgentKind; holds per-session ownership to enforce K2.
@@ -742,22 +755,46 @@ mod tests {
         }
 
         async fn install_command(&self) -> Result<tokio::process::Command, ProtocolError> {
+            #[cfg(unix)]
             let script = match self.kind {
                 AgentKind::Codex => "echo installed",
                 AgentKind::ClaudeCode => "echo install-boom >&2; exit 4",
             };
+            #[cfg(windows)]
+            let script = match self.kind {
+                AgentKind::Codex => "echo installed",
+                AgentKind::ClaudeCode => "echo install-boom 1>&2 & exit /b 4",
+            };
+            #[cfg(unix)]
             let mut command = tokio::process::Command::new("/bin/sh");
+            #[cfg(unix)]
             command.args(["-c", script]);
+            #[cfg(windows)]
+            let mut command = tokio::process::Command::new("cmd.exe");
+            #[cfg(windows)]
+            command.args(["/D", "/C", script]);
             Ok(command)
         }
 
         async fn update_command(&self) -> Result<tokio::process::Command, ProtocolError> {
+            #[cfg(unix)]
             let script = match self.kind {
                 AgentKind::Codex => "echo updated",
                 AgentKind::ClaudeCode => "echo boom >&2; exit 3",
             };
+            #[cfg(windows)]
+            let script = match self.kind {
+                AgentKind::Codex => "echo updated",
+                AgentKind::ClaudeCode => "echo boom 1>&2 & exit /b 3",
+            };
+            #[cfg(unix)]
             let mut command = tokio::process::Command::new("/bin/sh");
+            #[cfg(unix)]
             command.args(["-c", script]);
+            #[cfg(windows)]
+            let mut command = tokio::process::Command::new("cmd.exe");
+            #[cfg(windows)]
+            command.args(["/D", "/C", script]);
             Ok(command)
         }
 
@@ -950,6 +987,54 @@ esac
         assert!(error.message.ends_with("已终止"), "{}", error.message);
         tokio::time::sleep(Duration::from_millis(350)).await;
         assert!(!marker.exists(), "an updater child survived its timeout");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn update_cancellation_reaps_the_windows_installer_tree() {
+        use crate::process::test_fixture;
+        let dir = test_fixture::directory();
+        let command = test_fixture::fixture_command("root-stay", &dir).into();
+        let (cancel_tx, cancel) = watch::channel(false);
+        let run = tokio::spawn(run_agent_setup(
+            command,
+            cancel,
+            Duration::from_secs(30),
+            AgentSetupAction::Update,
+        ));
+        // Trigger cancellation only after two descendant generations exist.
+        let descendants = test_fixture::descendants(&dir).await;
+        cancel_tx.send(true).unwrap();
+        let error = run.await.unwrap().unwrap_err();
+        assert!(error.message.ends_with("已终止"), "{}", error.message);
+        for pid in descendants {
+            test_fixture::assert_exited(pid);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn setup_does_not_report_success_for_a_live_background_installer() {
+        use crate::process::test_fixture;
+        let dir = test_fixture::directory();
+        let command = test_fixture::fixture_command("root-exit", &dir).into();
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let error = run_agent_setup(
+            command,
+            cancel,
+            Duration::from_secs(15),
+            AgentSetupAction::Install,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.message.contains("未确认完成"), "{}", error.message);
+        for name in ["root-exit.pid", "branch.pid", "leaf.pid"] {
+            if let Ok(pid) = std::fs::read_to_string(dir.join(name)) {
+                test_fixture::assert_exited(pid.parse().unwrap());
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

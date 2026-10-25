@@ -227,10 +227,9 @@ mod tests {
     #[test]
     fn log_path_is_app_support() {
         let p = log_path_from(None, None, Some(std::ffi::OsStr::new("/Users/example"))).unwrap();
-        assert!(
-            p.to_string_lossy()
-                .contains(&format!("{}/AgentDeck", crate::record::PLATFORM_DATA_ROOT))
-        );
+        assert!(p.ends_with(
+            PathBuf::from(crate::record::PLATFORM_DATA_ROOT).join("AgentDeck/diagnostic.log")
+        ));
         assert!(p.to_string_lossy().ends_with("diagnostic.log"));
     }
 
@@ -249,11 +248,10 @@ mod tests {
         let path = log_path_from(None, Some(std::ffi::OsStr::new("dev")), Some(home)).unwrap();
 
         assert_eq!(
-            path.to_string_lossy(),
-            format!(
-                "/Users/example/{}/AgentDeck-Dev/diagnostic.log",
-                crate::record::PLATFORM_DATA_ROOT
-            )
+            path,
+            PathBuf::from(home)
+                .join(crate::record::PLATFORM_DATA_ROOT)
+                .join("AgentDeck-Dev/diagnostic.log")
         );
     }
 

@@ -7,12 +7,14 @@
 
 use crate::agent::{AgentEventSender, AgentSessionExit};
 use crate::codex::app_server::{
-    CodexBinary, StderrTail, drain_child_stderr, join_stderr_drain, process_group_exists,
-    signal_process_group, spawn_child_with_binary,
+    CodexBinary, StderrTail, drain_child_stderr, join_stderr_drain, spawn_child_with_binary,
 };
+#[cfg(unix)]
+use crate::codex::app_server::{process_group_exists, signal_process_group};
 use crate::codex::capabilities::build_codex_capabilities;
 use crate::codex::translate::CodexTranslator;
 use crate::diag::{self, DiagnosticEvent};
+use crate::process::Child;
 use agentdeck_protocol::{
     AgentKind, CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode, ImageAttachment,
     InitialTurn, ProtocolError, ServerEvent, SessionId, SessionOutcome, SessionStart, ThreadId,
@@ -26,7 +28,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::process::Child;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
@@ -34,6 +35,7 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 const INTERRUPT_TERMINAL_TIMEOUT: Duration = Duration::from_secs(10);
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const KILL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(unix)]
 const PROCESS_GROUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 type BoxReader = Pin<Box<dyn AsyncRead + Send>>;
@@ -154,8 +156,11 @@ impl AppServerFactory for ProcessAppServerFactory {
 struct OwnedChild {
     child: Option<Child>,
     process_group_id: Option<u32>,
+    #[cfg(unix)]
     signal_group: Arc<dyn Fn(u32) -> std::io::Result<()> + Send + Sync>,
+    #[cfg(unix)]
     group_exists: Arc<dyn Fn(u32) -> std::io::Result<bool> + Send + Sync>,
+    #[cfg(unix)]
     group_exit_timeout: Duration,
 }
 
@@ -165,13 +170,16 @@ impl OwnedChild {
         Self {
             child: Some(child),
             process_group_id,
+            #[cfg(unix)]
             signal_group: Arc::new(signal_process_group),
+            #[cfg(unix)]
             group_exists: Arc::new(process_group_exists),
+            #[cfg(unix)]
             group_exit_timeout: KILL_SHUTDOWN_TIMEOUT,
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_group_ops(
         child: Child,
         signal_group: Arc<dyn Fn(u32) -> std::io::Result<()> + Send + Sync>,
@@ -188,6 +196,7 @@ impl OwnedChild {
         }
     }
 
+    #[cfg(unix)]
     fn terminate_process_group(&self) -> Result<Option<u32>, ProtocolError> {
         #[cfg(unix)]
         {
@@ -203,12 +212,9 @@ impl OwnedChild {
             })?;
             Ok(Some(process_group_id))
         }
-        #[cfg(not(unix))]
-        {
-            Ok(None)
-        }
     }
 
+    #[cfg(unix)]
     async fn confirm_process_group_exit(
         &self,
         process_group_id: Option<u32>,
@@ -244,12 +250,14 @@ impl OwnedChild {
         Ok(())
     }
 
+    #[cfg(unix)]
     async fn cleanup_process_group(&self) -> Result<(), ProtocolError> {
         let process_group_id = self.terminate_process_group()?;
         self.confirm_process_group_exit(process_group_id).await
     }
 }
 
+#[cfg(unix)]
 #[async_trait]
 impl AppServerProcess for OwnedChild {
     fn pid(&self) -> Option<u32> {
@@ -299,8 +307,32 @@ impl AppServerProcess for OwnedChild {
     }
 }
 
+#[cfg(windows)]
+#[async_trait]
+impl AppServerProcess for OwnedChild {
+    fn pid(&self) -> Option<u32> {
+        self.process_group_id
+    }
+
+    async fn shutdown(&mut self) -> Result<(), ProtocolError> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(());
+        };
+        // stdin was closed by OpenedAppServer. Even a reaped direct child can
+        // leave tools in its job; only an empty job confirms complete cleanup.
+        let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, child.wait()).await;
+        child
+            .terminate_tree_and_wait(KILL_SHUTDOWN_TIMEOUT)
+            .await
+            .map_err(cleanup_error)?;
+        self.child.take();
+        Ok(())
+    }
+}
+
 impl Drop for OwnedChild {
     fn drop(&mut self) {
+        #[cfg(unix)]
         if self.child.is_some() {
             let _ = self.terminate_process_group();
         }
@@ -2051,6 +2083,28 @@ mod tests {
         owned.shutdown().await.unwrap();
 
         assert_eq!(*calls.lock().unwrap(), vec![expected_process_group]);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn reaped_direct_child_still_cleans_its_windows_job() {
+        use crate::process::test_fixture;
+        let dir = test_fixture::directory();
+        let mut command: tokio::process::Command =
+            test_fixture::fixture_command("root-exit", &dir).into();
+        let child = crate::process::spawn(&mut command).unwrap();
+        let mut owned = OwnedChild::new(child);
+        let descendants = test_fixture::descendants(&dir).await;
+        owned.child.as_mut().unwrap().wait().await.unwrap();
+        assert!(owned.child.as_ref().unwrap().id().is_none());
+        owned
+            .shutdown()
+            .await
+            .expect("job cleanup must be confirmed");
+        for pid in descendants {
+            test_fixture::assert_exited(pid);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(unix)]

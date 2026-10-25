@@ -43,6 +43,14 @@ fn next_history_request_id() -> String {
 }
 
 fn is_exec(path: &Path) -> bool {
+    #[cfg(windows)]
+    if !path
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+    {
+        return false;
+    }
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
     };
@@ -75,17 +83,22 @@ fn locate_daemon() -> Result<PathBuf> {
 
     let mut candidates = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("agentdeckd"));
+        if let Some(sibling) = sibling_daemon(&exe) {
+            return Ok(sibling);
         }
     }
-    candidates.push(PathBuf::from("target/debug/agentdeckd"));
-    candidates.push(PathBuf::from("target/release/agentdeckd"));
+    candidates.push(PathBuf::from("target/debug").join(crate::platform::DAEMON_EXE));
+    candidates.push(PathBuf::from("target/release").join(crate::platform::DAEMON_EXE));
 
     candidates
         .into_iter()
         .find(|path| is_exec(path))
         .ok_or_else(|| "未找到 agentdeckd（构建：cargo build -p agentdeckd）".to_string())
+}
+
+fn sibling_daemon(executable: &Path) -> Option<PathBuf> {
+    let path = executable.parent()?.join(crate::platform::DAEMON_EXE);
+    is_exec(&path).then_some(path)
 }
 
 /// 进程守卫：无论成功、失败还是提前返回都回收子进程。
@@ -125,7 +138,8 @@ impl Drop for DaemonChild {
 
 /// ControlMaster 让断线重连免去完整握手；ServerAlive 让对端休眠/断网时 ssh
 /// 约 45 秒内退出，读线程据此让等待者失败，而不是永远挂起。
-pub(crate) const SSH_OPTIONS: [&str; 13] = [
+#[cfg(not(windows))]
+pub(crate) const SSH_OPTIONS: &[&str] = &[
     "-T",
     "-o",
     "BatchMode=yes",
@@ -135,6 +149,18 @@ pub(crate) const SSH_OPTIONS: [&str; 13] = [
     "ControlPath=~/.ssh/agentdeck-%C",
     "-o",
     "ControlPersist=60",
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=3",
+];
+
+// Windows OpenSSH 没有 Unix ControlMaster socket；保留非交互与断线检测。
+#[cfg(windows)]
+pub(crate) const SSH_OPTIONS: &[&str] = &[
+    "-T",
+    "-o",
+    "BatchMode=yes",
     "-o",
     "ServerAliveInterval=15",
     "-o",
@@ -175,7 +201,7 @@ fn build_command(host: Option<&str>) -> Result<Command> {
         }
         None => {
             let mut command = daemon_command(locate_daemon()?);
-            if let Some(home) = std::env::var_os("HOME") {
+            if let Some(home) = crate::platform::home_dir() {
                 let old_path = std::env::var_os("PATH").unwrap_or_default();
                 let paths = std::iter::once(PathBuf::from(home).join(".local/bin"))
                     .chain(std::env::split_paths(&old_path));
@@ -189,7 +215,7 @@ fn build_command(host: Option<&str>) -> Result<Command> {
 }
 
 fn daemon_command(program: impl AsRef<OsStr>) -> Command {
-    let mut command = Command::new(program);
+    let mut command = crate::platform::command(program);
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -966,6 +992,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn fake_daemon(script: &str) -> std::sync::Arc<super::Connection> {
         let mut command = super::daemon_command("/bin/sh");
         command.args(["-c", script]);
@@ -1002,18 +1029,7 @@ mod tests {
     #[test]
     fn sent_commands_reach_the_daemon_and_events_flow_back() {
         let client = super::Client::new(Some("-offline-test"));
-        let mut command = super::daemon_command("/bin/sh");
-        command.env(
-            "TEST_PROTOCOL_VERSION",
-            agentdeck_protocol::PROTOCOL_VERSION.to_string(),
-        );
-        command.args([
-            "-c",
-            r#"read -r line
-                printf '{"reply":"protocolVersion","protocolVersion":%s}\n' "$TEST_PROTOCOL_VERSION"
-                read -r line; case "$line" in *'"command":"sessionStart"'*)
-                echo '{"type":"turnStarted","sessionId":"s","threadId":"t","agentKind":"claude_code","turnId":"t1"}';; esac"#,
-        ]);
+        let command = native_fixture("session");
         let connection = super::Connection::spawn(command, client.inner.events.0.clone()).unwrap();
         client.inner.state.lock().unwrap().connection = Some(connection);
         let events = client.events();
@@ -1030,6 +1046,108 @@ mod tests {
         ));
     }
 
+    fn native_fixture(mode: &str) -> std::process::Command {
+        let mut command = super::daemon_command(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "daemon::tests::native_pipe_fixture",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("AGENTDECK_DESKTOP_PIPE_FIXTURE", mode);
+        command
+    }
+
+    #[test]
+    fn native_pipe_fixture() {
+        use std::io::{BufRead, Write};
+        let Ok(mode) = std::env::var("AGENTDECK_DESKTOP_PIPE_FIXTURE") else {
+            return;
+        };
+        println!(); // libtest 的前缀不是 IPC；真实 fixture 回复从新行开始。
+        for line in std::io::stdin().lock().lines() {
+            let request: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+            let reply = match request["command"].as_str().unwrap() {
+                "protocolVersion" => {
+                    serde_json::json!({"reply":"protocolVersion", "protocolVersion":agentdeck_protocol::PROTOCOL_VERSION})
+                }
+                "sessionStart" => {
+                    println!(
+                        "{}",
+                        serde_json::json!({"type":"turnStarted","sessionId":"s","threadId":"t","agentKind":"claude_code","turnId":"t1"})
+                    );
+                    std::io::stdout().flush().unwrap();
+                    std::process::exit(0);
+                }
+                "agentList" => serde_json::json!({"reply":"agentList", "agents":[]}),
+                "history" => {
+                    serde_json::json!({"reply":"history", "requestId":request["requestId"]})
+                }
+                _ => panic!("unexpected fixture request {request}"),
+            };
+            println!("{reply}");
+            std::io::stdout().flush().unwrap();
+            assert!(mode == "session" || mode == "requests");
+        }
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn native_executable_routes_requests_and_disconnects_without_a_shell() {
+        let connection =
+            super::Connection::spawn(native_fixture("requests"), async_channel::unbounded().0)
+                .unwrap();
+        let client = fake_client(&connection);
+        assert!(client.agent_list().unwrap().is_empty());
+        let first = connection
+            .request(&list_request(), "history")
+            .unwrap()
+            .unwrap();
+        let second = connection
+            .request(&list_request(), "history")
+            .unwrap()
+            .unwrap();
+        assert_ne!(first["requestId"], second["requestId"]);
+        client.disconnect();
+        assert!(!connection.is_alive());
+        assert!(connection.child.lock().unwrap().is_none());
+        assert_eq!(client.agent_list().unwrap_err(), "机器连接已断开");
+    }
+
+    #[test]
+    fn packaged_daemon_uses_platform_executable_name() {
+        let dir = std::env::temp_dir().join(next_history_request_id());
+        std::fs::create_dir_all(&dir).unwrap();
+        let executable = dir.join(if cfg!(windows) {
+            "AgentDeck.exe"
+        } else {
+            "AgentDeck"
+        });
+        assert!(super::sibling_daemon(&executable).is_none());
+        let daemon = dir.join(crate::platform::DAEMON_EXE);
+        std::fs::write(&daemon, "fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&daemon, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(super::sibling_daemon(&executable), Some(daemon));
+        #[cfg(windows)]
+        {
+            let shim = dir.join("agentdeckd.cmd");
+            std::fs::write(&shim, "@echo off").unwrap();
+            assert!(!super::is_exec(&shim));
+            assert!(
+                super::SSH_OPTIONS
+                    .iter()
+                    .all(|arg| !arg.starts_with("Control"))
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
     #[test]
     fn delayed_disconnect_only_targets_sessions_on_the_old_connection() {
         let gate = std::env::temp_dir().join(next_history_request_id());
@@ -1095,6 +1213,7 @@ mod tests {
         std::fs::remove_file(gate).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn closed_sessions_are_removed_from_disconnect_notifications() {
         let client = super::Client::new(Some("-offline-test"));
@@ -1257,6 +1376,7 @@ mod tests {
     }
 
     /// 两个 agent 的能力查询并发发出、daemon 乱序返回，各自拿到完整的 typed capabilities。
+    #[cfg(unix)]
     #[test]
     fn agent_capabilities_are_routed_by_agent_kind() {
         let connection = fake_daemon(
@@ -1301,6 +1421,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn interaction_rejects_old_protocol_on_the_connection_that_would_send() {
         let connection = fake_daemon(
@@ -1339,6 +1460,7 @@ mod tests {
         assert!(connection.is_alive(), "read-only requests remain available");
     }
 
+    #[cfg(unix)]
     #[test]
     fn agent_install_and_update_reject_old_protocol_without_sending_writes() {
         let connection = fake_daemon(
@@ -1363,6 +1485,7 @@ mod tests {
         assert!(client.agent_list().unwrap().is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn agent_install_and_update_do_not_retry_a_lost_reply() {
         for action in [super::Client::agent_install, super::Client::agent_update] {

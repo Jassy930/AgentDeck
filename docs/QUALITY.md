@@ -66,21 +66,29 @@ iOS 变更范围在本地单独执行。
 
 ## Release 包门禁
 
-第一期矩阵、安装与签名边界见 [RELEASE.md](RELEASE.md)。`.github/workflows/release.yml`
+产物矩阵、安装与签名边界见 [RELEASE.md](RELEASE.md)。`.github/workflows/release.yml`
 的 PR/手动运行只生成候选产物，覆盖 macOS Apple Silicon / Intel 桌面与 daemon、
-Ubuntu 24.04 x86_64 桌面与 GNU daemon、Linux 双架构 musl daemon。
+Ubuntu 24.04 x86_64 / ARM64 桌面与 GNU daemon、Windows x64 桌面与 daemon、Linux 双架构 musl daemon。
 
 构建必须使用 `--release --locked`；烟测从实际归档解包，检查架构、workspace/二进制/归档
 版本一致，隔离 HOME 与数据目录运行 daemon selfcheck/diagnostics 和桌面隐藏窗口 selfcheck。
 macOS 另核对 bundle 图标、最低系统版本和代码签名完整性；签名完整性不等于 Developer ID
 签名或公证验收。Linux CI 使用 Xvfb 和软件 Vulkan，不代表硬件 GPU / Wayland 全面兼容。
+Windows 在 `windows-2025`（Windows Server 2025）上原生构建，验证 x64 PE、系统 DLL
+依赖、静态 CRT 和未签名状态；PowerShell smoke 从 ZIP 解包，隔离用户环境并使用原生 EXE
+tripwire。Windows 路径、native IPC 与 Job 进程树 fixture 必须实际执行，不能用跨平台
+`cargo check` 替代。Windows CI 还用当前 release CLI/daemon 执行 selfcheck、协议 schema
+和诊断报告；POSIX shell 的 `session_live` fixture 仅在 Unix 执行。
+CI 隐藏窗口启动不代表 Windows 10/11 GUI、SmartScreen、Authenticode、
+真实 SSH 或 vendor 会话已验收。
 
-完整集合必须精确包含 8 个归档，生成并回验 `SHA256SUMS`。只有 v* tag 的版本匹配、
+完整集合必须精确包含 12 个归档，生成并回验 `SHA256SUMS`。只有 v* tag 的版本匹配、
 全部原生目标和离线门禁成功后，统一 publish 才能上传 draft、回验并公开。
 PR/手动运行不得创建实际 Release。验收分别记录静态检查、实际构建、归档启动烟测、
 人工 GUI 和签名/公证结果；没有运行的项目明确写未运行。
 
-release 验证使用 `scripts/release/package.sh` 和 `scripts/release/smoke.sh`，不调用
+Unix release 验证使用 `scripts/release/package.sh` 和 `scripts/release/smoke.sh`，Windows
+使用 `package-windows.ps1` / `smoke-windows.ps1` / `test-windows.ps1`，不调用
 会停止或打开开发应用的 `script/build_and_run.sh`。发布脚本的归档验证负责 release bundle
 检查；交互视图变更仍按下文执行真实窗口人工验收。
 
@@ -163,7 +171,7 @@ selfcheck 的成功输出必须是单行 JSON，并明确包含：
 - [ ] 空态渲染居中标题与按已注册 agent 生成的卡片；激活侧栏条目切到会话态并
       加载该会话记录，激活“新建会话”切回空态；焦点移入搜索框后，当前条目仍显示选中态。
 - [ ] agent 卡片右上角“＋”在对应机器与 agent 上打开新会话，不触发卡片筛选；发送前可改工作目录，
-      默认使用同来源最近会话的目录，本机无历史时为 HOME，远端无历史时留空；空目录、能力未就绪或协议不匹配时不能发送。
+      默认使用同来源最近会话的目录，本机无历史时为用户目录（Windows 优先 USERPROFILE，其余平台为 HOME），远端无历史时留空；空目录、能力未就绪或协议不匹配时不能发送。
 - [ ] 新会话首条命令不带 resumeThreadId；daemon 返回真实 threadId 后加入侧栏，标题取首条消息首行，
       后续消息复用 session，刷新与重新打开后不重复生成侧栏条目。
 - [ ] 搜索框可键入中文，按标题或项目名实时过滤；点击 agent 卡片或机器页 agent 行只看该 agent，
@@ -229,6 +237,7 @@ macOS 桌面不得重新依赖 Swift target；共享 Core 测试也不得重新�
 | GPUI 视图、状态或组件 | `cargo test -p agentdeck-desktop`、desktop selfcheck、真实窗口冒烟 |
 | 桌面 bundle 或启动脚本 | `bash -n script/build_and_run.sh`、`./script/build_and_run.sh --verify` |
 | release 打包或发布 CI | `scripts/release/` 静态检查与自检、各原生目标 package/smoke、完整集合和 SHA256 回验；见 [RELEASE.md](RELEASE.md) |
+| Windows 路径、原生 EXE、进程树与 IPC | Windows 原生 daemon/desktop/CLI fixture 测试、PowerShell 脚本自检、实际 ZIP 烟测；不启动真实 vendor |
 | Swift Core / iOS 共享模型 | `swift test`；涉及 iOS 时再跑 iOS Simulator 测试 |
 | daemon、adapter、record、diagnostics | `scripts/verify-offline-tests.sh`、对应 focused test，以及通过 `AGENTDECK_DAEMON_BIN` 绑定当前 checkout 的 CLI selfcheck |
 | agentdeck-protocol | `cargo test -p agentdeck-protocol`；漂移时按下文重生成 schema |

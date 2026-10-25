@@ -118,9 +118,13 @@ where
 pub fn probe_claude_code_version() -> String {
     probe_claude_code_version_with_command(|| {
         use std::process::Command;
-        Command::new("claude")
-            .arg("--version")
-            .output()
+        let mut command = Command::new(crate::platform::executable("claude"));
+        command.arg("--version");
+        #[cfg(windows)]
+        let output = crate::process::output(&mut command, std::time::Duration::from_secs(5));
+        #[cfg(not(windows))]
+        let output = command.output();
+        output
             .map(|out| {
                 (
                     out.status.code().unwrap_or(-1),

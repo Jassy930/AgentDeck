@@ -1,7 +1,6 @@
 //! 版本号提取与比较，以及从 npm registry 查询 agent CLI 的最新发布版本。
 
 use std::cmp::Ordering;
-use std::process::Command;
 
 use agentdeck_protocol::AgentKind;
 
@@ -46,7 +45,7 @@ fn npm_package(kind: AgentKind) -> &'static str {
 /// 在本机查 npm registry 上的最新版本；阻塞调用，放到后台线程执行。
 pub fn fetch_latest(kind: AgentKind) -> Result<String, String> {
     let url = format!("https://registry.npmjs.org/{}/latest", npm_package(kind));
-    let output = Command::new("curl")
+    let output = crate::platform::command("curl")
         .args(["-fsSL", "--max-time", "10", &url])
         .output()
         .map_err(|error| format!("运行 curl 失败：{error}"))?;

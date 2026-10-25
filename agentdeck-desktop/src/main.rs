@@ -1,6 +1,12 @@
+#![cfg_attr(
+    all(windows, not(debug_assertions), not(test)),
+    windows_subsystem = "windows"
+)]
+
 mod daemon;
 mod live;
 mod machines;
+mod platform;
 mod remotes;
 mod session_router;
 mod shell;
@@ -89,6 +95,10 @@ fn open_main_window(cx: &mut App, show: bool) {
 }
 
 fn main() {
+    #[cfg(windows)]
+    if env::args_os().any(|arg| arg == "--version" || arg == "-V" || arg == "--selfcheck") {
+        platform::attach_parent_console_if_needed();
+    }
     if env::args_os().any(|arg| arg == "--version" || arg == "-V") {
         println!("agentdeck-desktop {}", env!("CARGO_PKG_VERSION"));
         return;
@@ -100,7 +110,7 @@ fn main() {
         theme::apply(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([
-            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("secondary-q", Quit, None),
             KeyBinding::new("tab", shell::NextQuestion, Some("QuestionCard")),
             KeyBinding::new("shift-tab", shell::PreviousQuestion, Some("QuestionCard")),
         ]);

@@ -20,6 +20,7 @@
 
 use crate::agent::{AgentEventSender, AgentSessionExit};
 use crate::claude_code::translate::{ClaudeCodeTranslator, PermissionRoute};
+use crate::process::Child;
 use agentdeck_protocol::{
     ActionDecision, ActionDecisionKind, AgentKind, ClaudeCodePermissionMode, ImageAttachment,
     InitialTurn, ProtocolError, ServerEvent, SessionId, SessionOutcome, ThreadId, TurnId,
@@ -29,7 +30,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin};
+use tokio::process::ChildStdin;
 use tokio::sync::{mpsc, oneshot};
 
 /// How long a closing session may take to flush stdout and exit before
@@ -508,6 +509,7 @@ impl Owner {
 
 /// Wait for the child (killing its process group if it would not exit in
 /// time) and sweep any orphans left in the group. True once both are gone.
+#[cfg(unix)]
 async fn reap(child: &mut Child, process_group_id: Option<u32>, exited_gracefully: bool) -> bool {
     if !exited_gracefully
         || tokio::time::timeout(Duration::from_secs(2), child.wait())
@@ -526,9 +528,20 @@ async fn reap(child: &mut Child, process_group_id: Option<u32>, exited_gracefull
         // Tool subprocesses (e.g. a backgrounded Bash) may outlive claude.
         kill_group(pid).is_ok() && confirm_group_exit(pid).await
     } else {
-        !cfg!(unix)
+        false
     };
     reaped && group_gone
+}
+
+#[cfg(windows)]
+async fn reap(child: &mut Child, _process_group_id: Option<u32>, exited_gracefully: bool) -> bool {
+    if exited_gracefully {
+        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    }
+    child
+        .terminate_tree_and_wait(Duration::from_secs(5))
+        .await
+        .is_ok()
 }
 
 fn reject(command: SessionCommand, code: &str, message: &str) {
@@ -568,6 +581,7 @@ fn error(code: &str, message: impl Into<String>) -> ProtocolError {
     }
 }
 
+#[cfg(unix)]
 fn kill_group(pid: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     if unsafe { libc_kill(-(pid as i32), SIGKILL) } != 0 {
@@ -576,11 +590,10 @@ fn kill_group(pid: u32) -> std::io::Result<()> {
             return Err(error);
         }
     }
-    #[cfg(not(unix))]
-    let _ = pid;
     Ok(())
 }
 
+#[cfg(unix)]
 async fn confirm_group_exit(pid: u32) -> bool {
     #[cfg(unix)]
     return tokio::time::timeout(Duration::from_secs(5), async {
@@ -598,11 +611,6 @@ async fn confirm_group_exit(pid: u32) -> bool {
     })
     .await
     .unwrap_or(false);
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        true
-    }
 }
 
 #[cfg(unix)]
@@ -623,31 +631,88 @@ mod tests {
     use agentdeck_protocol::{AgentItem, AgentItemState};
     use std::process::Stdio;
 
-    /// Fake `claude` speaking the stream-json control protocol shapes
-    /// recorded from claude 2.1.304.
-    const FAKE_CLAUDE: &str = r#"
-while IFS= read -r line; do
-  case "$line" in
-    *'"subtype":"initialize"'*) echo '{"type":"control_response","response":{"subtype":"success","request_id":"agentdeck-1","response":{}}}' ;;
-    *'"subtype":"set_permission_mode"'*)
-      id=$(printf %s "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
-      case "$line" in
-        *bypassPermissions*) echo "{\"type\":\"control_response\",\"response\":{\"subtype\":\"error\",\"request_id\":\"$id\",\"error\":\"not launched with bypass\"}}" ;;
-        *) echo "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$id\",\"response\":{}}}" ;;
-      esac ;;
-    *'"subtype":"interrupt"'*) echo '{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"thread-x"}' ;;
-    *'"answers":{"color":"blue"}'*) echo '{"type":"assistant","session_id":"thread-x","message":{"id":"m3","content":[{"type":"text","text":"got blue"}]}}'
-      echo '{"type":"result","subtype":"success","is_error":false,"session_id":"thread-x"}' ;;
-    *ask-me*) echo '{"type":"control_request","request_id":"ask-1","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{"question":"color","options":[{"label":"blue"}]}]}}}' ;;
-    *'"behavior":"allow"'*) echo '{"type":"assistant","session_id":"thread-x","message":{"id":"m2","content":[{"type":"text","text":"approved"}]}}'
-      echo '{"type":"result","subtype":"success","is_error":false,"session_id":"thread-x"}' ;;
-    *approve*) echo '{"type":"control_request","request_id":"perm-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"},"permission_suggestions":[]}}' ;;
-    *slow*) ;;
-    *'"type":"user"'*) echo '{"type":"assistant","session_id":"thread-x","message":{"id":"m1","content":[{"type":"text","text":"hi"}]}}'
-      echo '{"type":"result","subtype":"success","is_error":false,"session_id":"thread-x"}' ;;
-  esac
-done
-"#;
+    fn fake_claude_command(fail: bool) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "claude_code::session::tests::native_claude_fixture",
+                "--nocapture",
+            ])
+            .env(
+                "AGENTDECK_FAKE_CLAUDE",
+                if fail { "fail" } else { "normal" },
+            );
+        #[cfg(unix)]
+        command.process_group(0);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        command
+    }
+
+    #[test]
+    fn native_claude_fixture() {
+        use std::io::{BufRead, Write};
+        let Ok(mode) = std::env::var("AGENTDECK_FAKE_CLAUDE") else {
+            return;
+        };
+        let emit = |value: Value| {
+            println!("{value}");
+            std::io::stdout().flush().unwrap();
+        };
+        let finish = |text: &str| {
+            emit(
+                json!({"type":"assistant", "session_id":"thread-x", "message":{"id":"m", "content":[{"type":"text", "text":text}]}}),
+            );
+            emit(
+                json!({"type":"result", "subtype":"success", "is_error":false, "session_id":"thread-x"}),
+            );
+        };
+        for (index, line) in std::io::stdin().lock().lines().enumerate() {
+            let value: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            if mode == "fail" {
+                if index == 1 {
+                    eprintln!("boom");
+                    std::process::exit(3);
+                }
+                continue;
+            }
+            match value["type"].as_str() {
+                Some("control_request") => match value["request"]["subtype"].as_str() {
+                    Some("interrupt") => emit(
+                        json!({"type":"result", "subtype":"error_during_execution", "is_error":true, "session_id":"thread-x"}),
+                    ),
+                    Some("initialize" | "set_permission_mode") => {
+                        let denied = value["request"]["mode"] == "bypassPermissions";
+                        emit(
+                            json!({"type":"control_response", "response":{"subtype": if denied { "error" } else { "success" }, "request_id":value["request_id"], "response":{}, "error":if denied { "not launched with bypass" } else { "" }}}),
+                        );
+                    }
+                    _ => {}
+                },
+                Some("control_response") => finish(if value["response"]["request_id"] == "ask-1" {
+                    "got blue"
+                } else {
+                    "approved"
+                }),
+                Some("user") => match value["message"]["content"].as_str().unwrap_or("") {
+                    "slow" => {}
+                    "approve" => emit(
+                        json!({"type":"control_request", "request_id":"perm-1", "request":{"subtype":"can_use_tool", "tool_name":"Bash", "input":{"command":"ls"}, "permission_suggestions":[]}}),
+                    ),
+                    "ask-me" => emit(
+                        json!({"type":"control_request", "request_id":"ask-1", "request":{"subtype":"can_use_tool", "tool_name":"AskUserQuestion", "input":{"questions":[{"question":"color", "options":[{"label":"blue"}]}]}}}),
+                    ),
+                    _ => finish("hi"),
+                },
+                _ => {}
+            }
+        }
+        std::process::exit(0);
+    }
 
     async fn next(events: &mut mpsc::Receiver<ServerEvent>) -> ServerEvent {
         tokio::time::timeout(Duration::from_secs(5), events.recv())
@@ -720,14 +785,8 @@ done
 
     #[tokio::test]
     async fn one_child_serves_turns_approvals_cancel_and_close() {
-        let mut command = tokio::process::Command::new("sh");
-        command
-            .args(["-c", FAKE_CLAUDE])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
-        let child = command.spawn().expect("spawn fake claude");
+        let child =
+            crate::process::spawn(&mut fake_claude_command(false)).expect("spawn fake claude");
         let (events_tx, mut events) = mpsc::channel(64);
         let (exit_tx, exit_rx) = oneshot::channel();
         let (commands, _abort) = spawn_owner(
@@ -860,17 +919,10 @@ done
 
     #[tokio::test]
     async fn permission_mode_changes_follow_claude_answers() {
-        let mut command = tokio::process::Command::new("sh");
-        command
-            .args(["-c", FAKE_CLAUDE])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
         let (events_tx, mut events) = mpsc::channel(64);
         let (exit_tx, _exit_rx) = oneshot::channel();
         let (commands, _abort) = spawn_owner(
-            command.spawn().expect("spawn fake claude"),
+            crate::process::spawn(&mut fake_claude_command(false)).expect("spawn fake claude"),
             OwnerStart {
                 session_id: SessionId("s".into()),
                 thread_id: ThreadId("thread-x".into()),
@@ -912,17 +964,10 @@ done
 
     #[tokio::test]
     async fn answers_ride_in_updated_input() {
-        let mut command = tokio::process::Command::new("sh");
-        command
-            .args(["-c", FAKE_CLAUDE])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
         let (events_tx, mut events) = mpsc::channel(64);
         let (exit_tx, _exit_rx) = oneshot::channel();
         let (commands, _abort) = spawn_owner(
-            command.spawn().expect("spawn fake claude"),
+            crate::process::spawn(&mut fake_claude_command(false)).expect("spawn fake claude"),
             OwnerStart {
                 session_id: SessionId("s".into()),
                 thread_id: ThreadId("thread-x".into()),
@@ -966,17 +1011,10 @@ done
 
     #[tokio::test]
     async fn unexpected_child_exit_fails_the_running_turn_and_session() {
-        let mut command = tokio::process::Command::new("sh");
-        command
-            .args(["-c", "read -r _; read -r _; echo boom >&2; exit 3"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
         let (events_tx, mut events) = mpsc::channel(64);
         let (exit_tx, exit_rx) = oneshot::channel();
         let _owner = spawn_owner(
-            command.spawn().expect("spawn"),
+            crate::process::spawn(&mut fake_claude_command(true)).expect("spawn"),
             OwnerStart {
                 session_id: SessionId("s".into()),
                 thread_id: ThreadId("thread-x".into()),

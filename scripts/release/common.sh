@@ -33,10 +33,10 @@ release_version() {
 
 release_target() {
   case "$1:$2" in
-    aarch64-apple-darwin:desktop|x86_64-apple-darwin:desktop|x86_64-unknown-linux-gnu:desktop|\
-    aarch64-apple-darwin:daemon|x86_64-apple-darwin:daemon|x86_64-unknown-linux-gnu:daemon|\
+    aarch64-apple-darwin:desktop|x86_64-apple-darwin:desktop|x86_64-unknown-linux-gnu:desktop|aarch64-unknown-linux-gnu:desktop|\
+    aarch64-apple-darwin:daemon|x86_64-apple-darwin:daemon|x86_64-unknown-linux-gnu:daemon|aarch64-unknown-linux-gnu:daemon|\
     x86_64-unknown-linux-musl:daemon|aarch64-unknown-linux-musl:daemon) ;;
-    *) release_fail "unsupported phase-one target/kind: $1 $2"; return 1 ;;
+    *) release_fail "unsupported Unix target/kind: $1 $2"; return 1 ;;
   esac
 }
 

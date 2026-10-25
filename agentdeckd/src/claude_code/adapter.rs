@@ -84,7 +84,7 @@ impl ClaudeCodeAdapter {
             }
         };
 
-        let mut cmd = Command::new("claude");
+        let mut cmd = Command::new(crate::platform::executable("claude"));
         cmd.arg("--print")
             .arg("--output-format")
             .arg("stream-json")
@@ -180,12 +180,14 @@ impl ClaudeCodeAdapter {
         use crate::claude_code::auth::{AuthState, probe_auth_status};
 
         // 1. Binary on PATH?
-        if which::which("claude").is_err() {
+        if !crate::platform::executable_available("claude") {
             let err = ProtocolError {
                 code: "cc-not-installed".into(),
-                message: "`claude` binary not in PATH. Install: \
-                          npm install -g @anthropic-ai/claude-code"
-                    .into(),
+                message: if cfg!(windows) {
+                    "找不到原生 claude.exe。Windows 不支持 npm .cmd / .bat shim，请用官方 PowerShell 安装器安装：https://claude.ai/install.ps1"
+                } else {
+                    "`claude` binary not in PATH. Install with the official native installer: https://claude.ai/install.sh"
+                }.into(),
                 diagnostic_ref: None,
             };
             let _ = events
@@ -255,7 +257,7 @@ impl ClaudeCodeAdapter {
         self.preflight(&events, Some(&session_id)).await?;
 
         let (mut cmd, permission_mode, thread_id) = Self::build_command(&start)?;
-        let child = cmd.spawn().map_err(|e| ProtocolError {
+        let child = crate::process::spawn(&mut cmd).map_err(|e| ProtocolError {
             code: "cc-spawn-failed".into(),
             message: format!("failed to spawn `claude`: {e}"),
             diagnostic_ref: None,
@@ -350,18 +352,27 @@ impl Agent for ClaudeCodeAdapter {
     }
 
     async fn install_command(&self) -> Result<tokio::process::Command, ProtocolError> {
-        let mut command = tokio::process::Command::new("bash");
-        command.args([
-            "-o",
-            "pipefail",
-            "-c",
-            "curl -fsSL https://claude.ai/install.sh | bash",
-        ]);
-        Ok(command)
+        #[cfg(windows)]
+        {
+            Ok(crate::platform::powershell_installer(
+                "https://claude.ai/install.ps1",
+            ))
+        }
+        #[cfg(not(windows))]
+        {
+            let mut command = tokio::process::Command::new("bash");
+            command.args([
+                "-o",
+                "pipefail",
+                "-c",
+                "curl -fsSL https://claude.ai/install.sh | bash",
+            ]);
+            Ok(command)
+        }
     }
 
     async fn update_command(&self) -> Result<tokio::process::Command, ProtocolError> {
-        let mut command = tokio::process::Command::new("claude");
+        let mut command = tokio::process::Command::new(crate::platform::executable("claude"));
         command.arg("update");
         Ok(command)
     }

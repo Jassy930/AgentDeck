@@ -24,6 +24,9 @@ jobs:
     name: package (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -37,6 +40,12 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
             kind: desktop
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            kind: desktop
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
+            kind: desktop
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-24.04
             kind: daemon
@@ -46,6 +55,8 @@ jobs:
     env:
       CARGO_BUILD_JOBS: 2
       MACOSX_DEPLOYMENT_TARGET: "15.0"
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+      AGENTDECK_RELEASE_TAG: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
 
     steps:
       - name: Check out repository
@@ -56,6 +67,34 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Configure native MSVC x64 tools
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        with:
+          arch: x64
+
+      - name: Locate Windows SDK shader compiler
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/fxc.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'The Windows SDK fxc.exe shader compiler is missing.' }
+          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
+          "LIBCLANG_PATH=$env:ProgramFiles/LLVM/bin" >> $env:GITHUB_ENV
+          Get-Command cl.exe, link.exe, dumpbin.exe, cmake.exe
+
+      # 只缓存依赖，显式区分OS/架构/runner/目标/部署基线；tag完全不用PR缓存。
+      - name: Cache non-publishing Rust dependencies
+        if: github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/')
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: release-v2-${{ runner.os }}-${{ runner.arch }}-${{ matrix.runner }}-${{ matrix.target }}-macos15
+          workspaces: ". -> target/release-build"
+          env-vars: "CARGO CC CFLAGS CXX CMAKE RUST MACOSX_DEPLOYMENT_TARGET GPUI_FXC_PATH LIBCLANG_PATH"
+          cache-bin: false
+          cache-workspace-crates: false
+
       - name: Install Linux desktop dependencies
         if: runner.os == 'Linux' && matrix.kind == 'desktop'
         run: |
@@ -64,15 +103,16 @@ jobs:
             build-essential clang cmake pkg-config libfontconfig1-dev libfreetype6-dev \
             libx11-xcb-dev libxcb1-dev libxkbcommon-x11-dev libwayland-dev \
             libssl-dev libasound2-dev libvulkan1 mesa-vulkan-drivers \
-            xvfb xauth dbus-x11 fonts-dejavu-core
+            xvfb xauth dbus-x11 fonts-dejavu-core zip unzip
 
       - name: Install musl toolchain
         if: matrix.kind == 'daemon'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends musl-tools
+          sudo apt-get install -y --no-install-recommends musl-tools zip unzip
 
       - name: Verify workspace and release tag versions
+        if: runner.os != 'Windows'
         env:
           RELEASE_REF: ${{ github.ref_name }}
           IS_TAG: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
@@ -84,15 +124,28 @@ jobs:
           fi
 
       - name: Test release packaging scripts
+        if: runner.os != 'Windows'
         run: |
           for script in scripts/release/*.sh; do bash -n "$script"; done
           scripts/release/test.sh
           scripts/release/test-verify-set.sh
 
+      - name: Test native Windows packaging scripts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/release/test-windows.ps1
+
       - name: Build release archives
+        if: runner.os != 'Windows'
         run: scripts/release/package.sh '${{ matrix.target }}' '${{ matrix.kind }}' dist/release
 
+      - name: Build native Windows release archives
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/release/package-windows.ps1 -OutputDir dist/release
+
       - name: Run target unit tests without vendor sessions
+        if: runner.os != 'Windows'
         env:
           TARGET: ${{ matrix.target }}
           PACKAGE_KIND: ${{ matrix.kind }}
@@ -116,6 +169,46 @@ jobs:
             -p "$package" "${test_targets[@]}"
           test ! -e "$test_root/marker"
 
+      - name: Run Windows tests with native process and IPC fixtures
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $testRoot = Join-Path $env:RUNNER_TEMP 'agentdeck-windows-tests'
+          New-Item -ItemType Directory -Force "$testRoot/home", "$testRoot/bin", "$testRoot/appdata", "$testRoot/localappdata" | Out-Null
+          $env:CARGO_HOME = Join-Path $env:USERPROFILE '.cargo'
+          $env:RUSTUP_HOME = Join-Path $env:USERPROFILE '.rustup'
+          $env:HOME = "$testRoot/home"
+          $env:USERPROFILE = "$testRoot/home"
+          $env:APPDATA = "$testRoot/appdata"
+          $env:LOCALAPPDATA = "$testRoot/localappdata"
+          $env:AGENTDECK_DATA_DIR = "$testRoot/data"
+          $env:AGENTDECK_OFFLINE_MARKER = "$testRoot/vendor-invoked"
+          $env:AGENTDECK_E2E = '0'
+          'fn main() { std::fs::write(std::env::var("AGENTDECK_OFFLINE_MARKER").unwrap(), b"vendor invoked").unwrap(); std::process::exit(97); }' |
+            Set-Content -Encoding utf8 "$testRoot/tripwire.rs"
+          rustc "$testRoot/tripwire.rs" -o "$testRoot/bin/codex.exe"
+          if ($LASTEXITCODE) { throw 'Vendor tripwire compilation failed.' }
+          Copy-Item "$testRoot/bin/codex.exe" "$testRoot/bin/claude.exe"
+          $env:PATH = "$testRoot/bin;$env:PATH"
+          $env:AGENTDECK_CODEX_BIN = "$testRoot/bin/codex.exe"
+          $env:AGENTDECK_DAEMON_BIN = "$env:GITHUB_WORKSPACE/target/release-build/x86_64-pc-windows-msvc/release/agentdeckd.exe"
+          cargo test --release --locked --target x86_64-pc-windows-msvc --target-dir target/release-build -p agentdeckd --lib --bins
+          if ($LASTEXITCODE) { throw 'Windows daemon tests failed.' }
+          cargo test --release --locked --target x86_64-pc-windows-msvc --target-dir target/release-build -p agentdeck-desktop --bins
+          if ($LASTEXITCODE) { throw 'Windows desktop tests failed.' }
+          cargo test --release --locked --target x86_64-pc-windows-msvc --target-dir target/release-build -p agentdeck-cli --tests
+          if ($LASTEXITCODE) { throw 'Windows CLI transport tests failed.' }
+          $cli = "$env:GITHUB_WORKSPACE/target/release-build/x86_64-pc-windows-msvc/release/agentdeck.exe"
+          $selfcheck = & $cli --data-dir "$testRoot/data" selfcheck | ConvertFrom-Json
+          if ($LASTEXITCODE -or $selfcheck.ok -ne $true) { throw 'Windows CLI/current daemon IPC selfcheck failed.' }
+          $schema = (& $cli --data-dir "$testRoot/data" protocol schema) -join "`n"
+          if ($LASTEXITCODE) { throw 'Windows protocol schema request failed.' }
+          $expected = (Get-Content -Raw protocol/agentdeck/agentdeck-protocol.schema.json).Replace("`r`n", "`n").Trim()
+          if ($schema.Trim() -cne $expected) { throw 'Windows protocol schema differs from the committed snapshot.' }
+          & $cli --data-dir "$testRoot/data" diagnostics report
+          if ($LASTEXITCODE) { throw 'Windows diagnostics report failed.' }
+          if (Test-Path $env:AGENTDECK_OFFLINE_MARKER) { throw 'A test attempted to run a real vendor CLI.' }
+
       - name: Smoke test Linux desktop archive under X11
         if: runner.os == 'Linux' && matrix.kind == 'desktop'
         run: |
@@ -125,14 +218,23 @@ jobs:
             dbus-run-session -- scripts/release/smoke.sh '${{ matrix.target }}' desktop dist/release
 
       - name: Smoke test packaged binaries
-        if: runner.os != 'Linux' || matrix.kind != 'desktop'
+        if: runner.os == 'macOS' || matrix.kind == 'daemon'
         run: scripts/release/smoke.sh '${{ matrix.target }}' '${{ matrix.kind }}' dist/release
+
+      - name: Smoke test native Windows archives
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          GPUI_DISABLE_DIRECT_COMPOSITION: "1"
+        run: ./scripts/release/smoke-windows.ps1 -OutputDir dist/release
 
       - name: Upload verified target archives
         uses: actions/upload-artifact@v4
         with:
           name: package-${{ matrix.target }}
-          path: dist/release/*.tar.gz
+          path: |
+            dist/release/*.tar.gz
+            dist/release/*.zip
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
@@ -186,9 +288,9 @@ jobs:
             jq -e --arg commit "$GITHUB_SHA" '.isDraft and .targetCommitish == $commit' "$RUNNER_TEMP/release.json"
           else
             cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
-          macOS 15+ Apple Silicon / Intel 桌面包与独立 daemon；Ubuntu 24.04 x86_64 桌面包与独立 daemon；Linux x86_64 / ARM64 musl daemon。
+          macOS 15+ Apple Silicon / Intel、Ubuntu 24.04 x86_64 / ARM64、Windows x64 桌面包与独立 daemon；保留 Linux x86_64 / ARM64 musl daemon。
 
-          macOS 产物使用 ad-hoc 签名，未经 Apple 公证；不能视为 Developer ID 公证发行版。Linux ARM64 桌面与 Windows 不在本期支持范围。
+          macOS 产物使用 ad-hoc 签名，未经 Apple 公证；不能视为 Developer ID 公证发行版。Windows zip 未作 Authenticode 签名，构建及烟测基线为 Windows Server 2025。Windows ARM64 不在支持范围。
 
           安装方法和系统依赖见本 tag 的 docs/RELEASE.md；下载后请使用 SHA256SUMS 校验。
           NOTES

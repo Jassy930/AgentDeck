@@ -24,10 +24,12 @@
 - Codex 细节只能留在 `agentdeckd/src/codex/` 子模块；CC 细节只能留在 `agentdeckd/src/claude_code/` 子模块；两者互不知晓（N3）。
 - `protocol/` 中 Codex schema 必须来自官方 `codex app-server generate-json-schema`，不要手写或逆向猜测协议（K8）。
 - AgentDeck 不读取、不保存、不转发任何 vendor token（Codex 或 Claude Code）；CC 历史走 CC 原生接口，不建 `cc-meta/` 目录（K9、N8）。
-- AgentDeck 管理的 run record 与 diagnostic log 写入 `~/Library/Application Support/AgentDeck/`（Linux 为 `~/.local/share/AgentDeck/`），不得写入用户项目 git（K5）。
+- AgentDeck 管理的 run record 与 diagnostic log 写入 `~/Library/Application Support/AgentDeck/`（Linux 为 `~/.local/share/AgentDeck/`，Windows 为 `%LOCALAPPDATA%\AgentDeck\`）；Windows 缺少 LOCALAPPDATA 时回退用户目录下 `AppData\Local`。不得写入用户项目 git（K5）。
 - `Sources/AgentDeckMobileCore/` 是 iOS 使用的平台无关 Swift 层，禁止 import AppKit/UIKit；macOS GPUI target 不依赖它。`ios/` 是 fixture 驱动的 UIKit companion 前端，唯一数据入口是 `MobileSessionSource`，本期不含网络代码（设计见 `docs/plans/2026-07-03-ios-uikit-frontend-design.md`）。
 
 ## 工作规则
+
+macOS/Linux/Windows 打包和证据边界以 `docs/RELEASE.md` 为准。Windows SSH 目标不在当前范围。
 
 - 永远使用中文回答用户；项目文档默认使用中文。
 - Python 使用 `uv`；JS/TS 使用 `bun`。
@@ -49,6 +51,10 @@ scripts/verify-agent-docs.sh
 ```
 
 涉及 GPUI 桌面时至少运行 desktop test、desktop selfcheck 和真实 bundle verify。涉及 daemon、IPC、记录、诊断、协议翻译时至少运行 `scripts/verify-offline-tests.sh`、对应 focused test 和绑定当前 checkout daemon 的 CLI selfcheck。标准 workspace Cargo tests 默认离线；真实 vendor process、session、prompt、history 和 auth 只有 `AGENTDECK_E2E=1` 才启用，运行前仍须取得用户确认。涉及 `AgentDeckMobileCore` 或 iOS 时运行 `swift test`；涉及诊断、日志或数据目录时同时运行 daemon diagnostics report。
+
+多平台 release 使用 `scripts/release/` 的原生打包与归档 smoke，不调用开发 build/run 脚本。
+Windows 平台分支还需在原生 Windows CI 运行 EXE/路径/进程树 fixture；交叉 `cargo check`
+或 macOS 通过不能代替 Windows 执行证据。具体门禁和未验收项目见 `docs/QUALITY.md`。
 
 ### iOS 前端验证
 

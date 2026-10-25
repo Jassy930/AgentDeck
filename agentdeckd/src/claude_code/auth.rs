@@ -123,7 +123,13 @@ where
 pub fn probe_auth_status() -> AuthState {
     probe_auth_status_with_command(|| {
         use std::process::Command;
-        match Command::new("claude").arg("auth").arg("status").output() {
+        let mut command = Command::new(crate::platform::executable("claude"));
+        command.arg("auth").arg("status");
+        #[cfg(windows)]
+        let output = crate::process::output(&mut command, std::time::Duration::from_secs(5));
+        #[cfg(not(windows))]
+        let output = command.output();
+        match output {
             Ok(out) => Ok((
                 out.status.code().unwrap_or(-1),
                 String::from_utf8_lossy(&out.stdout).to_string(),

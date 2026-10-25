@@ -53,8 +53,21 @@ impl SyncTransport for FakeTransport {
 }
 
 const DAEMON_BIN_ENV: &str = "AGENTDECK_DAEMON_BIN";
+const DAEMON_EXE: &str = if cfg!(windows) {
+    "agentdeckd.exe"
+} else {
+    "agentdeckd"
+};
 
 fn is_exec(p: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    if !p
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+    {
+        return false;
+    }
     let Ok(metadata) = std::fs::metadata(p) else {
         return false;
     };
@@ -110,20 +123,24 @@ fn locate_daemon_with_override(explicit: Option<OsString>) -> std::io::Result<Pa
     // provided. In particular, an invalid test path must never fall through to
     // an older sibling or system installation.
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let sib = dir.join("agentdeckd");
-            if is_exec(&sib) {
-                return Ok(sib);
-            }
+        if let Some(sibling) = sibling_daemon(&exe) {
+            return Ok(sibling);
         }
     }
-    for c in [
-        "target/debug/agentdeckd",
-        "target/release/agentdeckd",
-        "/usr/local/bin/agentdeckd",
-        "/opt/homebrew/bin/agentdeckd",
-    ] {
-        let p = PathBuf::from(c);
+    let mut directories = vec![
+        PathBuf::from("target/debug"),
+        PathBuf::from("target/release"),
+    ];
+    if let Some(path) = std::env::var_os("PATH") {
+        directories.extend(std::env::split_paths(&path));
+    }
+    #[cfg(unix)]
+    directories.extend([
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/opt/homebrew/bin"),
+    ]);
+    for directory in directories {
+        let p = directory.join(DAEMON_EXE);
         if is_exec(&p) {
             return Ok(p);
         }
@@ -132,6 +149,11 @@ fn locate_daemon_with_override(explicit: Option<OsString>) -> std::io::Result<Pa
         std::io::ErrorKind::NotFound,
         "agentdeckd not found (build it: cargo build -p agentdeckd)",
     ))
+}
+
+fn sibling_daemon(executable: &std::path::Path) -> Option<PathBuf> {
+    let path = executable.parent()?.join(DAEMON_EXE);
+    is_exec(&path).then_some(path)
 }
 
 /// 定位 agentdeckd。`AGENTDECK_DAEMON_BIN` 一旦存在就必须是有效的绝对
@@ -177,11 +199,15 @@ impl ProcessTransport {
     pub fn spawn(profile: &str, data_dir: Option<&str>) -> std::io::Result<Self> {
         let path = locate_daemon()?;
         let mut cmd = Command::new(path);
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
         cmd.env("AGENTDECK_PROFILE", profile);
         if let Some(d) = data_dir {
             cmd.env("AGENTDECK_DATA_DIR", d);
         }
+        Self::spawn_command(cmd)
+    }
+
+    fn spawn_command(mut cmd: Command) -> std::io::Result<Self> {
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
@@ -244,13 +270,17 @@ impl AsyncProcessTransport {
     pub async fn spawn(profile: &str, data_dir: Option<&str>) -> std::io::Result<Self> {
         let path = locate_daemon()?;
         let mut cmd = TokioCommand::new(path);
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
         cmd.env("AGENTDECK_PROFILE", profile);
         if let Some(d) = data_dir {
             cmd.env("AGENTDECK_DATA_DIR", d);
         }
+        Self::spawn_command(cmd)
+    }
+
+    fn spawn_command(mut cmd: TokioCommand) -> std::io::Result<Self> {
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
         let mut child = cmd.spawn()?;
         let writer = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
@@ -399,7 +429,56 @@ impl Drop for AsyncTransportWriter {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
+    fn native_fixture(mode: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "transport::tests::native_transport_fixture",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("AGENTDECK_CLI_PIPE_FIXTURE", mode);
+        command
+    }
+
+    #[test]
+    fn native_transport_fixture() {
+        let Ok(mode) = std::env::var("AGENTDECK_CLI_PIPE_FIXTURE") else {
+            return;
+        };
+        println!();
+        if mode == "hang" {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            std::process::exit(1);
+        }
+        for line in std::io::stdin().lock().lines() {
+            let line = line.unwrap();
+            if mode == "echo" {
+                println!("{line}");
+                std::io::stdout().flush().unwrap();
+            }
+        }
+        if let Some(marker) = std::env::var_os("AGENTDECK_CLI_PIPE_MARKER") {
+            std::fs::write(marker, "stdin closed").unwrap();
+        }
+        std::process::exit(if mode == "fail" { 7 } else { 0 });
+    }
+
+    #[test]
+    fn native_executable_round_trips_jsonl_without_a_shell() {
+        let mut transport = ProcessTransport::spawn_command(native_fixture("echo")).unwrap();
+        let message = r#"{"reply":"pong","path":"C:\\用户目录\\AgentDeck"}"#;
+        transport.send_line(message).unwrap();
+        loop {
+            let line = transport.recv_line().unwrap().expect("fixture response");
+            if line.starts_with('{') {
+                assert_eq!(line, message);
+                break;
+            }
+        }
+    }
+
     #[tokio::test]
     async fn async_writer_shutdown_closes_stdin_and_waits_for_daemon_exit() {
         use tokio::io::AsyncReadExt;
@@ -412,11 +491,8 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let mut child = TokioCommand::new("/bin/sh")
-            .arg("-c")
-            .arg("while IFS= read -r _; do :; done; : > \"$1\"")
-            .arg("agentdeck-test")
-            .arg(&marker)
+        let mut child = TokioCommand::from(native_fixture("exit"))
+            .env("AGENTDECK_CLI_PIPE_MARKER", &marker)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -441,14 +517,11 @@ mod tests {
         std::fs::remove_file(marker).unwrap();
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn async_writer_shutdown_reports_when_graceful_exit_times_out() {
         use tokio::io::AsyncReadExt;
 
-        let mut child = TokioCommand::new("/bin/sh")
-            .arg("-c")
-            .arg("while :; do :; done")
+        let mut child = TokioCommand::from(native_fixture("hang"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -475,14 +548,11 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn async_writer_shutdown_reports_nonzero_graceful_exit_status() {
         use tokio::io::AsyncReadExt;
 
-        let mut child = TokioCommand::new("/bin/sh")
-            .arg("-c")
-            .arg("while IFS= read -r _; do :; done; exit 7")
+        let mut child = TokioCommand::from(native_fixture("fail"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -505,7 +575,7 @@ mod tests {
             .expect_err("a nonzero daemon exit must fail graceful shutdown");
         assert_eq!(error.kind(), std::io::ErrorKind::Other);
         assert!(
-            error.to_string().contains("exit status: 7"),
+            error.to_string().contains('7'),
             "shutdown error must preserve the daemon exit status: {error}"
         );
     }
@@ -561,5 +631,33 @@ mod tests {
             .expect_err("empty override must fail closed");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains(DAEMON_BIN_ENV));
+    }
+
+    #[test]
+    fn packaged_daemon_uses_platform_suffix_and_rejects_windows_shims() {
+        let dir =
+            std::env::temp_dir().join(format!("agentdeck-cli-locator-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let executable = dir.join(if cfg!(windows) {
+            "agentdeck.exe"
+        } else {
+            "agentdeck"
+        });
+        assert!(sibling_daemon(&executable).is_none());
+        let daemon = dir.join(DAEMON_EXE);
+        std::fs::write(&daemon, "fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&daemon, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(sibling_daemon(&executable), Some(daemon));
+        #[cfg(windows)]
+        {
+            let shim = dir.join("agentdeckd.cmd");
+            std::fs::write(&shim, "@echo off").unwrap();
+            assert!(explicit_daemon_path(shim.into_os_string()).is_err());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

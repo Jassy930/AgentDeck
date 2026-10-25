@@ -5,7 +5,7 @@
 ## 快速入口
 
 ```bash
-# GPUI 桌面壳：只验证 UI/Metal/隐藏窗口/Root 初始化
+# GPUI 桌面壳：只验证 UI/平台 renderer/隐藏窗口/Root 初始化
 cargo run -p agentdeck-desktop -- --selfcheck
 
 # backend：独立验证 daemon 与 adapter
@@ -24,10 +24,16 @@ diagnostics report 的 UI 入口。桌面 selfcheck 不连接 daemon，成功不
 
 ## 日志位置
 
-- run record: `~/Library/Application Support/AgentDeck/runs/*.jsonl`
-- diagnostic log: `~/Library/Application Support/AgentDeck/diagnostic.log`
-- dev profile: `~/Library/Application Support/AgentDeck-Dev/`
-- 测试覆盖目录: 设置 `AGENTDECK_DATA_DIR=/tmp/agentdeck-diag`
+| 平台 | 默认 stable 数据目录 |
+| --- | --- |
+| macOS | `~/Library/Application Support/AgentDeck/` |
+| Linux | `~/.local/share/AgentDeck/` |
+| Windows | `%LOCALAPPDATA%\AgentDeck\` |
+
+run record 位于上述目录的 `runs/*.jsonl`，diagnostic log 为 `diagnostic.log`；dev profile
+把应用目录名改为 `AgentDeck-Dev`。Windows 用户目录优先 `USERPROFILE`，缺失时回退 `HOME`；
+`LOCALAPPDATA` 缺失时回退用户目录下的 `AppData\Local`。`AGENTDECK_DATA_DIR` 显式覆盖优先，
+排障烟测必须指向本次独立临时目录，避免读取或写入用户现有诊断。
 
 ## 关联规则
 
@@ -70,7 +76,7 @@ backend 数据目录规则；这些变量不改变 vendor 历史来源。
 | `adapter_unhandled_method` | app-server 协议出现未识别事件 | 查看 raw record 和 schema |
 | `ipc_malformed_jsonl` | client/daemon IPC 收到坏 JSONL | 查看上一条 IPC line |
 | `daemon_spawn_failed` | backend client 无法启动 daemon | 检查 `agentdeckd` 路径 |
-| `agent-install-failed` | 官方 CLI 安装命令启动、下载、执行或取消清理失败 | 检查界面返回的退出状态与安装输出；在 daemon 所在机器确认官方安装域名可达、curl/bash 可用及用户目录可写 |
+| `agent-install-failed` | 官方 CLI 安装命令启动、下载、执行或取消清理失败 | 检查界面返回的退出状态与安装输出；确认官方安装域名可达、Unix 的 curl/bash 或 Windows 的 powershell.exe 可用，以及用户目录可写；不要修改执行策略规避失败 |
 | `agent-install-unsupported` | adapter 不支持一键安装 | 按对应 CLI 官方说明安装 |
 | `app_server_handshake_failed` | app-server 握手失败 | 检查 agent 登录、版本和 GUI 启动环境里的 `PATH` / `node` |
 | `turn_failed` | turn 执行失败 | 按 runId 查看 run record |
@@ -96,7 +102,7 @@ daemon 会持续 drain Codex app-server 子进程 stderr，避免管道回压卡
 | `codex-disconnected` / `codex-stdout-read-failed` / `codex-stdin-write-failed` | app-server transport 在 terminal 前断开或读写失败 | 将当前 session 视为不可继续；核对 Codex 版本、进程退出原因与对应 diagnosticRef |
 | `codex-malformed-json` / `codex-unmatched-response` / `codex-protocol-error` | vendor frame 无法按固定 schema 解码、response 无对应 request，或 JSON-RPC error | 与 `protocol/` 中 0.155.0-alpha.16 官方 schema 对照；不要把该 session 恢复为 Ready |
 | `codex-unsupported-server-request` / `codex-terminal-status-invalid` | app-server 发出 M0 不支持的 server request，或 terminal status 仍是 `inProgress` | 记录可复现方法与固定版本；该 turn/session 会按 protocol failure 收口 |
-| `codex-cleanup-failed` | 无法确认 direct child 已 wait、Unix 进程组已消失或 stderr pump 已停止 | 不再向该 daemon 发新 session；等待 failed `SessionClosed` 后 daemon 退出，检查残留 app-server/helper 进程 |
+| `codex-cleanup-failed` | 无法确认 direct child 已 wait、Unix 进程组 / Windows Job 已清理或 stderr pump 已停止 | 不再向该 daemon 发新 session；等待 failed `SessionClosed` 后 daemon 退出，检查残留 app-server/helper 进程 |
 | `turn-id-already-used` | client 在同一 session 内复用了已接受的 caller-owned `turnId` | 生成新的 `turnId` 后重试；该拒绝不会写入 vendor 或改变 Ready session |
 
 `initialize` 成功仍可能在 `thread/start` 因用户配置类型不兼容而返回 `codex-protocol-error`；2026-09-21 的 0.145.0 验收曾遇到 `features.context_management` 的 table/bool 冲突，仅用进程级 `-c features.context_management=false` 覆盖完成真实验收，未修改全局配置。当前 0.155.0-alpha.16 尚未重跑 lifecycle E2E，详见 [当前验收边界](AGENTDECKD_STATUS.md#当前验收边界)。
@@ -104,7 +110,7 @@ daemon 会持续 drain Codex app-server 子进程 stderr，避免管道回压卡
 Claude Code 历史 archive / rename 子进程遵守同一 K9 边界：daemon 将其
 stdout / stderr 直接丢弃，非零退出只返回结构化 failure code、exit status 和
 `vendor stderr content withheld` 标记。完整历史请求超时或被取消时，daemon
-同时终止该命令的独立进程组，禁止 CLI helper 在超时回复后继续产生晚到副作用。
+同时终止该命令的独立进程组（Windows 为所属 Job），禁止 CLI helper 在超时回复后继续产生晚到副作用。
 
 ## 真实 Codex / Claude Code 历史刷新
 
@@ -141,6 +147,9 @@ macOS daemon 优先探测桌面端的 `/Applications/ChatGPT.app/Contents/Resour
 若设置 `AGENTDECK_CODEX_BIN`，只使用指定的绝对路径，不执行自动候选查找；路径无效
 返回 `codex-version-probe-failed`；历史版本不匹配只 warning，live session 则返回
 `codex-version-unsupported`，均不回退到其他路径。
+Windows 仅接受原生 EXE，跳过 PATH 中的 `.cmd` / `.bat` wrapper，并探测用户 `.local\bin`、
+`.bun\bin` 和官方 Codex 安装目录。排查 Windows 的“未安装”时先核对实际 `.exe` 路径；
+发现 npm wrapper 不构成原生可执行文件已可用的证据。目录和安装入口见 [RELEASE.md](RELEASE.md)。
 历史 warning 含实际路径、版本与已验证基线，桌面非阻断显示，CLI 写 stderr，stdout
 成功 JSON 保持不变。正文 warning 默认折叠为一行，可展开；列表失败时旧 warning
 清除，已有条目保留。这不证明协议一定不兼容，也不保证未知格式语义完全保真。

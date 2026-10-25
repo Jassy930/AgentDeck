@@ -3,7 +3,7 @@
 //! Eng premise 5 (the one the user insisted on): "留痕要留,但由 AgentDeck
 //! 管理,绝不侵入用户 git". Records live in AgentDeck's OWN directory
 //! (`~/Library/Application Support/AgentDeck/` on macOS,
-//! `~/.local/share/AgentDeck/` elsewhere), NEVER in the project tree
+//! `~/.local/share/AgentDeck/` on Linux, `%LOCALAPPDATA%\AgentDeck` on Windows), NEVER in the project tree
 //! or git. The deprecated repo-native `.agentdeck/runs/*.json` approach is
 //! gone.
 //!
@@ -26,10 +26,13 @@ use std::path::PathBuf;
 /// AgentDeck's own data directory. Never the project tree (premise 5).
 #[cfg(not(test))]
 pub fn app_data_dir() -> Option<PathBuf> {
-    app_data_dir_from(
+    app_data_dir_with_local_root(
         std::env::var_os("AGENTDECK_DATA_DIR").as_deref(),
         std::env::var_os("AGENTDECK_PROFILE").as_deref(),
-        std::env::var_os("HOME").as_deref(),
+        crate::platform::home_dir()
+            .as_deref()
+            .map(std::path::Path::as_os_str),
+        std::env::var_os("LOCALAPPDATA").as_deref(),
     )
 }
 
@@ -55,6 +58,15 @@ pub fn app_data_dir_from(
     agentdeck_profile: Option<&OsStr>,
     home: Option<&OsStr>,
 ) -> Option<PathBuf> {
+    app_data_dir_with_local_root(agentdeck_data_dir, agentdeck_profile, home, None)
+}
+
+fn app_data_dir_with_local_root(
+    agentdeck_data_dir: Option<&OsStr>,
+    agentdeck_profile: Option<&OsStr>,
+    home: Option<&OsStr>,
+    local_app_data: Option<&OsStr>,
+) -> Option<PathBuf> {
     if let Some(root) = agentdeck_data_dir
         && !root.is_empty()
     {
@@ -69,18 +81,24 @@ pub fn app_data_dir_from(
         "dev" => "AgentDeck-Dev",
         _ => return None,
     };
-    let home = home?;
-    let mut p = PathBuf::from(home);
-    p.push(PLATFORM_DATA_ROOT);
+    let mut p = if cfg!(windows) {
+        local_app_data
+            .filter(|root| !root.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| home.map(|home| PathBuf::from(home).join(PLATFORM_DATA_ROOT)))?
+    } else {
+        PathBuf::from(home?).join(PLATFORM_DATA_ROOT)
+    };
     p.push(app_dir_name);
     Some(p)
 }
 
-/// 相对 HOME 的平台数据根目录：macOS 用 Application Support，其他平台（远端
-/// Linux 工作站）用 XDG 默认的 `~/.local/share`。
+/// 相对用户主目录的数据根目录；Windows 生产环境优先 LOCALAPPDATA。
 #[cfg(target_os = "macos")]
 pub(crate) const PLATFORM_DATA_ROOT: &str = "Library/Application Support";
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+pub(crate) const PLATFORM_DATA_ROOT: &str = "AppData/Local";
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 pub(crate) const PLATFORM_DATA_ROOT: &str = ".local/share";
 
 pub fn record_dir() -> Option<PathBuf> {
@@ -195,7 +213,7 @@ pub fn try_append(run_id: &str, line: &str) -> Result<(), String> {
     if std::path::Path::new(run_id).file_name() != Some(OsStr::new(run_id)) {
         return Err("runId must be a single file name".into());
     }
-    let dir = record_dir().ok_or_else(|| "HOME not set".to_string())?;
+    let dir = record_dir().ok_or_else(|| "user data directory unavailable".to_string())?;
     create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
     let mut path = dir;
     path.push(format!("{run_id}.jsonl"));
@@ -307,7 +325,7 @@ mod tests {
         // Premise 5: must be AgentDeck's own dir, never the cwd / repo.
         let d = record_dir_from(None, None, Some(OsStr::new("/Users/example"))).unwrap();
         let s = d.to_string_lossy();
-        assert!(s.contains(&format!("{PLATFORM_DATA_ROOT}/AgentDeck")));
+        assert!(d.ends_with(PathBuf::from(PLATFORM_DATA_ROOT).join("AgentDeck/runs")));
         assert!(!s.contains(".agentdeck")); // deprecated repo-native path
     }
 
@@ -353,8 +371,10 @@ mod tests {
         let dir = app_data_dir_from(None, Some(std::ffi::OsStr::new("dev")), Some(home)).unwrap();
 
         assert_eq!(
-            dir.to_string_lossy(),
-            format!("/Users/example/{PLATFORM_DATA_ROOT}/AgentDeck-Dev")
+            dir,
+            PathBuf::from(home)
+                .join(PLATFORM_DATA_ROOT)
+                .join("AgentDeck-Dev")
         );
     }
 
@@ -364,8 +384,10 @@ mod tests {
         let dir = app_data_dir_from(None, None, Some(home)).unwrap();
 
         assert_eq!(
-            dir.to_string_lossy(),
-            format!("/Users/example/{PLATFORM_DATA_ROOT}/AgentDeck")
+            dir,
+            PathBuf::from(home)
+                .join(PLATFORM_DATA_ROOT)
+                .join("AgentDeck")
         );
     }
 
@@ -386,6 +408,34 @@ mod tests {
     #[test]
     fn app_data_dir_requires_home_without_an_override() {
         assert_eq!(app_data_dir_from(None, None, None), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_local_app_data_and_explicit_override_take_precedence() {
+        let home = OsStr::new(r"C:\Users\example");
+        let local = OsStr::new(r"D:\App Data");
+        assert_eq!(
+            app_data_dir_with_local_root(None, None, Some(home), Some(local)),
+            Some(PathBuf::from(local).join("AgentDeck"))
+        );
+        assert_eq!(
+            app_data_dir_with_local_root(None, Some(OsStr::new("dev")), None, Some(local)),
+            Some(PathBuf::from(local).join("AgentDeck-Dev"))
+        );
+        assert_eq!(
+            app_data_dir_with_local_root(
+                Some(OsStr::new("isolated")),
+                None,
+                Some(home),
+                Some(local)
+            ),
+            Some(PathBuf::from("isolated"))
+        );
+        assert_eq!(
+            app_data_dir_with_local_root(None, None, Some(home), Some(OsStr::new(""))),
+            Some(PathBuf::from(home).join("AppData/Local/AgentDeck"))
+        );
     }
 
     #[test]

@@ -1,20 +1,23 @@
 # Linux 桌面端
 
-第一期发布流水线为 GPUI 桌面端提供 Ubuntu 24.04 x86_64 的归档包和配套 daemon；
-安装与验收边界见 [RELEASE.md](RELEASE.md)。Linux ARM64 桌面仍属第二期，
+发布流水线为 GPUI 桌面端提供 Ubuntu 24.04 x86_64 / ARM64 的归档包和配套 GNU daemon；
+安装与验收边界见 [RELEASE.md](RELEASE.md)。两个架构均使用原生 runner 构建，
 其他发行版、GPU 和 Wayland 组合需要单独验收。平台适配缺口统一记录在 issue #52。
 
-## 第一期平台边界
+## 当前平台边界
 
 本期增加 release 构建、打包和归档启动烟测，并修复 Linux `--selfcheck` 在事件循环开始前
 调用退出导致挂起的问题；不代表 Linux 交互体验已全面验收。
 
-- 默认远端机器列表仍保存在 `~/Library/Application Support/AgentDeck/desktop-remotes`，
-  daemon 的默认记录与诊断目录是 `~/.local/share/AgentDeck/`，两者尚未统一。
+- 第二期将远端机器列表改为 `~/.local/share/AgentDeck/desktop-remotes`，与 daemon 的
+  默认记录和诊断目录一致。旧 macOS 风格路径中的列表不会自动迁移；需要保留旧列表时，
+  应在退出应用后人工确认内容并迁移。
   `AGENTDECK_DATA_DIR` 可显式覆盖目录，dev profile 的应用目录名为 `AgentDeck-Dev`。
-- 部分快捷键和输入框提示仍沿用 macOS 表述；X11 / Wayland 的窗口装饰、真实 GPU 和
+- 退出快捷键使用平台 secondary 修饰键（Linux 为 Ctrl+Q），输入框显示 Ctrl+Enter 换行。
+  X11 / Wayland 的窗口装饰、真实 GPU 和
   桌面环境行为需要单独检查。发布 CI 的 Xvfb 隐藏窗口 selfcheck 不覆盖这些交互。
-- Linux ARM64 仅提供独立 musl daemon，本期没有 ARM64 桌面包。
+- Linux ARM64 桌面使用 Ubuntu 24.04 ARM 的 Xvfb/Mesa 软件 Vulkan 烟测；保留双架构
+  独立 musl daemon。各平台是否通过，以最终提交的原生 CI 结果为准。
 
 ## 中文输入法崩溃（X11 + ibus，已修复）
 
