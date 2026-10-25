@@ -59,26 +59,53 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
 /// 命令模式可复用调用者控制台；已有输出管道保持原样，不创建新控制台。
 #[cfg(windows)]
 pub fn attach_parent_console_if_needed() {
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{
+        DUPLICATE_SAME_ACCESS, DuplicateHandle, INVALID_HANDLE_VALUE,
+    };
     use windows_sys::Win32::System::Console::{
         ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
         SetStdHandle,
     };
-    let streams = [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE].map(|stream| {
-        let handle = unsafe { GetStdHandle(stream) };
-        (
-            stream,
-            handle,
-            !handle.is_null() && handle != INVALID_HANDLE_VALUE,
-        )
-    });
-    if streams.iter().all(|(_, _, valid)| *valid) {
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    // A caller may redirect only stdout. Missing stderr is not a reason to
+    // attach a console and replace an already usable machine-readable stream.
+    if !stdout.is_null() && stdout != INVALID_HANDLE_VALUE {
         return;
     }
+
+    let stderr = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+    let preserved_stderr = if !stderr.is_null() && stderr != INVALID_HANDLE_VALUE {
+        let process = unsafe { GetCurrentProcess() };
+        let mut duplicate = std::ptr::null_mut();
+        if unsafe {
+            DuplicateHandle(
+                process,
+                stderr,
+                process,
+                &mut duplicate,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        } == 0
+        {
+            // If preservation fails, leave the caller's existing stream alone.
+            return;
+        }
+        Some(unsafe { OwnedHandle::from_raw_handle(duplicate) })
+    } else {
+        None
+    };
     if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) } != 0 {
-        for (stream, handle, valid) in streams {
-            if valid {
-                unsafe { SetStdHandle(stream, handle) };
+        if let Some(stderr) = preserved_stderr {
+            if unsafe { SetStdHandle(STD_ERROR_HANDLE, stderr.as_raw_handle()) } != 0 {
+                // Standard handles are process-owned. The duplicate must stay
+                // open after this function; restoring a saved raw value alone
+                // would not protect its lifetime across console attachment.
+                let _ = stderr.into_raw_handle();
             }
         }
     }

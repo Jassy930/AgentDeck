@@ -94,6 +94,8 @@ jobs:
           env-vars: "CARGO CC CFLAGS CXX CMAKE RUST MACOSX_DEPLOYMENT_TARGET GPUI_FXC_PATH LIBCLANG_PATH"
           cache-bin: false
           cache-workspace-crates: false
+          # 保留失败 PR 中已编译的依赖；tag 任务仍完全禁用该缓存步骤。
+          cache-on-failure: true
 
       - name: Install Linux desktop dependencies
         if: runner.os == 'Linux' && matrix.kind == 'desktop'
@@ -194,7 +196,7 @@ jobs:
           $env:AGENTDECK_DAEMON_BIN = "$env:GITHUB_WORKSPACE/target/release-build/x86_64-pc-windows-msvc/release/agentdeckd.exe"
           cargo test --release --locked --target x86_64-pc-windows-msvc --target-dir target/release-build -p agentdeckd --lib --bins
           if ($LASTEXITCODE) { throw 'Windows daemon tests failed.' }
-          cargo test --release --locked --target x86_64-pc-windows-msvc --target-dir target/release-build -p agentdeck-desktop --bins
+          cargo test --release --locked --target x86_64-pc-windows-msvc --target-dir target/release-build -p agentdeck-desktop --tests
           if ($LASTEXITCODE) { throw 'Windows desktop tests failed.' }
           cargo test --release --locked --target x86_64-pc-windows-msvc --target-dir target/release-build -p agentdeck-cli --tests
           if ($LASTEXITCODE) { throw 'Windows CLI transport tests failed.' }

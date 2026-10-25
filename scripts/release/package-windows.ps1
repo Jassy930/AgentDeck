@@ -36,11 +36,26 @@ try {
         -p agentdeckd --bin agentdeckd -p agentdeck-desktop --bin agentdeck-desktop
     if ($LASTEXITCODE -ne 0) { throw 'Windows release build failed' }
     $binDir = Join-Path $root "target/release-build/$target/release"
+    $probeDir = Join-Path $stage 'version-probe'
+    foreach ($directory in @('', 'home', 'data', 'temp', 'home/AppData/Roaming', 'home/AppData/Local')) {
+        [void][IO.Directory]::CreateDirectory((Join-Path $probeDir $directory))
+    }
+    $probeEnvironment = @{
+        USERPROFILE = (Join-Path $probeDir 'home'); HOME = (Join-Path $probeDir 'home')
+        APPDATA = (Join-Path $probeDir 'home/AppData/Roaming'); LOCALAPPDATA = (Join-Path $probeDir 'home/AppData/Local')
+        TEMP = (Join-Path $probeDir 'temp'); TMP = (Join-Path $probeDir 'temp')
+        PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+        AGENTDECK_DATA_DIR = (Join-Path $probeDir 'data')
+    }
+    $probeEnvironment.HOMEDRIVE = [IO.Path]::GetPathRoot($probeEnvironment.USERPROFILE).TrimEnd('\')
+    $probeEnvironment.HOMEPATH = $probeEnvironment.USERPROFILE.Substring($probeEnvironment.HOMEDRIVE.Length)
     foreach ($name in @('agentdeckd', 'agentdeck-desktop')) {
         $binary = Join-Path $binDir "$name.exe"
         Assert-WindowsBinary $binary
-        $actual = @(& $binary --version)
-        if ($LASTEXITCODE -ne 0 -or $actual.Count -eq 0 -or $actual[0] -ne "$name $version") {
+        # GUI-subsystem executables need an explicit process wait; never rely on PowerShell's pipeline lifetime.
+        $actual = Invoke-IsolatedProcess -Executable $binary -Arguments @('--version') `
+            -WorkingDirectory $probeDir -Environment $probeEnvironment -Log (Join-Path $probeDir "$name-version.log")
+        if ([string]::IsNullOrEmpty($actual) -or ($actual -split '\r?\n')[0] -ne "$name $version") {
             throw "Binary version mismatch: $binary"
         }
         if ((Get-AuthenticodeSignature -LiteralPath $binary).Status -ne 'NotSigned') {

@@ -72,6 +72,28 @@ fn main() {
 '@
         & rustc --edition 2024 --crate-name release_process_fixture -C target-feature=+crt-static $source -o $binary
         if ($LASTEXITCODE -ne 0) { throw 'Cannot build process fixture' }
+        $guiSource = Join-Path $fixture 'gui-version-fixture.rs'
+        $guiBinary = Join-Path $fixture 'gui-version-fixture.exe'
+        $guiCompleted = Join-Path $fixture 'gui-version-completed'
+        Write-ReleaseText $guiSource @'
+#![windows_subsystem = "windows"]
+fn main() {
+    let args: Vec<_> = std::env::args().collect();
+    assert_eq!(args[1], "--version");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    println!("agentdeck-desktop 1.2.3");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    std::fs::write(&args[2], "completed").unwrap();
+}
+'@
+        & rustc --edition 2024 --crate-name release_gui_version_fixture -C target-feature=+crt-static $guiSource -o $guiBinary
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot build GUI-subsystem version fixture' }
+        $guiOutput = Invoke-IsolatedProcess -Executable $guiBinary -Arguments @('--version', $guiCompleted) `
+            -WorkingDirectory $fixture -Environment @{} -Log (Join-Path $fixture 'gui-version.log')
+        if ($guiOutput.Trim() -ne 'agentdeck-desktop 1.2.3' -or -not (Test-Path -LiteralPath $guiCompleted)) {
+            throw 'GUI-subsystem version output or explicit process wait failed'
+        }
+        Assert-LogReleased (Join-Path $fixture 'gui-version.log')
         $value = 'space "quotes" unicode 路径 trailing\'
         $output = Invoke-IsolatedProcess -Executable $binary -Arguments @('echo', $value) `
             -WorkingDirectory $fixture -Environment @{ PROBE_VALUE = $value } -Log (Join-Path $fixture 'echo.log')

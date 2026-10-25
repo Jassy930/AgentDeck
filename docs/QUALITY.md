@@ -79,6 +79,8 @@ Windows 在 `windows-2025`（Windows Server 2025）上原生构建，验证 x64 
 tripwire。Windows 路径、native IPC 与 Job 进程树 fixture 必须实际执行，不能用跨平台
 `cargo check` 替代。Windows CI 还用当前 release CLI/daemon 执行 selfcheck、协议 schema
 和诊断报告；POSIX shell 的 `session_live` fixture 仅在 Unix 执行。
+桌面命令模式须用实际 GUI-subsystem EXE 验证 stdout-only 管道；打包版本探测通过
+文件日志和显式进程等待读取结果，不依赖 PowerShell 对 GUI 程序的管道等待行为。
 CI 隐藏窗口启动不代表 Windows 10/11 GUI、SmartScreen、Authenticode、
 真实 SSH 或 vendor 会话已验收。
 
