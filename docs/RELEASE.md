@@ -141,6 +141,8 @@ Expand-Archive -LiteralPath AgentDeck-x86_64-pc-windows-msvc.zip -DestinationPat
 位置，并为 `AgentDeck.exe` 创建快捷方式。升级前先退出旧版本，再替换整个目录。
 桌面使用 Direct3D 11 图形后端；release 将 FXC 编译的 shader 嵌入二进制，使用静态 CRT，
 打包门禁拒绝未捆绑的非系统 DLL 依赖。用户运行包不需要安装 Rust、Windows SDK 或 FXC。
+GPUI 使用 Windows 自带的 `icuuc.dll`；打包时同时核对允许的系统库名称与 System32 中的
+实际文件，不从开发工具目录复制 DLL。[系统 ICU 说明](https://learn.microsoft.com/en-us/windows/win32/intl/international-components-for-unicode--icu-)
 
 当前 CI 的原生验证环境是 `windows-2025`（Windows Server 2025）。它不等于 Windows 10/11
 真实桌面、硬件 GPU、输入法和交互已验收；具体构建、fixture 与启动烟测结果应查对应提交的

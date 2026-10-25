@@ -47,7 +47,7 @@ function Assert-WindowsBinary {
     # Only Windows-provided libraries are allowed; static CRT avoids a hidden VC redistributable prerequisite.
     $systemDlls = @('advapi32', 'bcrypt', 'bcryptprimitives', 'cfgmgr32', 'combase', 'comctl32',
         'comdlg32', 'crypt32', 'cryptbase', 'd2d1', 'd3d11', 'd3d12', 'd3dcompiler_47', 'dbghelp',
-        'dcomp', 'dnsapi', 'dwmapi', 'dwrite', 'dxgi', 'gdi32', 'hid', 'imm32', 'iphlpapi', 'kernel32',
+        'dcomp', 'dnsapi', 'dwmapi', 'dwrite', 'dxgi', 'gdi32', 'hid', 'icuuc', 'imm32', 'iphlpapi', 'kernel32',
         'kernelbase', 'msimg32', 'msvcrt', 'ncrypt', 'netapi32', 'normaliz', 'ntdll', 'ole32', 'oleaut32',
         'opengl32', 'powrprof', 'profapi', 'propsys', 'psapi', 'rpcrt4', 'runtimeobject', 'secur32',
         'setupapi', 'shell32', 'shlwapi', 'user32', 'userenv', 'usp10', 'uxtheme', 'version',
