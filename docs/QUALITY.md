@@ -94,9 +94,10 @@ Unix release 验证使用 `scripts/release/package.sh` 和 `scripts/release/smok
 会停止或打开开发应用的 `script/build_and_run.sh`。发布脚本的归档验证负责 release bundle
 检查；交互视图变更仍按下文执行真实窗口人工验收。
 
-## GPUI 桌面 P0 门禁
+## GPUI macOS 开发 P0 门禁
 
-涉及 `agentdeck-desktop/`、Cargo workspace 或桌面打包脚本时至少运行：
+本节的 `build_and_run.sh`、Metal 和 `.app` 验证适用于 macOS；跨平台 release 使用上文的原生归档门禁。
+在 macOS 开发环境中，涉及 `agentdeck-desktop/`、Cargo workspace 或开发打包脚本时至少运行：
 
 ```bash
 cargo fmt --check -p agentdeck-desktop
@@ -117,7 +118,7 @@ selfcheck 的成功输出必须是单行 JSON，并明确包含：
 {"status":"ok","surface":"desktop","ui":"gpui"}
 ```
 
-该 selfcheck 只验证 GPUI application、Metal renderer、隐藏窗口、
+macOS 上的 selfcheck 只验证 GPUI application、Metal renderer、隐藏窗口、
 `gpui-component::init` 和 `Root`；它显式不连接 daemon，因此也不能证明 daemon、IPC
 或 vendor CLI 健康。selfcheck 路径一旦开始 spawn daemon，子进程的 stderr 会破坏
 「单行 JSON」这条门禁。
@@ -136,7 +137,8 @@ selfcheck 的成功输出必须是单行 JSON，并明确包含：
 
 ## 桌面人工冒烟
 
-每个可交互桌面切片完成前至少确认：
+每个可交互桌面切片完成前至少确认以下项目。清单中的 `.app`、Command 快捷键和系统菜单
+描述以 macOS 为例；其他平台应对其实际包和平台行为进行实窗验收，不能用 release 隐藏窗口烟测替代。
 
 - [ ] `AgentDeck.app` 打开真实窗口并成为前台应用。
 - [ ] 侧栏渲染出品牌行、新建会话与搜索框、按日期分组的会话列表和左下角机器管理图标四段结构；
