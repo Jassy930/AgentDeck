@@ -220,6 +220,22 @@ mod windows {
             self.job.is_empty()
         }
 
+        pub(crate) async fn wait_for_tree_empty(&self, timeout: Duration) -> io::Result<()> {
+            tokio::time::timeout(timeout, async {
+                while !self.tree_is_empty()? {
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Windows job still contains active processes after the exit deadline",
+                )
+            })?
+        }
+
         pub(crate) async fn terminate_tree_and_wait(
             &mut self,
             timeout: Duration,
@@ -227,10 +243,8 @@ mod windows {
             self.terminate_tree()?;
             tokio::time::timeout(timeout, async {
                 self.child.wait().await?;
-                while !self.tree_is_empty()? {
-                    tokio::time::sleep(POLL_INTERVAL).await;
-                }
-                Ok(())
+                // The outer deadline covers both direct-child wait and job accounting.
+                self.wait_for_tree_empty(timeout).await
             })
             .await
             .map_err(|_| {
@@ -428,6 +442,23 @@ mod windows {
         }
 
         #[tokio::test]
+        async fn normally_exited_command_waits_for_job_accounting_to_settle() {
+            let mut command = tokio::process::Command::new("cmd.exe");
+            command
+                .args(["/d", "/c", "echo updated"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut child = spawn(&mut command).unwrap();
+            assert!(child.wait().await.unwrap().success());
+            child
+                .wait_for_tree_empty(Duration::from_secs(1))
+                .await
+                .unwrap();
+            assert!(child.tree_is_empty().unwrap());
+        }
+
+        #[tokio::test]
         async fn reaped_direct_child_keeps_descendants_owned_until_confirmed_cleanup() {
             let dir = directory();
             let mut command: tokio::process::Command = fixture_command("root-exit", &dir).into();
@@ -436,6 +467,11 @@ mod windows {
             child.wait().await.unwrap();
             assert!(child.id().is_none());
             assert!(!child.tree_is_empty().unwrap());
+            let error = child
+                .wait_for_tree_empty(Duration::from_millis(50))
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
             child
                 .terminate_tree_and_wait(CLEANUP_TIMEOUT)
                 .await

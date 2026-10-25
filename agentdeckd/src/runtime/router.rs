@@ -81,8 +81,28 @@ async fn run_agent_setup(
         _ = cancel.wait_for(|cancelled| *cancelled) => Err(format!("{label}已取消")),
         _ = tokio::time::sleep(timeout) => Err(format!("{label}超过 {}s 未完成", timeout.as_secs())),
         result = async {
-            tokio::try_join!(child.wait(), stdout.read_to_end(&mut out), stderr.read_to_end(&mut err))
-        } => result.map(|(status, _, _)| status).map_err(|error| format!("读取{label}结果失败：{error}")),
+            // Keep draining both pipes while the direct process runs. On Windows,
+            // a launcher exit starts the job grace period even if descendants
+            // still hold pipe writers, so EOF cannot postpone tree cleanup.
+            tokio::try_join!(
+                async {
+                    let status = child.wait().await
+                        .map_err(|error| format!("等待{label}命令失败：{error}"))?;
+                    #[cfg(windows)]
+                    child.wait_for_tree_empty(Duration::from_secs(1)).await
+                        .map_err(|error| format!("{label}命令退出后未确认进程树清空，未确认完成：{error}"))?;
+                    Ok::<_, String>(status)
+                },
+                async {
+                    stdout.read_to_end(&mut out).await
+                        .map_err(|error| format!("读取{label}输出失败：{error}"))
+                },
+                async {
+                    stderr.read_to_end(&mut err).await
+                        .map_err(|error| format!("读取{label}错误输出失败：{error}"))
+                },
+            )
+        } => result.map(|(status, _, _)| status),
     };
     let status = match result {
         Ok(status) => status,
@@ -111,20 +131,6 @@ async fn run_agent_setup(
             ));
         }
     };
-    #[cfg(windows)]
-    {
-        // A launcher exit alone cannot prove its background installer finished.
-        let unfinished = !child
-            .tree_is_empty()
-            .map_err(|error| action.failed(format!("{label}进程检查失败：{error}")))?;
-        child
-            .terminate_tree_and_wait(Duration::from_secs(1))
-            .await
-            .map_err(|error| action.failed(format!("{label}进程清理失败：{error}")))?;
-        if unfinished {
-            return Err(action.failed(format!("{label}命令退出后仍有子进程；已终止，未确认完成")));
-        }
-    }
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out),
@@ -1010,6 +1016,27 @@ esac
         for pid in descendants {
             test_fixture::assert_exited(pid);
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn setup_drains_large_stdout_and_stderr_before_reporting_completion() {
+        use crate::process::test_fixture;
+        let dir = test_fixture::directory();
+        let command = test_fixture::fixture_command("emit", &dir).into();
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let output = run_agent_setup(
+            command,
+            cancel,
+            Duration::from_secs(15),
+            AgentSetupAction::Install,
+        )
+        .await
+        .unwrap();
+        assert!(output.contains("fixture stdout"));
+        assert!(output.contains("fixture stderr"));
+        assert!(output.len() > 262_144);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -1758,7 +1758,12 @@ mod tests {
             )
             .unwrap();
             let now = std::time::SystemTime::now() + std::time::Duration::from_secs(idx as u64);
-            let _ = std::fs::File::open(&path).unwrap().set_modified(now);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(now)
+                .unwrap();
         }
 
         let items = list_history_from_jsonl_root(&root, None, 2).unwrap();
@@ -1784,7 +1789,9 @@ mod tests {
         )
         .unwrap();
         let newest = std::time::SystemTime::now() + std::time::Duration::from_secs(180);
-        std::fs::File::open(&claude_mem)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&claude_mem)
             .unwrap()
             .set_modified(newest)
             .unwrap();
@@ -1796,7 +1803,9 @@ mod tests {
         )
         .unwrap();
         let second_newest = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
-        std::fs::File::open(&memory)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&memory)
             .unwrap()
             .set_modified(second_newest)
             .unwrap();
@@ -1808,7 +1817,9 @@ mod tests {
         )
         .unwrap();
         let older = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-        std::fs::File::open(&normal)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&normal)
             .unwrap()
             .set_modified(older)
             .unwrap();
@@ -1837,7 +1848,9 @@ mod tests {
         )
         .unwrap();
         let newest = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
-        std::fs::File::open(&observer_session)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&observer_session)
             .unwrap()
             .set_modified(newest)
             .unwrap();
@@ -1849,7 +1862,9 @@ mod tests {
         )
         .unwrap();
         let older = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-        std::fs::File::open(&normal)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&normal)
             .unwrap()
             .set_modified(older)
             .unwrap();
@@ -1880,7 +1895,9 @@ mod tests {
         )
         .unwrap();
         let future = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-        std::fs::File::open(&newest)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&newest)
             .unwrap()
             .set_modified(future)
             .unwrap();
