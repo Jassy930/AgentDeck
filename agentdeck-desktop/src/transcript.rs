@@ -60,6 +60,8 @@ pub struct Block {
     group_summary: Option<(SharedString, usize)>,
     /// 用户消息随轮发出的图片；只有本次打开后发出的轮次才有，历史重读不回显图片。
     pub images: Vec<Arc<Image>>,
+    /// 被截断的代码块 `(显示的文本, 原文)`：界面只排版前一段，「复制」给全文。
+    pub clipped: Vec<(SharedString, SharedString)>,
 }
 
 impl Block {
@@ -82,6 +84,7 @@ impl Block {
             group: None,
             group_summary: None,
             images: Vec::new(),
+            clipped: Vec::new(),
         }
     }
 
@@ -98,6 +101,7 @@ impl Block {
             group: None,
             group_summary: None,
             images: Vec::new(),
+            clipped: Vec::new(),
         }
     }
 
@@ -116,6 +120,13 @@ fn status_tail(state: Option<String>, duration_ms: Option<u64>) -> Option<Shared
 }
 
 pub fn describe(item: &AgentItem) -> Block {
+    let mut clipped = Vec::new();
+    let mut block = describe_clipping(item, &mut clipped);
+    block.clipped = clipped;
+    block
+}
+
+fn describe_clipping(item: &AgentItem, clipped: &mut Vec<(SharedString, SharedString)>) -> Block {
     match item {
         AgentItem::UserMessage { text, images, meta } => {
             match meta
@@ -137,7 +148,7 @@ pub fn describe(item: &AgentItem) -> Block {
                         ..Block::detail(
                             label,
                             summary.to_string(),
-                            fence("", &truncate(text.trim())),
+                            fence("", &clip(text.trim(), clipped)),
                         )
                     }
                 }
@@ -165,7 +176,7 @@ pub fn describe(item: &AgentItem) -> Block {
             let summary = first
                 .trim()
                 .trim_matches(|c| c == '*' || c == '#' || c == ' ');
-            Block::detail("思考", summary.to_string(), truncate(text))
+            Block::detail("思考", summary.to_string(), text.to_string())
         }
         AgentItem::Shell {
             command,
@@ -184,7 +195,7 @@ pub fn describe(item: &AgentItem) -> Block {
                 }),
                 ShellStatus::Canceled => Some("已取消".to_string()),
             };
-            let body = fence("sh", &truncate(command.trim()));
+            let body = fence("sh", &clip(command.trim(), clipped));
             Block {
                 status: status_tail(state, *duration_ms),
                 failed: matches!(status, ShellStatus::Failed),
@@ -217,7 +228,7 @@ pub fn describe(item: &AgentItem) -> Block {
                 let args = serde_json::to_string_pretty(&scrub(args)).unwrap_or_default();
                 body.push_str(&format!(
                     "**参数**\n\n{}\n\n",
-                    fence("json", &truncate(&args))
+                    fence("json", &clip(&args, clipped))
                 ));
             }
             if let Some(result) = result {
@@ -231,7 +242,7 @@ pub fn describe(item: &AgentItem) -> Block {
                 if !text.trim().is_empty() {
                     body.push_str(&format!(
                         "**结果**\n\n{}",
-                        fence(lang, &truncate(text.trim()))
+                        fence(lang, &clip(text.trim(), clipped))
                     ));
                 }
             }
@@ -253,7 +264,10 @@ pub fn describe(item: &AgentItem) -> Block {
                     let path = file.path.display();
                     match &file.patch {
                         Some(patch) if !patch.trim().is_empty() => {
-                            format!("`{path}`\n\n{}", fence("diff", &truncate(patch.trim())))
+                            format!(
+                                "`{path}`\n\n{}",
+                                fence("diff", &clip(patch.trim(), clipped))
+                            )
                         }
                         _ => format!("`{path}`"),
                     }
@@ -291,7 +305,7 @@ pub fn describe(item: &AgentItem) -> Block {
             let body = if path.is_empty() {
                 String::new()
             } else {
-                fence("", &truncate(&path))
+                fence("", &clip(&path, clipped))
             };
             Block::detail("图片", path, body)
         }
@@ -384,12 +398,29 @@ fn one_line(text: &str) -> String {
     }
 }
 
+/// 截断并登记原文，供代码块的「复制」取回全文。
+fn clip(text: &str, clipped: &mut Vec<(SharedString, SharedString)>) -> String {
+    let shown = truncate(text);
+    if shown.len() != text.len() {
+        clipped.push((shown.clone().into(), text.to_string().into()));
+    }
+    shown
+}
+
+/// 代码块「复制」的内容：截断过的给原文，其余原样。
+fn copy_text(clipped: &[(SharedString, SharedString)], code: SharedString) -> SharedString {
+    clipped
+        .iter()
+        .find(|(shown, _)| shown.trim_end() == code.trim_end())
+        .map_or(code, |(_, full)| full.clone())
+}
+
 pub(crate) fn truncate(body: &str) -> String {
     if body.chars().count() <= BODY_LIMIT {
         return body.to_string();
     }
     let head: String = body.chars().take(BODY_LIMIT).collect();
-    format!("{head}…（已截断）")
+    format!("{head}…（已截断，点「复制」获取全文）")
 }
 
 pub fn prepare(turns: Vec<HistoryTurn>) -> Vec<Block> {
@@ -597,15 +628,19 @@ fn summary_row(
 pub(crate) fn markdown(
     id: ElementId,
     body: &SharedString,
+    clipped: &[(SharedString, SharedString)],
     window: &mut Window,
     cx: &mut gpui::App,
 ) -> TextView {
+    let clipped = clipped.to_vec();
     TextView::markdown(id, body.clone(), window, cx)
         .selectable(true)
-        .code_block_actions(|code, _, _| {
+        .code_block_actions(move |code, _, _| {
             // TextView 缓存各代码块的 SharedString；同内容的不同块也要有独立按钮状态。
             let code = code.code();
-            Button::new(ElementId::Integer(code.as_ptr() as u64))
+            let id = ElementId::Integer(code.as_ptr() as u64);
+            let code = copy_text(&clipped, code);
+            Button::new(id)
                 .ghost()
                 .xsmall()
                 .label("复制")
@@ -689,7 +724,7 @@ pub fn render(
         let content = match &block.summary {
             None => {
                 let body = if block.markdown {
-                    markdown(md_id, &block.body, window, cx).into_any_element()
+                    markdown(md_id, &block.body, &block.clipped, window, cx).into_any_element()
                 } else {
                     block.body.clone().into_any_element()
                 };
@@ -816,7 +851,7 @@ pub fn render(
                                 .border_color(border)
                                 .text_sm()
                                 .when(block.label == "思考", |text| text.text_color(muted))
-                                .child(markdown(md_id, &block.body, window, cx)),
+                                .child(markdown(md_id, &block.body, &block.clipped, window, cx)),
                         )
                     })
                     .into_any_element()
@@ -916,8 +951,8 @@ fn edge_fade(top: bool, cx: &gpui::App) -> gpui::Div {
 #[cfg(test)]
 mod tests {
     use super::{
-        BODY_LIMIT, Block, CONTEXT_KIND_KEY, VisibleRows, append, collapsed_indices, describe,
-        fence, is_binary, prepare, prepare_live, row_for_block, truncate,
+        BODY_LIMIT, Block, CONTEXT_KIND_KEY, VisibleRows, append, collapsed_indices, copy_text,
+        describe, fence, is_binary, prepare, prepare_live, row_for_block, truncate,
     };
     use agentdeck_protocol::{
         AgentItem, AgentItemMeta, HistoryTurn, PlanStep, PlanStepStatus, ShellStatus,
@@ -1167,10 +1202,38 @@ mod tests {
     }
 
     #[test]
+    fn clipped_tool_results_copy_their_full_text() {
+        let full = format!("{}尾", "字".repeat(BODY_LIMIT));
+        let block = describe(&AgentItem::ToolCall {
+            name: "Read".into(),
+            args: serde_json::json!({}),
+            result: Some(serde_json::json!(full)),
+            meta: meta(),
+        });
+        assert!(!block.body.contains('尾'));
+        assert_eq!(block.clipped.len(), 1);
+        let shown = block.clipped[0].0.clone();
+        assert!(block.body.contains(shown.as_ref()));
+        assert_eq!(copy_text(&block.clipped, shown).as_ref(), full);
+        assert_eq!(copy_text(&block.clipped, "别的".into()).as_ref(), "别的");
+    }
+
+    #[test]
+    fn long_reasoning_is_not_truncated() {
+        let text = format!("想法\n{}", "字".repeat(BODY_LIMIT + 1));
+        let block = describe(&AgentItem::Reasoning {
+            text: text.clone(),
+            meta: meta(),
+        });
+        assert_eq!(block.body.as_ref(), text);
+        assert!(block.clipped.is_empty());
+    }
+
+    #[test]
     fn truncate_keeps_short_bodies_and_marks_long_ones() {
         assert_eq!(truncate("短文本"), "短文本");
         let truncated = truncate(&"字".repeat(BODY_LIMIT + 1));
-        assert!(truncated.ends_with("…（已截断）"));
+        assert!(truncated.ends_with("…（已截断，点「复制」获取全文）"));
     }
 
     #[test]

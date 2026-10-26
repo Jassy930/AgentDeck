@@ -2587,6 +2587,7 @@ impl Shell {
             transcript::markdown(
                 SharedString::from(format!("approval-{}", action.request_id)).into(),
                 &markdown.into(),
+                &[],
                 window,
                 cx,
             )
