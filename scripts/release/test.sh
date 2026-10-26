@@ -24,7 +24,7 @@ mv "$fixture/changed.lock" "$fixture/Cargo.lock"
 if release_version "$fixture" > /dev/null 2>&1; then
   release_fail 'accepted stale lock versions'; exit 1
 fi
-for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu; do
+for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
   release_target "$target" desktop
 done
 for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
@@ -33,9 +33,8 @@ for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
     release_fail 'accepted unsupported desktop'; exit 1
   fi
 done
-if release_target aarch64-unknown-linux-gnu desktop > /dev/null 2>&1 \
-  || release_target x86_64-pc-windows-msvc desktop > /dev/null 2>&1; then
-  release_fail 'accepted phase-two target'; exit 1
+if release_target x86_64-pc-windows-msvc desktop > /dev/null 2>&1; then
+  release_fail 'Windows must use the PowerShell packaging entrypoint'; exit 1
 fi
 cat > "$fixture/binary" <<'BINARY'
 #!/bin/sh

@@ -52,7 +52,7 @@ poison 并退出 daemon。protocol v4 增加累计消息的 item identity/state/
 
 ## 分层边界
 
-- `agentdeck-desktop/`：macOS GPUI executable。负责窗口、组件根节点、外壳布局（侧栏 / 空态 / 会话态 / 机器管理页）和桌面 selfcheck。`daemon.rs` 是唯一的数据入口：发送 `AgentList`、`AgentCapabilities`（同次读取 CLI 版本与完整 typed 能力）、`AgentInstall` / `AgentUpdate`（机器页安装／更新 CLI，命令由各 adapter 提供）、`Selfcheck`、`ProtocolVersion`、`History`，以及新建与续聊的 `SessionStart` / `TurnStart` / `TurnCancel` / `ActionDecision` / `VendorControl`；消费 typed reply 与 `ServerEvent`，不解析 vendor JSON。`session_router.rs` 依据 typed `VendorCapabilities` 构造受支持的默认启动选项，以 `StreamingMessages` / `Approval` / `ClaudeCodePermissionMode` 控制消息、审批与权限模式命令；新建与续聊共用此路由，会话握手后的 `SessionCapabilities` 取代启动前缓存的能力。侧栏与空态卡片按 daemon 返回的 `AgentKind` 迭代生成，来源图标仅用它标识 agent，不按 vendor 分支路由会话操作。阻塞 IPC 一律走 GPUI background executor，UI 线程不等 daemon。机器页另在本机 `curl` 查 npm registry 的 CLI 最新版本（`versions.rs`），并能把与桌面端同版本的预编译 agentdeckd 从 GitHub Release 经 ssh 装到远端 `~/.local/bin`（`remotes.rs`）。
+- `agentdeck-desktop/`：macOS/Linux/Windows 的 GPUI executable。负责窗口、组件根节点、外壳布局（侧栏 / 空态 / 会话态 / 机器管理页）和桌面 selfcheck。`daemon.rs` 是唯一的数据入口：发送 `AgentList`、`AgentCapabilities`（同次读取 CLI 版本与完整 typed 能力）、`AgentInstall` / `AgentUpdate`（机器页安装／更新 CLI，命令由各 adapter 提供）、`Selfcheck`、`ProtocolVersion`、`History`，以及新建与续聊的 `SessionStart` / `TurnStart` / `TurnCancel` / `ActionDecision` / `VendorControl`；消费 typed reply 与 `ServerEvent`，不解析 vendor JSON。`session_router.rs` 依据 typed `VendorCapabilities` 构造受支持的默认启动选项，以 `StreamingMessages` / `Approval` / `ClaudeCodePermissionMode` 控制消息、审批与权限模式命令；新建与续聊共用此路由，会话握手后的 `SessionCapabilities` 取代启动前缓存的能力。侧栏与空态卡片按 daemon 返回的 `AgentKind` 迭代生成，来源图标仅用它标识 agent，不按 vendor 分支路由会话操作。阻塞 IPC 一律走 GPUI background executor，UI 线程不等 daemon。机器页另在本机 `curl` 查 npm registry 的 CLI 最新版本（`versions.rs`），并能把与桌面端同版本的预编译 agentdeckd 从 GitHub Release 经 ssh 装到 Linux/macOS 远端的 `~/.local/bin`（`remotes.rs`）。
 - `Sources/AgentDeckMobileCore/`：iOS 使用的平台无关 Swift 模型，禁止 import AppKit/UIKit。
 - `agentdeck-protocol/`：本地 IPC 协议事实源 crate。分 trunk / capabilities / vendor 三个模块，`PROTOCOL_VERSION` = 9，`protocol_schema()` 聚合本地 v9 类型。
 - `agentdeckd/src/ipc.rs`：re-export `agentdeck-protocol::*` 壳，保持 daemon 内 `crate::ipc::X` 引用不变。
@@ -62,6 +62,8 @@ poison 并退出 daemon。protocol v4 增加累计消息的 item identity/state/
 - `agentdeckd/src/claude_code/`：ClaudeCodeAdapter。`claude` CLI 子进程接入，stream-json 解析，CC 特色能力（auth / history / permission / hooks）实现在此。
 - `agentdeckd/src/record.rs`：run record 写入与脱敏，写入包含 `agent_kind` 字段。
 - `agentdeckd/src/diag.rs`：诊断日志、自检和机器可读诊断报告，诊断事件带 `agent_kind`。
+- `agentdeckd/src/platform.rs`：平台用户目录、PATH 与原生 executable 发现；Windows 只接受 `.exe`，vendor 安装策略仍由 adapter 决定。`agentdeck-desktop/src/platform.rs` 负责桌面路径与辅助命令设施，不跨越 typed client 边界。
+- `agentdeckd/src/process.rs`：Windows 子进程先暂停创建、绑定 Job、再恢复；清理时终止并等待整个 Job。普通继承的子进程属于该树，由外部服务代理另行创建的进程不在这项所有权保证内。Unix 保持原有独立进程组语义。
 - `agentdeck-cli/`：参考客户端与门控 E2E 驱动。提供 `agentdeck` 二进制，不在 GUI 实时通路上。
 - `protocol/`：官方 Codex app-server schema 快照和 spike 事实源。
 - `protocol/agentdeck/`：AgentDeck 自身中立协议 JSON Schema 快照（schemars 派生，`cargo test` 漂移测试守护）。
@@ -81,9 +83,9 @@ poison 并退出 daemon。protocol v4 增加累计消息的 item identity/state/
 
 - **K1**：daemon 的 stdin 主循环不得被单个 turn 阻塞；长时间工作放到 worker。
 - **K2**：`RuntimeHub` 必须按 `sessionId` 阻止同一 runtime 并发 turn；session 创建时 `agentKind` 不可变，整个生命周期固定到一个 adapter。
-- **K3**：每个 turn 的成功、失败或取消 terminal 发出前，worker 必须先释放 turn-local 占用；连接仍健康时 session 回到 Ready 并保留 session-scoped child。只有 `SessionClosed` 表示 session 已结束，且必须在 direct child wait、Unix 进程组消失确认、pump 停止和路由清理后发送。
+- **K3**：每个 turn 的成功、失败或取消 terminal 发出前，worker 必须先释放 turn-local 占用；连接仍健康时 session 回到 Ready 并保留 session-scoped child。只有 `SessionClosed` 表示 session 已结束，且必须在 direct child wait、所属进程树清理确认（Unix 进程组 / Windows Job）、pump 停止和路由清理后发送。
 - **K4**（加强）：所有事件主干消息必须带 `agentKind` 字段。
-- **K5**：run record 与 diagnostic log 写入 `~/Library/Application Support/AgentDeck/`（stable）或 `AgentDeck-Dev/`（dev），Linux 上根目录为 `~/.local/share/`，不得写入用户项目 git。
+- **K5**：run record 与 diagnostic log 写入平台数据根目录下的 `AgentDeck/`（stable）或 `AgentDeck-Dev/`（dev）。根目录为 macOS 的 `~/Library/Application Support/`、Linux 的 `~/.local/share/`、Windows 的 `%LOCALAPPDATA%`（缺失时回退用户目录下 `AppData\Local`），不得写入用户项目 git。
 - **K6**：`AGENTDECK_DATA_DIR` / `--profile` / `AGENTDECK_PROFILE` 控制数据目录隔离，不影响 vendor 登录状态或 vendor 历史。
 - **K7**：写入前做 best-effort 密钥脱敏；写失败不能静默，必须在可诊断位置暴露。
 - **K8**：vendor schema 不手写，Codex 协议来自官方 `codex app-server generate-json-schema`。

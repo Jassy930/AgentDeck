@@ -13,7 +13,7 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
 
 当前桌面端只承诺：
 
-- 创建真实 GPUI macOS 窗口，使用透明标题栏。
+- 创建 GPUI 桌面窗口，macOS 使用透明标题栏；Linux/Windows 的构建与验收范围见[发布说明](docs/RELEASE.md)。
 - 初始化 `gpui-component` 并挂载 `Root`。
 - 界面固定使用深色，配色来自设计系统 SSOT 生成的 codex 颜色；警告使用与品牌橙区分的琥珀色。
 - 渲染外壳布局：全高左侧栏（品牌行 / 新建会话与搜索框 / 按日期分组的会话列表 /
@@ -53,7 +53,8 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
   “没有匹配的会话”。
 - 侧栏左下角的服务器图标进入独立的机器管理页，每个 agent 行显示该机器上 Claude Code / Codex 的实际安装版本，并可一键运行 CLI 自带的更新命令（`claude update` / `codex update`）；连接框下方列出 `~/.ssh/config`（含 `Include`）里尚未连接的主机，点击即添加；已添加的远端保存在数据目录的 `desktop-remotes` 文件；悬停提示显示连接中或失败台数，连接或任一来源历史读取失败时图标标红。
   版本查询完成但拿不到版本号时显示「安装」，取得版本号时显示「更新」；拿不到版本号也可能是探测失败，不直接判定未安装。
-  安装使用官方推荐的原生脚本，在对应机器上执行：Codex 为 `curl -fsSL https://chatgpt.com/codex/install.sh | sh`，Claude Code 为 `curl -fsSL https://claude.ai/install.sh | bash`，均不依赖 npm。
+  安装使用官方原生脚本，在对应机器上执行：Unix 上 Codex 为 `curl -fsSL https://chatgpt.com/codex/install.sh | sh`，Claude Code 为 `curl -fsSL https://claude.ai/install.sh | bash`，均不依赖 npm。
+  Windows 使用同一官方站点的 `install.ps1`，通过 PowerShell 执行，不修改执行策略；CLI 只接受原生 `.exe`，不执行 `.cmd` / `.bat` wrapper。发现位置与限制见[发布说明](docs/RELEASE.md#windows-桌面x64)。
   Codex 使用官方 `CODEX_NON_INTERACTIVE=1` 跳过安装器询问，不自动启动登录或卸载其他渠道的安装。
   安装／更新均需二次确认，且要求 daemon 与桌面端协议一致（当前 v9）；旧 daemon 仍可读取历史，操作按钮禁用并提示先更新／重装 daemon。
   请求不自动重试；断开或超时会终止安装／更新进程及其子进程。CLI 操作期间不能同时重装该机器的 daemon。
@@ -63,9 +64,9 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
   机器页每台机器一张卡片：状态胶囊、名称、重试 / 断开、完整连接错误，以及各 agent 的
   完整状态、兼容性警告和读取错误；顶部是常驻的远端连接输入框。
 - 点击主页 agent 卡片右上角“＋”，在对应机器与 agent 上新建会话。发送首条消息前可填写工作目录绝对路径：
-  默认取该来源最近会话的目录，本机无历史时使用 HOME，远端无历史时留空待填；目录为空时不能发送。
+  默认取该来源最近会话的目录，本机无历史时使用用户目录（Unix 为 HOME，Windows 优先 USERPROFILE），远端无历史时留空待填；目录为空时不能发送。
   首条消息发出后等待 daemon 返回真实 threadId，再将会话加入侧栏；初始标题取首条消息的首行。
-- 会话态底部是消息输入框（Enter 发送、⌘Enter 换行，运行中切为“停止”）：首次发送使用
+- 会话态底部是消息输入框（Enter 发送，macOS 为 ⌘Enter 换行，Linux/Windows 为 Ctrl+Enter，运行中切为“停止”）：首次发送使用
   `SessionStart`，已有会话携带原 threadId 续聊，新建会话不带 resumeThreadId；之后同一 daemon 会话内发 `TurnStart`。
   流式条目接在历史记录之后，按 agent 与会话声明的能力启用发送和审批；能力查询失败可就地重试。
   命令与工具卡片行尾统一显示状态与耗时（“运行中 · 30.0s”“失败 · 1.5s”），Claude Code 长时间运行的工具每约 30 秒刷新一次耗时。
@@ -78,8 +79,8 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
   断线或发送失败清除待决审批。daemon 协议未知或不是 v9 时禁用交互，历史仍可读取；发送前会在实际连接上再次确认协议。
 - 透明标题栏下为红绿灯留出顶部空间，空态与会话态顶部均按系统偏好处理双击；
   打开窗口后搜索框默认聚焦。
-- 支持通过 `Command+Q` 或 AgentDeck 菜单中的“退出 AgentDeck”退出应用。
-- 提供 `--selfcheck`，验证 GPUI、Metal renderer、隐藏窗口和组件树初始化；该路径
+- 退出快捷键使用平台 secondary 修饰键（macOS 为 Command+Q，Linux/Windows 为 Ctrl+Q）；macOS 还可通过 AgentDeck 菜单中的“退出 AgentDeck”退出。
+- 提供 `--selfcheck`，验证 GPUI、平台 renderer、隐藏窗口和组件树初始化；该路径
   不连接 daemon，也不触碰本机 vendor 历史。
 - 开发者模式在右上角显示 FPS 与上一帧间隔：debug 构建（含 `build_and_run.sh`
   产出的 bundle）默认开启，release 构建设置 `AGENTDECK_DEBUG=1` 开启。GPUI
@@ -108,7 +109,7 @@ diagnostics 等较宽的代码表面。Codex 路径已经落地 protocol v4 的 
 ## 仓库结构
 
 ```text
-agentdeck-desktop/       Rust/GPUI macOS 客户端（历史读取、新建会话与续聊）
+agentdeck-desktop/       Rust/GPUI 桌面客户端（历史读取、新建会话与续聊）
 agentdeck-protocol/      AgentDeck 中立 IPC 类型与 schema 事实源
 agentdeckd/              Codex / Claude Code adapter daemon
 agentdeck-cli/           参考客户端与 E2E 驱动
@@ -124,7 +125,8 @@ stdin/stdout。依赖方向固定为 `desktop → typed local client → agentde
 解析 vendor JSON，也不把 daemon 嵌入 GUI 进程，更不依赖 `agentdeck-cli`。
 macOS 启动 daemon 前会在子进程恢复信号接收，避免继承 GPUI 后台线程屏蔽的
 `SIGCHLD`，导致已退出的版本探测进程仍被判为超时。
-本机和远端 daemon 的 `PATH` 均包含 `~/.local/bin`，可直接发现官方原生安装器生成的 CLI。
+Unix 本机和远端 daemon 的 `PATH` 均包含 `~/.local/bin`，可直接发现官方原生安装器生成的 CLI。
+Windows 使用原生 `agentdeckd.exe` 和平台 PATH；vendor 发现跳过 shell wrapper，详见[发布说明](docs/RELEASE.md)。
 
 官方安装说明：[Codex CLI](https://developers.openai.com/codex/cli)、[Claude Code](https://code.claude.com/docs/en/setup#install-claude-code)。
 
@@ -142,7 +144,10 @@ macOS 启动 daemon 前会在子进程恢复信号接收，避免继承 GPUI 后
 - 远端 `bash -lc` 的 PATH 中有 `codex`、`claude`；`agentdeckd` 在 PATH 或 `~/.local/bin` 中均可；
 - 每台机器一条常驻连接（本机一个 `agentdeckd` 子进程，远端一条 ssh 会话），所有请求复用，
   history 按 requestId 并发；`ServerAliveInterval=15` 让对端休眠/断网后约 45 秒内断开，
-  下次请求自动重连（`ControlMaster` `~/.ssh/agentdeck-%C` 让重连免去完整握手）。
+  下次请求自动重连（Unix 客户端用 `ControlMaster` `~/.ssh/agentdeck-%C` 复用握手；Windows 客户端不启用该 socket 复用）。
+
+Windows 客户端需安装 OpenSSH `ssh.exe`。当前远端启动和安装仅支持 Linux/macOS，
+不支持 Windows 主机作为 SSH 目标；真实 Windows SSH 联通性尚须单独验收。
 
 机器卡片提供「检查更新」，读取当前常驻连接中运行的 `agentdeckd` 版本，与桌面配套版本比较；
 检查不查询 GitHub 最新发布，也不主动重启连接。检查期间显示「检查中…」，失败显示具体原因并保留上次成功读取的版本和协议，
@@ -169,7 +174,9 @@ ssh dt 'cd ~/AgentDeck && ~/.cargo/bin/cargo build --release --locked -p agentde
   && bash -lc "agentdeckd --selfcheck"'
 ```
 
-Linux 上 daemon 的数据目录为 `~/.local/share/AgentDeck/`（`AGENTDECK_DATA_DIR` 可覆盖）。
+Linux 上桌面远端列表与 daemon 数据目录为 `~/.local/share/AgentDeck/`；Windows 为
+`%LOCALAPPDATA%\AgentDeck\`（缺失时使用用户目录下 `AppData\Local\AgentDeck\`）。
+`AGENTDECK_DATA_DIR` 可覆盖，完整路径规则见[发布说明](docs/RELEASE.md#用户数据目录)。
 
 ## 依赖版本
 
@@ -208,14 +215,15 @@ stderr，成功 stdout JSON 与退出码保持不变。版本不同表示尚未�
 
 ## 发布包与安装
 
-第一期发布流水线覆盖 macOS 15+ 的 Apple Silicon / Intel 桌面包，以及 Ubuntu 24.04
-x86_64 桌面包；每个桌面包携带同版本、同架构的 `agentdeckd`，daemon 也提供独立下载。
-保留 Linux x86_64 / ARM64 musl daemon；Linux ARM64 桌面和 Windows 属于第二期。
-产物清单、SHA256 校验、安装步骤及未公证 macOS 包的限制见[发布与安装说明](docs/RELEASE.md)。
+发布流水线覆盖 macOS 15+ 的 Apple Silicon / Intel、Ubuntu 24.04 x86_64 / ARM64 和
+Windows x64 桌面包；每个桌面包携带同版本、同架构的 `agentdeckd`，daemon 也提供独立下载。
+保留 Linux x86_64 / ARM64 musl daemon；Windows ARM64 不在当前矩阵中。
+产物清单、SHA256 校验、安装步骤、未公证 macOS 包及未签名 Windows 包的限制见
+[发布与安装说明](docs/RELEASE.md)。矩阵描述构建范围，不代表所有图形环境和真实模型已验收。
 
 ## 构建与运行
 
-前置环境：
+macOS 开发前置环境：
 
 - macOS 15+
 - Rust 1.96+
@@ -239,7 +247,8 @@ cargo run -p agentdeck-desktop -- --selfcheck
 让 macOS「本地网络」授权跨构建保持有效；该权限按 AgentDeck.app 判定，覆盖 app 启动的
 ssh 和 agent 会话。没有证书时退回 ad-hoc，每次重新构建都需重新授权（#56）。
 
-release 构建使用 `scripts/release/package.sh`，只构建和打包，不停止或打开现有应用；
+Unix release 构建使用 `scripts/release/package.sh`，Windows 使用 `package-windows.ps1`，
+只构建和打包，不停止或打开现有应用；
 验证使用解包后的独立 selfcheck，具体命令见[发布与安装说明](docs/RELEASE.md)。
 
 macOS 应用图标和侧栏品牌行使用统一的 04C 图标；iOS companion 使用同款满版

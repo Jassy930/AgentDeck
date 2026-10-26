@@ -552,22 +552,19 @@ pub(crate) enum SidebarRow {
 
 /// 毫秒时间戳的本地日序号、年、月、日、时、分。零表示 adapter 没有可显示的时间。
 /// 偏移取该时刻自己的，夏令时切换当天不会错位。
-#[cfg(unix)]
 fn local_time(ms: u64) -> Option<(i64, i32, i32, i32, i32, i32)> {
+    use chrono::{DateTime, Datelike, Local, Timelike};
     if ms == 0 {
         return None;
     }
-    let secs = (ms / 1000) as libc::time_t;
-    // SAFETY: localtime_r 只写入传入的 tm。
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    unsafe { libc::localtime_r(&secs, &mut tm) };
+    let time = DateTime::from_timestamp_millis(i64::try_from(ms).ok()?)?.with_timezone(&Local);
     Some((
-        (secs as i64 + tm.tm_gmtoff as i64).div_euclid(86_400),
-        tm.tm_year + 1900,
-        tm.tm_mon + 1,
-        tm.tm_mday,
-        tm.tm_hour,
-        tm.tm_min,
+        (time.timestamp() + i64::from(time.offset().local_minus_utc())).div_euclid(86_400),
+        time.year(),
+        time.month() as i32,
+        time.day() as i32,
+        time.hour() as i32,
+        time.minute() as i32,
     ))
 }
 
@@ -737,7 +734,11 @@ impl Shell {
         let composer = cx.new(|cx| {
             InputState::new(window, cx)
                 .auto_grow(1, 8)
-                .placeholder("发消息，Enter 发送，⌘Enter 换行")
+                .placeholder(if cfg!(target_os = "macos") {
+                    "发消息，Enter 发送，⌘Enter 换行"
+                } else {
+                    "发消息，Enter 发送，Ctrl+Enter 换行"
+                })
         });
         let cwd_input = cx.new(|cx| InputState::new(window, cx).placeholder("工作目录绝对路径"));
         cx.subscribe(&cwd_input, |_, _, event, cx| {
@@ -1897,7 +1898,12 @@ impl Shell {
             .iter()
             .find(|session| session.host == host && session.item.agent_kind == kind)
             .map(|session| session.item.cwd.display().to_string())
-            .or_else(|| host.is_none().then(|| std::env::var("HOME").ok()).flatten())
+            .or_else(|| {
+                host.is_none()
+                    .then(crate::platform::home_dir)
+                    .flatten()
+                    .map(|home| home.display().to_string())
+            })
             .unwrap_or_default();
         self.cwd_input
             .update(cx, |input, cx| input.set_value(cwd, window, cx));
@@ -3533,6 +3539,14 @@ mod tests {
     #[test]
     fn sidebar_rows_do_not_render_epoch_for_unknown_time() {
         assert_eq!(local_time(0), None);
+        assert_eq!(local_time(u64::MAX), None);
+        let (day, year, month, date, hour, minute) = local_time(1_700_000_000_000).unwrap();
+        assert!((19_675..=19_676).contains(&day));
+        assert_eq!(year, 2023);
+        assert_eq!(month, 11);
+        assert!((14..=15).contains(&date));
+        assert!((0..24).contains(&hour));
+        assert!((0..60).contains(&minute));
         let rows = sidebar_rows([(0, local_time(0))], 20_000, 2026);
         assert!(matches!(
             rows.as_slice(),

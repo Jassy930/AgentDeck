@@ -12,16 +12,27 @@ version="$("$root/scripts/release/check-version.sh")"
 commit="$(git -C "$root" rev-parse HEAD)"
 assets=(
   AgentDeck-aarch64-apple-darwin.tar.gz
+  AgentDeck-aarch64-unknown-linux-gnu.tar.gz
   AgentDeck-x86_64-apple-darwin.tar.gz
+  AgentDeck-x86_64-pc-windows-msvc.zip
   AgentDeck-x86_64-unknown-linux-gnu.tar.gz
   agentdeckd-aarch64-apple-darwin.tar.gz
+  agentdeckd-aarch64-unknown-linux-gnu.tar.gz
   agentdeckd-aarch64-unknown-linux-musl.tar.gz
   agentdeckd-x86_64-apple-darwin.tar.gz
+  agentdeckd-x86_64-pc-windows-msvc.zip
   agentdeckd-x86_64-unknown-linux-gnu.tar.gz
   agentdeckd-x86_64-unknown-linux-musl.tar.gz
 )
 
 fail() { echo "verify-set: $*" >&2; exit 1; }
+archive_read() {
+  if [[ "$1" == *.zip ]]; then
+    unzip -p "$1" "$2"
+  else
+    tar -xOf "$1" "$2"
+  fi
+}
 shopt -s nullglob dotglob
 for path in "$asset_dir"/*; do
   name="${path##*/}"
@@ -39,6 +50,7 @@ for asset in "${assets[@]}"; do
   [[ -f "$archive" && ! -L "$archive" ]] || fail "missing asset: $asset"
   target="${asset#*-}"
   target="${target%.tar.gz}"
+  target="${target%.zip}"
   case "$asset" in
     AgentDeck-*-apple-darwin.tar.gz)
       prefix=AgentDeck.app/Contents/Resources/
@@ -48,18 +60,30 @@ for asset in "${assets[@]}"; do
       prefix=AgentDeck/
       binaries=(AgentDeck/agentdeck-desktop AgentDeck/agentdeckd)
       ;;
+    AgentDeck-*-pc-windows-msvc.zip)
+      prefix=AgentDeck/
+      binaries=(AgentDeck/AgentDeck.exe AgentDeck/agentdeckd.exe)
+      ;;
+    agentdeckd-*-pc-windows-msvc.zip)
+      prefix=
+      binaries=(agentdeckd.exe)
+      ;;
     agentdeckd-*)
       prefix=
       binaries=(agentdeckd)
       ;;
   esac
-  listing="$(tar -tzf "$archive")"
+  if [[ "$archive" == *.zip ]]; then
+    listing="$(unzip -Z1 "$archive")"
+  else
+    listing="$(tar -tzf "$archive")"
+  fi
   for entry in "${binaries[@]}" "${prefix}RELEASE-VERSION" "${prefix}RELEASE-INFO.txt"; do
     grep -Fxq "$entry" <<< "$listing" || fail "$asset is missing $entry"
   done
-  actual_version="$(tar -xOf "$archive" "${prefix}RELEASE-VERSION")"
+  actual_version="$(archive_read "$archive" "${prefix}RELEASE-VERSION")"
   [[ "$actual_version" == "$version" ]] || fail "$asset version $actual_version != $version"
-  info="$(tar -xOf "$archive" "${prefix}RELEASE-INFO.txt")"
+  info="$(archive_read "$archive" "${prefix}RELEASE-INFO.txt")"
   grep -Fxq "target=$target" <<< "$info" || fail "$asset target metadata mismatch"
   grep -Fxq "commit=$commit" <<< "$info" || fail "$asset commit metadata mismatch"
 done
@@ -71,4 +95,4 @@ if [[ "${2:-}" == --check ]]; then
 else
   printf '%s\n' "$checksums" > "$asset_dir/SHA256SUMS"
 fi
-printf 'verify-set: 8 archives, version %s, commit %s, SHA256SUMS OK\n' "$version" "$commit"
+printf 'verify-set: %s archives, version %s, commit %s, SHA256SUMS OK\n' "${#assets[@]}" "$version" "$commit"

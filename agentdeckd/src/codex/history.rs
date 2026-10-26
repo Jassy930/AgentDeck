@@ -194,7 +194,7 @@ pub async fn list_history(
         list_history_inner(&mut client, cwd_filter, limit),
     )
     .await;
-    client.shutdown().await;
+    client.shutdown().await?;
     result
         .map(|items| HistoryReply {
             response: HistoryResponse::List(items),
@@ -286,7 +286,7 @@ pub async fn read_history(thread_id: &ThreadId) -> Result<HistoryReply, Protocol
         read_history_inner(&mut client, thread_id.clone()),
     )
     .await;
-    client.shutdown().await;
+    client.shutdown().await?;
     result
         .map(|response| HistoryReply {
             response: HistoryResponse::Read(response),
@@ -709,7 +709,7 @@ mod tests {
                 assert!(warning.message.contains(detail), "{}", warning.message);
             }
             let result = read_history_inner(&mut client, ThreadId("thread-1".into())).await;
-            client.shutdown().await;
+            client.shutdown().await.unwrap();
             let requests: Vec<Value> = std::fs::read_to_string(&log)
                 .unwrap()
                 .lines()

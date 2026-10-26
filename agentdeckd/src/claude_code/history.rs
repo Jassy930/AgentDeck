@@ -39,6 +39,7 @@ use std::process::{ExitStatus, Stdio};
 use std::time::SystemTime;
 
 use super::is_collaboration_tool_name;
+use crate::process::Child;
 use agentdeck_protocol::{
     AgentItem, AgentItemMeta, AgentKind, CONTEXT_KIND_KEY, DiffFile, DiffStatus, HistoryListItem,
     HistoryReadResponse, HistoryTurn, ImageAttachment, ProtocolError, ShellStatus, ThreadId,
@@ -46,7 +47,7 @@ use agentdeck_protocol::{
 };
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 
 // ── Path encoding (CC convention) ───────────────────────────────────────────
 
@@ -66,11 +67,13 @@ pub fn decode_cwd(dirname: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// `~/.claude/projects/` resolved against `$HOME`. Returns `None` only
-/// when `$HOME` is unset (test-time isolation).
+/// `~/.claude/projects/` resolved against the native user's home directory.
 fn claude_projects_root() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".claude").join("projects"))
+    Some(
+        crate::platform::home_dir()?
+            .join(".claude")
+            .join("projects"),
+    )
 }
 
 // ── claude agents --json parser (best-effort live-agent enrichment) ─────────
@@ -195,7 +198,10 @@ fn list_history_from_jsonl_root(
     }
 
     let mut candidates = Vec::new();
-    let dirs: Vec<PathBuf> = if let Some(cwd) = cwd_filter {
+    // Windows drive letters, separators and punctuation are lossy in the vendor
+    // directory key. Filter by the exact cwd in JSONL instead of guessing that key.
+    let directory_filter = if cfg!(windows) { None } else { cwd_filter };
+    let dirs: Vec<PathBuf> = if let Some(cwd) = directory_filter {
         let p = root.join(encode_cwd(cwd));
         if p.is_dir() { vec![p] } else { vec![] }
     } else {
@@ -253,13 +259,35 @@ fn list_history_from_jsonl_root(
             continue;
         }
         let (title, recorded_cwd) = scan_session(&candidate.path);
+        #[cfg(windows)]
+        if let Some(expected) = cwd_filter {
+            let Some(actual) = recorded_cwd.as_deref() else {
+                continue;
+            };
+            if !actual
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
+                .eq(expected
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy().to_lowercase()))
+            {
+                continue;
+            }
+        }
+        // An encoded Windows directory cannot reconstruct a trustworthy absolute
+        // cwd. Leave old records without cwd empty rather than inventing a path.
+        let fallback_cwd = if cfg!(windows) {
+            PathBuf::new()
+        } else {
+            candidate.cwd
+        };
         items.push(HistoryListItem {
             thread_id: candidate.thread_id,
             agent_kind: AgentKind::ClaudeCode,
             title,
             // The directory name is lossy (`-` and `/` collide); the cwd CC
             // records on each line is exact.
-            cwd: recorded_cwd.unwrap_or(candidate.cwd),
+            cwd: recorded_cwd.unwrap_or(fallback_cwd),
             last_active_ms: candidate.last_active_ms,
             archived: false,
         });
@@ -972,7 +1000,7 @@ impl CancelSafeVendorChild {
         command.kill_on_drop(true);
         #[cfg(unix)]
         command.process_group(0);
-        command.spawn().map(|child| Self { child: Some(child) })
+        crate::process::spawn(command).map(|child| Self { child: Some(child) })
     }
 
     async fn wait(mut self) -> std::io::Result<ExitStatus> {
@@ -981,6 +1009,12 @@ impl CancelSafeVendorChild {
             .as_mut()
             .expect("cancel-safe vendor child exists until wait completes")
             .wait()
+            .await?;
+        #[cfg(windows)]
+        self.child
+            .as_mut()
+            .expect("vendor child exists until cleanup completes")
+            .terminate_tree_and_wait(std::time::Duration::from_secs(2))
             .await?;
         // The child has been reaped; disarm cancellation cleanup so a recycled
         // pid can never be targeted after a successful wait.
@@ -1052,7 +1086,7 @@ pub async fn read_history(thread_id: &ThreadId) -> Result<HistoryReadResponse, P
     tokio::task::spawn_blocking(move || -> Result<HistoryReadResponse, ProtocolError> {
         let root = claude_projects_root().ok_or_else(|| ProtocolError {
             code: "cc-history-no-home".into(),
-            message: "$HOME unset; cannot resolve ~/.claude/projects".into(),
+            message: "user home unavailable; cannot resolve ~/.claude/projects".into(),
             diagnostic_ref: None,
         })?;
         let rd = std::fs::read_dir(&root).map_err(|e| ProtocolError {
@@ -1110,9 +1144,13 @@ async fn find_session_cwd(thread_id: &ThreadId) -> Result<PathBuf, ProtocolError
         .into_iter()
         .find(|i| i.thread_id == *thread_id)
         .map(|i| i.cwd)
+        .filter(|cwd| !cwd.as_os_str().is_empty())
         .ok_or_else(|| ProtocolError {
             code: "cc-session-not-found".into(),
-            message: format!("session {} not found in history", thread_id.0),
+            message: format!(
+                "session {} or its original cwd not found in history",
+                thread_id.0
+            ),
             diagnostic_ref: None,
         })
 }
@@ -1128,7 +1166,7 @@ pub async fn rename(thread_id: &ThreadId, title: &str) -> Result<(), ProtocolErr
     // list_history. Without this the CC binary reports
     // "No conversation found with session ID: <id>".
     let session_cwd = find_session_cwd(thread_id).await?;
-    let mut command = Command::new("claude");
+    let mut command = Command::new(crate::platform::executable("claude"));
     command
         .current_dir(&session_cwd)
         .arg("--print")
@@ -1158,7 +1196,7 @@ pub async fn rename(thread_id: &ThreadId, title: &str) -> Result<(), ProtocolErr
 /// Generic wrapper for fire-and-forget `claude <args>` invocations used by
 /// archive. Vendor output is discarded at the process boundary.
 async fn run_claude_in(args: &[&str], cwd: &std::path::Path) -> Result<(), ProtocolError> {
-    let mut command = Command::new("claude");
+    let mut command = Command::new(crate::platform::executable("claude"));
     command.current_dir(cwd);
     for a in args {
         command.arg(a);
@@ -1664,6 +1702,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_history_uses_recorded_drive_path_instead_of_directory_encoding() {
+        let root = tempdir_unique();
+        let project = root.join("lossy-vendor-directory-key");
+        std::fs::create_dir_all(&project).unwrap();
+        let recorded = Path::new(r"C:\Users\Example\project-name.app");
+        std::fs::write(project.join("aaaaaaaa-0000-0000-0000-000000000001.jsonl"),
+            serde_json::json!({"type":"user", "cwd":recorded, "message":{"role":"user", "content":"fixture"}}).to_string()).unwrap();
+        let items = list_history_from_jsonl_root(
+            &root,
+            Some(Path::new("c:/users/example/project-name.app")),
+            10,
+        )
+        .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].cwd, recorded);
+        assert!(
+            list_history_from_jsonl_root(&root, Some(Path::new(r"D:\other")), 10)
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::write(
+            project.join("bbbbbbbb-0000-0000-0000-000000000002.jsonl"),
+            r#"{"type":"user","message":{"role":"user","content":"no cwd"}}"#,
+        )
+        .unwrap();
+        let all = list_history_from_jsonl_root(&root, None, 10).unwrap();
+        assert!(
+            all.iter()
+                .find(|item| item.thread_id.0.starts_with("bbbbbbbb"))
+                .unwrap()
+                .cwd
+                .as_os_str()
+                .is_empty()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn list_history_from_jsonl_root_sorts_newest_first_and_applies_limit() {
         let home = tempdir_unique();
@@ -1681,7 +1758,12 @@ mod tests {
             )
             .unwrap();
             let now = std::time::SystemTime::now() + std::time::Duration::from_secs(idx as u64);
-            let _ = std::fs::File::open(&path).unwrap().set_modified(now);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(now)
+                .unwrap();
         }
 
         let items = list_history_from_jsonl_root(&root, None, 2).unwrap();
@@ -1707,7 +1789,9 @@ mod tests {
         )
         .unwrap();
         let newest = std::time::SystemTime::now() + std::time::Duration::from_secs(180);
-        std::fs::File::open(&claude_mem)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&claude_mem)
             .unwrap()
             .set_modified(newest)
             .unwrap();
@@ -1719,7 +1803,9 @@ mod tests {
         )
         .unwrap();
         let second_newest = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
-        std::fs::File::open(&memory)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&memory)
             .unwrap()
             .set_modified(second_newest)
             .unwrap();
@@ -1731,7 +1817,9 @@ mod tests {
         )
         .unwrap();
         let older = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-        std::fs::File::open(&normal)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&normal)
             .unwrap()
             .set_modified(older)
             .unwrap();
@@ -1760,7 +1848,9 @@ mod tests {
         )
         .unwrap();
         let newest = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
-        std::fs::File::open(&observer_session)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&observer_session)
             .unwrap()
             .set_modified(newest)
             .unwrap();
@@ -1772,7 +1862,9 @@ mod tests {
         )
         .unwrap();
         let older = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-        std::fs::File::open(&normal)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&normal)
             .unwrap()
             .set_modified(older)
             .unwrap();
@@ -1803,7 +1895,9 @@ mod tests {
         )
         .unwrap();
         let future = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-        std::fs::File::open(&newest)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&newest)
             .unwrap()
             .set_modified(future)
             .unwrap();

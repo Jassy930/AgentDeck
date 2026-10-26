@@ -141,12 +141,23 @@ mod tests {
 
     #[test]
     fn session_ui_does_not_branch_on_vendor_identity() {
-        let shell = include_str!("shell.rs");
+        let live = include_str!("live.rs").replace("\r\n", "\n");
+        let shell = include_str!("shell.rs").replace("\r\n", "\n");
+        for newline in ["\n", "\r\n"] {
+            assert_session_ui_has_no_vendor_branches(
+                &live.replace('\n', newline),
+                &shell.replace('\n', newline),
+            );
+        }
+    }
+
+    fn assert_session_ui_has_no_vendor_branches(live: &str, shell: &str) {
+        // Windows checkouts may use CRLF. Normalize before locating the end of
+        // the impl so test-only vendor fixtures stay outside the inspected UI.
+        let live = live.replace("\r\n", "\n");
+        let shell = shell.replace("\r\n", "\n");
         for implementation in [
-            include_str!("live.rs")
-                .split("#[cfg(test)]")
-                .next()
-                .unwrap(),
+            live.split("#[cfg(test)]").next().unwrap(),
             shell
                 .split("fn current_live(")
                 .nth(1)

@@ -1,5 +1,5 @@
 //! 已连接的远端主机列表：一行一个 ssh 目标，与 daemon 共用数据目录规则
-//! （`AGENTDECK_DATA_DIR` 覆盖，否则按 stable/dev profile 选择 Application Support 目录）。
+//! （`AGENTDECK_DATA_DIR` 覆盖，否则按 stable/dev profile 选择平台数据目录）。
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -13,7 +13,8 @@ fn path() -> Option<PathBuf> {
     path_from(
         std::env::var_os("AGENTDECK_DATA_DIR").as_deref(),
         std::env::var_os("AGENTDECK_PROFILE").as_deref(),
-        std::env::var_os("HOME").as_deref(),
+        crate::platform::home_dir().as_deref().map(Path::as_os_str),
+        std::env::var_os("LOCALAPPDATA").as_deref(),
     )
 }
 
@@ -21,6 +22,7 @@ fn path_from(
     data_dir: Option<&OsStr>,
     profile: Option<&OsStr>,
     home: Option<&OsStr>,
+    local_app_data: Option<&OsStr>,
 ) -> Option<PathBuf> {
     let dir = match data_dir.filter(|dir| !dir.is_empty()) {
         Some(dir) => PathBuf::from(dir),
@@ -34,9 +36,7 @@ fn path_from(
                 "dev" => "AgentDeck-Dev",
                 _ => return None,
             };
-            PathBuf::from(home?)
-                .join("Library/Application Support")
-                .join(app_dir)
+            crate::platform::data_root(home, local_app_data)?.join(app_dir)
         }
     };
     Some(dir.join(FILE_NAME))
@@ -48,7 +48,7 @@ pub fn load() -> Vec<String> {
 }
 
 pub fn save(hosts: &[&str]) -> Result<(), String> {
-    let path = path().ok_or("无法确定数据目录（HOME 未设置或 AGENTDECK_PROFILE 无效）")?;
+    let path = path().ok_or("无法确定数据目录（用户目录未设置或 AGENTDECK_PROFILE 无效）")?;
     save_to(&path, hosts)
 }
 
@@ -65,7 +65,7 @@ fn load_from(path: &Path) -> Vec<String> {
 
 /// `~/.ssh/config`（含 `Include`）里的具体 Host 别名，供机器页快速添加；带通配符的模式跳过。
 pub fn ssh_config_hosts() -> Vec<String> {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let Some(home) = crate::platform::home_dir() else {
         return Vec::new();
     };
     let mut hosts = Vec::new();
@@ -96,7 +96,7 @@ fn collect_ssh_hosts(path: &Path, home: &Path, hosts: &mut Vec<String>, depth: u
             for include in rest {
                 let include = match include.strip_prefix("~/") {
                     Some(rel) => home.join(rel),
-                    None if include.starts_with('/') => PathBuf::from(include),
+                    None if Path::new(include).is_absolute() => PathBuf::from(include),
                     None => home.join(".ssh").join(include),
                 };
                 collect_ssh_hosts(&include, home, hosts, depth + 1);
@@ -134,7 +134,7 @@ fn release_target(uname: &str) -> Result<&'static str, String> {
 }
 
 fn ssh(host: &str) -> Command {
-    let mut command = Command::new("ssh");
+    let mut command = crate::platform::command("ssh");
     command.args(daemon::SSH_OPTIONS).args(["--", host]);
     command
 }
@@ -181,7 +181,7 @@ pub fn install_daemon(host: &str) -> Result<String, String> {
     let url = format!("{base}/agentdeckd-{target}.tar.gz");
 
     // -L 必需：GitHub 的资产下载会 302 到对象存储。
-    let mut curl = Command::new("curl")
+    let mut curl = crate::platform::command("curl")
         .args(["-fsSL", "--max-time", "300", &url])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -228,21 +228,26 @@ mod tests {
             (Some("dev"), "AgentDeck-Dev"),
         ] {
             assert_eq!(
-                path_from(Some(OsStr::new("")), profile.map(OsStr::new), home),
+                path_from(Some(OsStr::new("")), profile.map(OsStr::new), home, None),
                 Some(
-                    Path::new("/Users/example/Library/Application Support")
+                    crate::platform::data_root(home, None)
+                        .unwrap()
                         .join(app_dir)
                         .join(FILE_NAME)
                 )
             );
         }
-        assert_eq!(path_from(None, Some(OsStr::new("invalid")), home), None);
-        assert_eq!(path_from(None, None, None), None);
+        assert_eq!(
+            path_from(None, Some(OsStr::new("invalid")), home, None),
+            None
+        );
+        assert_eq!(path_from(None, None, None, None), None);
         assert_eq!(
             path_from(
                 Some(OsStr::new("/tmp/agentdeck-custom")),
                 Some(OsStr::new("invalid")),
                 None,
+                Some(OsStr::new("ignored-local-app-data")),
             ),
             Some(PathBuf::from("/tmp/agentdeck-custom/desktop-remotes"))
         );
@@ -296,6 +301,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn installer_rejects_wrong_version_before_replacing_existing_daemon() {
         use std::io::Write;

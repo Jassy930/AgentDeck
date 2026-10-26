@@ -1,4 +1,8 @@
 //! Actual CLI → current daemon → deterministic Codex fixture. No real vendor I/O.
+// Every scenario installs the POSIX shell fixture and checks Unix process ownership.
+// Native pipe/EOF/timeout coverage for Windows lives in src/transport.rs.
+#![cfg(unix)]
+
 mod support;
 
 use agentdeck_protocol::{ClientCommand, SessionId, TurnId};

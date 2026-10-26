@@ -10,17 +10,20 @@
 //! every method offered by the pinned vendor binary. Issue #3 establishes the
 //! lifecycle and cumulative assistant streaming only.
 
+use crate::process::Child;
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::time::{Instant, timeout_at};
 
-use super::app_server::{SHORT_LIVED_SHUTDOWN_TIMEOUT, process_group_exists, signal_process_group};
+use super::app_server::SHORT_LIVED_SHUTDOWN_TIMEOUT;
+#[cfg(unix)]
+use super::app_server::{process_group_exists, signal_process_group};
 
 use agentdeck_protocol::{
     AgentKind, CapabilityId, CodexApprovalPolicy, CodexCapabilities, CodexReasoningEffort,
@@ -162,12 +165,16 @@ pub(super) fn check_probe_deadline(
 
 struct VersionProbe {
     child: Child,
+    #[cfg(unix)]
     process_group_id: u32,
 }
 
 impl Drop for VersionProbe {
     fn drop(&mut self) {
+        #[cfg(unix)]
         let _ = signal_process_group(self.process_group_id);
+        #[cfg(windows)]
+        let _ = self.child.terminate_tree();
         let _ = self.child.start_kill();
     }
 }
@@ -190,13 +197,14 @@ pub(super) async fn probe_codex_version_at(
         .kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
-    let child = command.spawn().map_err(|error| {
+    let child = crate::process::spawn(&mut command).map_err(|error| {
         probe_error(
             "codex-version-probe-failed",
             format!("Codex CLI version probe could not be executed: {error}"),
         )
     })?;
     let mut probe = VersionProbe {
+        #[cfg(unix)]
         process_group_id: child.id().expect("new probe pid"),
         child,
     };
@@ -211,12 +219,20 @@ pub(super) async fn probe_codex_version_at(
     };
 
     // Launchers may leave descendants holding stdout after exiting themselves.
+    #[cfg(unix)]
     let signal = signal_process_group(probe.process_group_id);
+    #[cfg(windows)]
+    let signal = probe.child.terminate_tree();
     let _ = probe.child.start_kill();
     let cleanup = async {
         probe.child.wait().await?;
         signal?;
+        #[cfg(unix)]
         while process_group_exists(probe.process_group_id)? {
+            tokio::time::sleep(PROBE_POLL_INTERVAL).await;
+        }
+        #[cfg(windows)]
+        while !probe.child.tree_is_empty()? {
             tokio::time::sleep(PROBE_POLL_INTERVAL).await;
         }
         let mut stdout = Vec::new();
