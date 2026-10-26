@@ -1885,6 +1885,32 @@ impl Shell {
         .detach();
     }
 
+    /// 弹出系统目录选择器，选中后回填新会话的工作目录。
+    fn pick_cwd(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("选择".into()),
+        });
+        cx.spawn_in(window, async move |shell, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            shell
+                .update_in(cx, |shell, window, cx| {
+                    shell.cwd_input.update(cx, |input, cx| {
+                        input.set_value(path.display().to_string(), window, cx)
+                    });
+                })
+                .ok();
+        })
+        .detach();
+    }
+
     /// 在某台机器的某个 agent 上新建会话；工作目录默认取它最近一次会话的。
     pub fn start_draft(
         &mut self,
@@ -2396,7 +2422,19 @@ impl Shell {
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child("工作目录")
-                        .child(Input::new(&self.cwd_input).small().flex_1()),
+                        .child(Input::new(&self.cwd_input).small().flex_1())
+                        // 原生选择器只能浏览本机目录，远端机器仍手填路径。
+                        .when(session.host.is_none(), |row| {
+                            row.child(
+                                Button::new("pick-cwd")
+                                    .small()
+                                    .outline()
+                                    .label("选择…")
+                                    .on_click(cx.listener(|shell, _, window, cx| {
+                                        shell.pick_cwd(window, cx)
+                                    })),
+                            )
+                        }),
                 )
             })
             .when_some(action, |section, action| {

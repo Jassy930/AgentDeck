@@ -65,6 +65,7 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
   完整状态、兼容性警告和读取错误；顶部是常驻的远端连接输入框。
 - 点击主页 agent 卡片右上角“＋”，在对应机器与 agent 上新建会话。发送首条消息前可填写工作目录绝对路径：
   默认取该来源最近会话的目录，本机无历史时使用用户目录（Unix 为 HOME，Windows 优先 USERPROFILE），远端无历史时留空待填；目录为空时不能发送。
+  本机会话可点输入框旁的“选择…”用系统目录选择器回填，远端机器只能手填（本机选择器浏览不到远端文件系统）。
   首条消息发出后等待 daemon 返回真实 threadId，再将会话加入侧栏；初始标题取首条消息的首行。
 - 会话态底部是消息输入框（Enter 发送，macOS 为 ⌘Enter 换行，Linux/Windows 为 Ctrl+Enter，运行中切为“停止”）：首次发送使用
   `SessionStart`，已有会话携带原 threadId 续聊，新建会话不带 resumeThreadId；之后同一 daemon 会话内发 `TurnStart`。
