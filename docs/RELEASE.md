@@ -42,6 +42,15 @@ Linux 对所需文件同样筛选，再用 `sha256sum -c selected.sha256`。若�
 校验失败时不要解包运行。SHA256 用于发现下载损坏或归档与清单不符，不代替 macOS
 Developer ID 签名、公证、Windows Authenticode 签名或对下载来源的信任。
 
+每个 tag 发布的归档都附带 GitHub 构建来源证明（build provenance），可确认归档由本仓库
+对应 tag 的 Release workflow 构建：
+
+```bash
+gh attestation verify AgentDeck-aarch64-apple-darwin.tar.gz --repo Jassy930/AgentDeck
+```
+
+来源证明只说明归档出自哪次 CI 构建，不代替上述平台签名或公证。
+
 Windows 可在 PowerShell 中核验所下载 ZIP，例如：
 
 ```powershell
