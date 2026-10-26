@@ -38,6 +38,7 @@ pub const CHEVRON_RIGHT_ICON: &str = "icons/chevron-right.svg";
 pub const CHEVRON_DOWN_ICON: &str = "icons/chevron-down.svg";
 pub const ALERT_ICON: &str = "icons/triangle-alert.svg";
 pub const REFRESH_ICON: &str = "icons/refresh.svg";
+pub const FOLDER_ICON: &str = "icons/folder.svg";
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
@@ -48,6 +49,7 @@ impl AssetSource for Assets {
             CHEVRON_DOWN_ICON => include_bytes!("../../assets/icons/chevron-down.svg"),
             ALERT_ICON => include_bytes!("../../assets/icons/triangle-alert.svg"),
             REFRESH_ICON => include_bytes!("../../assets/icons/refresh.svg"),
+            FOLDER_ICON => include_bytes!("../../assets/icons/folder.svg"),
             _ => return Ok(None),
         };
         Ok(Some(Cow::Borrowed(bytes)))
