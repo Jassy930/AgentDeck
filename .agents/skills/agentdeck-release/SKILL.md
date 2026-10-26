@@ -90,10 +90,11 @@ gh run view <run-id> --json conclusion,jobs --jq '{conclusion, jobs: [.jobs[] | 
 gh release view vX.Y.Z --json isDraft,assets --jq '{isDraft, n: (.assets | length)}'   # 期望 false 和 13
 dir=$(mktemp -d)
 gh release download vX.Y.Z --pattern 'agentdeckd-x86_64-unknown-linux-musl.tar.gz' --dir "$dir"
-gh attestation verify "$dir/agentdeckd-x86_64-unknown-linux-musl.tar.gz" --repo Jassy930/AgentDeck
+gh attestation verify "$dir/agentdeckd-x86_64-unknown-linux-musl.tar.gz" --repo Jassy930/AgentDeck --format json \
+  --jq '.[].verificationResult.signature.certificate | {buildSignerURI, sourceRepositoryDigest}'
 ```
 
-provenance 校验失败要当作发版问题向用户报告，不能跳过。
+非终端环境下，校验成功时默认格式什么都不输出，所以要用 `--format json` 看结果：`buildSignerURI` 应为 `.../release.yml@refs/tags/vX.Y.Z`，`sourceRepositoryDigest` 应为发版提交的 SHA。provenance 校验失败要当作发版问题向用户报告，不能跳过。
 
 ## 9. 补写变更说明
 
@@ -104,11 +105,12 @@ prev=$(git tag --sort=-v:refname | sed -n 2p)
 git log "$prev"..vX.Y.Z --first-parent --oneline
 ```
 
-根据上面的提交整理一份中文变更摘要，按「新功能 / 修复 / 发行与构建」分组，附上 PR 和 issue 编号，不要直接贴 commit 列表。然后：
+根据上面的提交整理一份中文变更摘要，按「新功能 / 修复 / 发行与构建」分组，附上 PR 和 issue 编号，不要直接贴 commit 列表，写到 `$tmp/changes.md`（`tmp=$(mktemp -d)`，别写进仓库目录）。摘要可以在等 CI 的时候提前写好。然后：
 
 ```bash
-{ cat changes.md; printf '\n\n'; gh release view vX.Y.Z --json body --jq .body; } > notes.md
-gh release edit vX.Y.Z --notes-file notes.md
+{ cat "$tmp/changes.md"; printf '\n\n'; gh release view vX.Y.Z --json body --jq .body; } > "$tmp/notes.md"
+gh release edit vX.Y.Z --notes-file "$tmp/notes.md"
+gh release view vX.Y.Z --json body --jq .body   # 确认模板里的平台范围和签名限制还在
 ```
 
 ## 10. 收尾
