@@ -1,6 +1,20 @@
 # Linux 桌面端
 
-GPUI 桌面端在 Linux 上可以从源码构建运行，但还没有发布包（见 issue #53）。平台适配缺口统一记录在 issue #52。
+第一期发布流水线为 GPUI 桌面端提供 Ubuntu 24.04 x86_64 的归档包和配套 daemon；
+安装与验收边界见 [RELEASE.md](RELEASE.md)。Linux ARM64 桌面仍属第二期，
+其他发行版、GPU 和 Wayland 组合需要单独验收。平台适配缺口统一记录在 issue #52。
+
+## 第一期平台边界
+
+本期增加 release 构建、打包和归档启动烟测，并修复 Linux `--selfcheck` 在事件循环开始前
+调用退出导致挂起的问题；不代表 Linux 交互体验已全面验收。
+
+- 默认远端机器列表仍保存在 `~/Library/Application Support/AgentDeck/desktop-remotes`，
+  daemon 的默认记录与诊断目录是 `~/.local/share/AgentDeck/`，两者尚未统一。
+  `AGENTDECK_DATA_DIR` 可显式覆盖目录，dev profile 的应用目录名为 `AgentDeck-Dev`。
+- 部分快捷键和输入框提示仍沿用 macOS 表述；X11 / Wayland 的窗口装饰、真实 GPU 和
+  桌面环境行为需要单独检查。发布 CI 的 Xvfb 隐藏窗口 selfcheck 不覆盖这些交互。
+- Linux ARM64 仅提供独立 musl daemon，本期没有 ARM64 桌面包。
 
 ## 中文输入法崩溃（X11 + ibus，已修复）
 

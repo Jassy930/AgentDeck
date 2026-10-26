@@ -64,6 +64,26 @@ check 名称是 `Offline CI / offline`，使用 `macos-15`，按顺序执行：
 Simulator。`swift test` 只覆盖平台无关的 `AgentDeckMobileCore`；UIKit Simulator 仍按
 iOS 变更范围在本地单独执行。
 
+## Release 包门禁
+
+第一期矩阵、安装与签名边界见 [RELEASE.md](RELEASE.md)。`.github/workflows/release.yml`
+的 PR/手动运行只生成候选产物，覆盖 macOS Apple Silicon / Intel 桌面与 daemon、
+Ubuntu 24.04 x86_64 桌面与 GNU daemon、Linux 双架构 musl daemon。
+
+构建必须使用 `--release --locked`；烟测从实际归档解包，检查架构、workspace/二进制/归档
+版本一致，隔离 HOME 与数据目录运行 daemon selfcheck/diagnostics 和桌面隐藏窗口 selfcheck。
+macOS 另核对 bundle 图标、最低系统版本和代码签名完整性；签名完整性不等于 Developer ID
+签名或公证验收。Linux CI 使用 Xvfb 和软件 Vulkan，不代表硬件 GPU / Wayland 全面兼容。
+
+完整集合必须精确包含 8 个归档，生成并回验 `SHA256SUMS`。只有 v* tag 的版本匹配、
+全部原生目标和离线门禁成功后，统一 publish 才能上传 draft、回验并公开。
+PR/手动运行不得创建实际 Release。验收分别记录静态检查、实际构建、归档启动烟测、
+人工 GUI 和签名/公证结果；没有运行的项目明确写未运行。
+
+release 验证使用 `scripts/release/package.sh` 和 `scripts/release/smoke.sh`，不调用
+会停止或打开开发应用的 `script/build_and_run.sh`。发布脚本的归档验证负责 release bundle
+检查；交互视图变更仍按下文执行真实窗口人工验收。
+
 ## GPUI 桌面 P0 门禁
 
 涉及 `agentdeck-desktop/`、Cargo workspace 或桌面打包脚本时至少运行：
@@ -208,6 +228,7 @@ macOS 桌面不得重新依赖 Swift target；共享 Core 测试也不得重新�
 | --- | --- |
 | GPUI 视图、状态或组件 | `cargo test -p agentdeck-desktop`、desktop selfcheck、真实窗口冒烟 |
 | 桌面 bundle 或启动脚本 | `bash -n script/build_and_run.sh`、`./script/build_and_run.sh --verify` |
+| release 打包或发布 CI | `scripts/release/` 静态检查与自检、各原生目标 package/smoke、完整集合和 SHA256 回验；见 [RELEASE.md](RELEASE.md) |
 | Swift Core / iOS 共享模型 | `swift test`；涉及 iOS 时再跑 iOS Simulator 测试 |
 | daemon、adapter、record、diagnostics | `scripts/verify-offline-tests.sh`、对应 focused test，以及通过 `AGENTDECK_DAEMON_BIN` 绑定当前 checkout 的 CLI selfcheck |
 | agentdeck-protocol | `cargo test -p agentdeck-protocol`；漂移时按下文重生成 schema |

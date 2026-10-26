@@ -151,10 +151,11 @@ macOS 启动 daemon 前会在子进程恢复信号接收，避免继承 GPUI 后
 「已是桌面配套版本」，同版协议不匹配或版本未知时提供「重装 agentdeckd」。远端版本更高时
 提示先更新桌面 App，不提供降级；找不到 `agentdeckd` 时显示「未安装 agentdeckd」和「安装」。
 
-安装／升级沿用同一流程：桌面端先 `ssh <host> uname -sm` 选目标（Linux x86_64 / aarch64），
+安装／升级沿用同一流程：桌面端先 `ssh <host> uname -sm` 选目标（Linux x86_64 / aarch64，或 macOS x86_64 / arm64），
 在本机 `curl` 下载与桌面端同版本的 GitHub Release 资产
-`agentdeckd-<target>.tar.gz`（`v<版本>` tag，由 `.github/workflows/release.yml` 构建 musl 静态二进制），
-经 ssh stdin 写入远端 `~/.local/bin/agentdeckd`，试运行成功后才替换并重连；启动时优先使用该目录，避免继续命中 PATH 中的旧安装。
+`agentdeckd-<target>.tar.gz`（`v<版本>` tag；Linux 使用 musl 静态二进制，macOS 使用对应架构的 Darwin 二进制），
+经 ssh stdin 写入远端临时文件，确认可执行且版本匹配后才替换 `~/.local/bin/agentdeckd` 并重连；启动时优先使用该目录，避免继续命中 PATH 中的旧安装。
+自动安装通过 HTTPS 下载，当前不读取 `SHA256SUMS`；需要手动核验归档时见[发布与安装说明](docs/RELEASE.md)。
 `AGENTDECK_RELEASE_URL` 可把下载前缀改成别的地址（如 `file:///tmp/agentdeck-release`）用于测试。
 还没发布对应 Release 时，安装会报「GitHub 上可能还没有发布 … 二进制」。
 
@@ -205,6 +206,13 @@ stderr，成功 stdout JSON 与退出码保持不变。版本不同表示尚未�
 展开／收起按钮支持 Tab 聚焦、Enter／Space 操作。桌面长错误可滚动查看，
 修复运行时后可直接点击重试。
 
+## 发布包与安装
+
+第一期发布流水线覆盖 macOS 15+ 的 Apple Silicon / Intel 桌面包，以及 Ubuntu 24.04
+x86_64 桌面包；每个桌面包携带同版本、同架构的 `agentdeckd`，daemon 也提供独立下载。
+保留 Linux x86_64 / ARM64 musl daemon；Linux ARM64 桌面和 Windows 属于第二期。
+产物清单、SHA256 校验、安装步骤及未公证 macOS 包的限制见[发布与安装说明](docs/RELEASE.md)。
+
 ## 构建与运行
 
 前置环境：
@@ -223,13 +231,16 @@ cargo run -p agentdeck-desktop -- --selfcheck
 ./script/build_and_run.sh --verify
 ```
 
-`script/build_and_run.sh` 是唯一桌面 build/run 入口。它构建
+`script/build_and_run.sh` 是 macOS 桌面开发 build/run 入口。它构建
 `agentdeck-desktop` 与 `agentdeckd`、装配 `dist/AgentDeck.app`、写入 macOS 15 最低版本并
 启动最新产物。桌面维持到 bundle 内自带 `agentdeckd` 的本机连接，复用它读取历史。
 
 脚本默认用钥匙串里的 Apple Development 证书签名（`AGENTDECK_SIGN_IDENTITY` 可覆盖），
 让 macOS「本地网络」授权跨构建保持有效；该权限按 AgentDeck.app 判定，覆盖 app 启动的
 ssh 和 agent 会话。没有证书时退回 ad-hoc，每次重新构建都需重新授权（#56）。
+
+release 构建使用 `scripts/release/package.sh`，只构建和打包，不停止或打开现有应用；
+验证使用解包后的独立 selfcheck，具体命令见[发布与安装说明](docs/RELEASE.md)。
 
 macOS 应用图标和侧栏品牌行使用统一的 04C 图标；iOS companion 使用同款满版
 AppIcon。正式资源和重新生成 `.icns` 的方式见 [图标资源](assets/brand/README.md)。
@@ -321,3 +332,4 @@ daemon。该入口使用固定 M0 选项（只读、never approval、medium）�
 - [docs/index.md](docs/index.md)：文档导航和历史计划。
 - [docs/AGENTDECKD_STATUS.md](docs/AGENTDECKD_STATUS.md)：daemon 能力完整度与缺口。
 - [docs/QUALITY.md](docs/QUALITY.md)：按变更范围选择验证。
+- [docs/RELEASE.md](docs/RELEASE.md)：多平台发布矩阵、安装、签名限制与发布门禁。

@@ -127,6 +127,8 @@ fn release_target(uname: &str) -> Result<&'static str, String> {
     match uname.split_whitespace().collect::<Vec<_>>()[..] {
         ["Linux", "x86_64"] => Ok("x86_64-unknown-linux-musl"),
         ["Linux", "aarch64" | "arm64"] => Ok("aarch64-unknown-linux-musl"),
+        ["Darwin", "x86_64"] => Ok("x86_64-apple-darwin"),
+        ["Darwin", "arm64" | "aarch64"] => Ok("aarch64-apple-darwin"),
         _ => Err(format!("没有适用于 {uname} 的预编译 agentdeckd")),
     }
 }
@@ -137,8 +139,31 @@ fn ssh(host: &str) -> Command {
     command
 }
 
+fn install_script() -> String {
+    format!(
+        r#"sh -c '
+set -e
+d="$HOME/.local/bin"
+mkdir -p "$d"
+t=$(mktemp "$d/.agentdeckd.XXXXXX")
+cleanup() {{ rm -f "$t"; }}
+trap cleanup EXIT
+tar -xzO agentdeckd > "$t"
+chmod 755 "$t"
+actual=$("$t" --version)
+version=$(printf "%s\n" "$actual" | head -n 1)
+if [ "$version" != "agentdeckd {DAEMON_VERSION}" ]; then
+    printf "agentdeckd 版本不匹配：%s（预期 {DAEMON_VERSION}）\n" "$actual" >&2
+    exit 1
+fi
+mv -f "$t" "$d/agentdeckd"
+"$d/agentdeckd" --version
+'"#
+    )
+}
+
 /// 把与桌面端同版本的预编译 agentdeckd 装到远端 `~/.local/bin`：本机 curl 下载，
-/// 经 ssh stdin 传过去。先写临时文件并试运行，确认能执行（架构对）才替换，
+/// 经 ssh stdin 传过去。先写临时文件并试运行，确认能执行且版本相等才替换，
 /// 也避开覆盖正在运行的可执行文件（ETXTBSY）。阻塞调用，返回新 daemon 的 `--version`。
 pub fn install_daemon(host: &str) -> Result<String, String> {
     daemon::validate_host(host)?;
@@ -163,9 +188,8 @@ pub fn install_daemon(host: &str) -> Result<String, String> {
         .spawn()
         .map_err(|error| format!("运行 curl 失败：{error}"))?;
     let body = curl.stdout.take().expect("curl stdout piped");
-    let script = r#"sh -c 'set -e; d="$HOME/.local/bin"; t="$d/.agentdeckd.tmp"; trap "rm -f \"$t\"" EXIT; mkdir -p "$d"; tar -xzO agentdeckd > "$t"; chmod 755 "$t"; "$t" --version >/dev/null; mv -f "$t" "$d/agentdeckd"; "$d/agentdeckd" --version'"#;
     let installed = ssh(host)
-        .arg(script)
+        .arg(install_script())
         .stdin(body)
         .output()
         .map_err(|error| format!("运行 ssh 失败：{error}"))?;
@@ -264,6 +288,59 @@ mod tests {
             release_target("Linux aarch64"),
             Ok("aarch64-unknown-linux-musl")
         );
-        assert!(release_target("Darwin arm64").is_err());
+        assert_eq!(release_target("Darwin arm64"), Ok("aarch64-apple-darwin"));
+        assert_eq!(release_target("Darwin aarch64"), Ok("aarch64-apple-darwin"));
+        assert_eq!(release_target("Darwin x86_64"), Ok("x86_64-apple-darwin"));
+        for unsupported in ["Windows x86_64", "Linux riscv64", "Darwin i386", "Linux"] {
+            assert!(release_target(unsupported).is_err());
+        }
+    }
+
+    #[test]
+    fn installer_rejects_wrong_version_before_replacing_existing_daemon() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!("agentdeck-install-{}", std::process::id()));
+        let source = dir.join("source");
+        let bin = dir.join(".local/bin");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("agentdeckd"), "old daemon").unwrap();
+        for (version, success) in [("0.0.0-wrong", false), (DAEMON_VERSION, true)] {
+            let script = format!(
+                "#!/bin/sh\nprintf \"agentdeckd {version}\\nprotocolVersion {}\\n\"\n",
+                agentdeck_protocol::PROTOCOL_VERSION
+            );
+            std::fs::write(source.join("agentdeckd"), &script).unwrap();
+            let archive = Command::new("tar")
+                .args(["-czf", "-", "-C"])
+                .arg(&source)
+                .arg("agentdeckd")
+                .output()
+                .unwrap();
+            assert!(archive.status.success());
+            let mut installer = Command::new("sh")
+                .args(["-c", &install_script()])
+                .env("HOME", &dir)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            installer
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(&archive.stdout)
+                .unwrap();
+            let result = installer.wait_with_output().unwrap();
+            assert_eq!(result.status.success(), success, "{result:?}");
+            assert_eq!(
+                std::fs::read_to_string(bin.join("agentdeckd")).unwrap(),
+                if success { &script } else { "old daemon" }
+            );
+            assert_eq!(std::fs::read_dir(&bin).unwrap().count(), 1);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

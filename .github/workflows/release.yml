@@ -1,27 +1,51 @@
-name: Release agentdeckd
+name: Release packages
 
-# 推送 v* tag 时构建 Linux 静态 agentdeckd 并附到同名 GitHub Release；
-# 桌面端机器页的「安装 agentdeckd」按与自身同版本的 tag 下载这些资产。
+# PR 和手动运行只产出 Actions artifacts；仅 v* tag 可进入统一发布门禁。
 on:
+  pull_request:
+  workflow_dispatch:
   push:
     tags:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  offline:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/offline-ci.yml
+
   build:
-    name: ${{ matrix.target }}
+    name: package (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 90
     strategy:
+      fail-fast: false
       matrix:
         include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            kind: desktop
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            kind: desktop
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            kind: desktop
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-24.04
+            kind: daemon
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
+            kind: daemon
+    env:
+      CARGO_BUILD_JOBS: 2
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
 
     steps:
       - name: Check out repository
@@ -32,19 +56,149 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build agentdeckd
-        run: cargo build --release --locked -p agentdeckd --target ${{ matrix.target }}
-
-      - name: Package
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux' && matrix.kind == 'desktop'
         run: |
-          tar -czf agentdeckd-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release agentdeckd
-          ./target/${{ matrix.target }}/release/agentdeckd --version
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake pkg-config libfontconfig1-dev libfreetype6-dev \
+            libx11-xcb-dev libxcb1-dev libxkbcommon-x11-dev libwayland-dev \
+            libssl-dev libasound2-dev libvulkan1 mesa-vulkan-drivers \
+            xvfb xauth dbus-x11 fonts-dejavu-core
 
-      - name: Upload to release
+      - name: Install musl toolchain
+        if: matrix.kind == 'daemon'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Verify workspace and release tag versions
+        env:
+          RELEASE_REF: ${{ github.ref_name }}
+          IS_TAG: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          if [[ "$IS_TAG" == true ]]; then
+            scripts/release/check-version.sh "$RELEASE_REF"
+          else
+            scripts/release/check-version.sh
+          fi
+
+      - name: Test release packaging scripts
+        run: |
+          for script in scripts/release/*.sh; do bash -n "$script"; done
+          scripts/release/test.sh
+          scripts/release/test-verify-set.sh
+
+      - name: Build release archives
+        run: scripts/release/package.sh '${{ matrix.target }}' '${{ matrix.kind }}' dist/release
+
+      - name: Run target unit tests without vendor sessions
+        env:
+          TARGET: ${{ matrix.target }}
+          PACKAGE_KIND: ${{ matrix.kind }}
+        run: |
+          test_root="$(mktemp -d)"
+          trap 'rm -rf "$test_root"' EXIT
+          mkdir -p "$test_root/home" "$test_root/bin"
+          for vendor in codex claude; do
+            printf '#!/bin/sh\necho vendor-executed >> "%s"\nexit 97\n' "$test_root/marker" > "$test_root/bin/$vendor"
+            chmod +x "$test_root/bin/$vendor"
+          done
+          package=agentdeckd
+          test_targets=(--lib --bins)
+          if [[ "$PACKAGE_KIND" == desktop ]]; then
+            package=agentdeck-desktop
+            test_targets=(--bins)
+          fi
+          env HOME="$test_root/home" CARGO_HOME="$HOME/.cargo" RUSTUP_HOME="$HOME/.rustup" \
+            PATH="$test_root/bin:$PATH" AGENTDECK_E2E=0 AGENTDECK_CODEX_BIN="$test_root/bin/codex" \
+            cargo test --release --locked --target "$TARGET" --target-dir target/release-build \
+            -p "$package" "${test_targets[@]}"
+          test ! -e "$test_root/marker"
+
+      - name: Smoke test Linux desktop archive under X11
+        if: runner.os == 'Linux' && matrix.kind == 'desktop'
+        run: |
+          lavapipe=(/usr/share/vulkan/icd.d/lvp_icd*.json)
+          test -f "${lavapipe[0]}"
+          xvfb-run -a env -u WAYLAND_DISPLAY VK_DRIVER_FILES="${lavapipe[0]}" \
+            dbus-run-session -- scripts/release/smoke.sh '${{ matrix.target }}' desktop dist/release
+
+      - name: Smoke test packaged binaries
+        if: runner.os != 'Linux' || matrix.kind != 'desktop'
+        run: scripts/release/smoke.sh '${{ matrix.target }}' '${{ matrix.kind }}' dist/release
+
+      - name: Upload verified target archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.target }}
+          path: dist/release/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  collect:
+    name: Complete release asset set
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          merge-multiple: true
+          path: dist/release
+      - name: Verify all targets and generate checksums
+        run: scripts/release/verify-set.sh dist/release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  publish:
+    name: Publish complete release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [build, collect, offline]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist/release
+      - name: Recheck tag and complete asset set
+        run: |
+          scripts/release/check-version.sh "$GITHUB_REF_NAME"
+          scripts/release/verify-set.sh dist/release --check
+      - name: Stage all assets, verify downloads, then publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
-            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "agentdeckd $GITHUB_REF_NAME" \
-            || true
-          gh release upload "$GITHUB_REF_NAME" agentdeckd-${{ matrix.target }}.tar.gz --clobber
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" --json isDraft,targetCommitish > "$RUNNER_TEMP/release.json" 2>/dev/null; then
+            jq -e --arg commit "$GITHUB_SHA" '.isDraft and .targetCommitish == $commit' "$RUNNER_TEMP/release.json"
+          else
+            cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
+          macOS 15+ Apple Silicon / Intel 桌面包与独立 daemon；Ubuntu 24.04 x86_64 桌面包与独立 daemon；Linux x86_64 / ARM64 musl daemon。
+
+          macOS 产物使用 ad-hoc 签名，未经 Apple 公证；不能视为 Developer ID 公证发行版。Linux ARM64 桌面与 Windows 不在本期支持范围。
+
+          安装方法和系统依赖见本 tag 的 docs/RELEASE.md；下载后请使用 SHA256SUMS 校验。
+          NOTES
+            gh release create "$tag" --verify-tag --target "$GITHUB_SHA" --draft \
+              --title "$tag" --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi
+          gh release upload "$tag" dist/release/* --clobber
+          downloaded="$RUNNER_TEMP/release-download"
+          mkdir -p "$downloaded"
+          gh release download "$tag" --dir "$downloaded"
+          scripts/release/verify-set.sh "$downloaded" --check
+          cmp dist/release/SHA256SUMS "$downloaded/SHA256SUMS"
+          gh release edit "$tag" --draft=false
