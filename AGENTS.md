@@ -29,7 +29,7 @@
 
 ## 工作规则
 
-macOS/Linux/Windows 打包和证据边界以 `docs/RELEASE.md` 为准。Windows SSH 目标不在当前范围。
+macOS/Linux/Windows 打包和证据边界以 `docs/RELEASE.md` 为准；发版操作按 `.agents/skills/agentdeck-release/SKILL.md` 执行。Windows SSH 目标不在当前范围。
 
 - 永远使用中文回答用户；项目文档默认使用中文。
 - Python 使用 `uv`；JS/TS 使用 `bun`。

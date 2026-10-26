@@ -276,6 +276,10 @@ tag 发布还需既有 Offline CI 通过。只有所有构建、烟测和集合�
 job 才有写权限：先建立 draft Release，上传完整集合，下载回验后再公开。公开的 Release
 不覆写；中途失败保留 draft，避免出现半套公开资产。PR 和手动运行没有发布权限入口。
 
+发版的操作步骤（前置检查、升版、推 tag、监控、失败重打、验收与变更说明）只写在仓库自有
+skill `.agents/skills/agentdeck-release/SKILL.md`，Claude Code 经 `.claude/skills/` 下的
+符号链接读取同一份。
+
 验收记录应分别列出静态检查、实际 release 构建、归档启动烟测和人工图形验收。
 CI selfcheck 成功只证明对应 runner 上的初始化和本地 plumbing，不证明真实模型交互、
 所有发行版/GPU 兼容性、Windows 10/11 人工 GUI、真实 SSH、macOS 公证、Windows

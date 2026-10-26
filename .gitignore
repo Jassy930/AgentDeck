@@ -29,8 +29,15 @@ target/
 .worktrees/
 
 # Agent 工具本地产物（各家 CLI 的会话/技能缓存，不入库）
-.agents/
-.claude/
+# 例外：仓库自有 skill 入库，正本在 .agents/skills/，.claude/skills/ 下是符号链接。
+.agents/*
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/agentdeck-release/
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/agentdeck-release
 .codex/
 skills-lock.json
 
