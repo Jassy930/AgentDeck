@@ -39,6 +39,7 @@ use std::process::{ExitStatus, Stdio};
 use std::time::SystemTime;
 
 use super::is_collaboration_tool_name;
+use super::translate::server_tool_result;
 use crate::process::Child;
 use agentdeck_protocol::{
     AgentItem, AgentItemMeta, AgentKind, CONTEXT_KIND_KEY, DiffFile, DiffStatus, HistoryListItem,
@@ -757,7 +758,7 @@ pub fn parse_session_jsonl(
                                 }
                             }
                         }
-                        "tool_use" => {
+                        "tool_use" | "server_tool_use" => {
                             if let (Some(id), Some(name)) = (
                                 block.get("id").and_then(Value::as_str),
                                 block.get("name").and_then(Value::as_str),
@@ -765,6 +766,18 @@ pub fn parse_session_jsonl(
                                 let input = block.get("input").cloned().unwrap_or(Value::Null);
                                 in_flight.insert(id.to_string(), (name.to_string(), input.clone()));
                                 current.push(tool_use_to_agent_item(id, name, &input));
+                            }
+                        }
+                        kind if kind.ends_with("_tool_result") => {
+                            let id = block
+                                .get("tool_use_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            if let Some((name, input)) = in_flight.remove(id) {
+                                let (is_error, text) = server_tool_result(block);
+                                current.push(tool_result_to_agent_item(
+                                    id, &name, &input, is_error, &text,
+                                ));
                             }
                         }
                         _ => {}
@@ -1425,6 +1438,29 @@ mod tests {
                 assert_eq!(meta.vendor_extensions["toolUseId"], "t1");
             }
             other => panic!("expected Shell tool_result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_session_jsonl_pairs_server_tool_use_with_its_result() {
+        let content = r#"
+{"type":"user","message":{"role":"user","content":"ask"}}
+{"type":"assistant","message":{"id":"m1","role":"assistant","content":[{"type":"server_tool_use","id":"srvtoolu_1","name":"advisor","input":{}}]}}
+{"type":"assistant","message":{"id":"m1","role":"assistant","content":[{"type":"advisor_tool_result","tool_use_id":"srvtoolu_1","content":{"type":"advisor_tool_result_error","error_code":"unavailable"}}]}}
+"#;
+        let resp = parse_session_jsonl(content, ThreadId("x".into())).unwrap();
+        let items = &resp.turns[0].items;
+        assert_eq!(items.len(), 3);
+        match &items[2] {
+            AgentItem::ToolCall {
+                name, result, meta, ..
+            } => {
+                assert_eq!(name, "advisor");
+                assert_eq!(result, &Some(serde_json::json!("unavailable")));
+                assert_eq!(meta.vendor_extensions["toolUseId"], "srvtoolu_1");
+                assert_eq!(meta.vendor_extensions["status"], "failed");
+            }
+            other => panic!("expected failed advisor ToolCall, got {other:?}"),
         }
     }
 

@@ -19,7 +19,9 @@
 //!   - `"assistant"` — final snapshot of an assistant message; its
 //!     `message.content` array is walked into AgentItem variants
 //!     (text → AssistantMessage, thinking → Reasoning, tool_use → Shell /
-//!     Diff / ToolCall depending on tool name).
+//!     Diff / ToolCall depending on tool name). Server tools arrive here
+//!     too: `server_tool_use` opens a card like tool_use and the matching
+//!     `*_tool_result` (e.g. `advisor_tool_result`) closes it.
 //!   - `"user"` — final snapshot of a user message; in a CC `--print`
 //!     stream this is how tool_result blocks come back from the model
 //!     (CC echoes the tool_result content the user side "sent"). We
@@ -439,10 +441,18 @@ impl ClaudeCodeTranslator {
                     };
                     events.push(self.item_event(item, item_id, AgentItemState::Completed));
                 }
-                "tool_use" => {
+                // Server tools (advisor, web_search, …) share tool_use's shape.
+                "tool_use" | "server_tool_use" => {
                     if let Some(ev) = self.handle_assistant_tool_use(block) {
                         events.push(ev);
                     }
+                }
+                kind if kind.ends_with("_tool_result") => {
+                    let Some(tool_use_id) = block.get("tool_use_id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let (is_error, result_text) = server_tool_result(block);
+                    events.push(self.complete_tool(tool_use_id, block, is_error, &result_text));
                 }
                 "image" => {
                     let path = block
@@ -597,79 +607,87 @@ impl ClaudeCodeTranslator {
             let Some(tool_use_id) = block.get("tool_use_id").and_then(Value::as_str) else {
                 continue;
             };
-            let Some(record) = self.in_flight_tools.remove(tool_use_id) else {
-                // Tool_result without a matching tool_use — surface raw
-                // so the trail isn't silently lost.
-                let raw_payload = serde_json::to_string(block).unwrap_or_default();
-                events.push(self.agent_item_event(AgentItem::Raw {
-                    raw_kind: "user.tool_result_orphan".into(),
-                    raw_payload,
-                    meta: AgentItemMeta::default(),
-                }));
-                continue;
-            };
             let is_error = block
                 .get("is_error")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let duration_ms = now_ms().saturating_sub(record.started_at_ms);
             let result_text = extract_tool_result_text(block);
-
-            let event = match record.name.as_str() {
-                "Bash" => {
-                    let command = record
-                        .input
-                        .get("command")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let status = if is_error {
-                        ShellStatus::Failed
-                    } else {
-                        ShellStatus::Completed
-                    };
-                    let exit_code = if is_error { Some(1) } else { Some(0) };
-                    self.agent_item_event(AgentItem::Shell {
-                        command,
-                        status,
-                        exit_code,
-                        duration_ms: Some(duration_ms),
-                        meta: tool_meta(tool_use_id, &record.name),
-                    })
-                }
-                "Edit" | "Write" | "MultiEdit" => {
-                    // Diff already emitted on tool_use; emit a finalized
-                    // snapshot so the UI can flip "pending" → "applied".
-                    let files = diff_files_from_tool_use(&record.name, &record.input);
-                    self.agent_item_event(AgentItem::Diff {
-                        files,
-                        meta: tool_meta(tool_use_id, &record.name),
-                    })
-                }
-                _ => {
-                    let mut meta = tool_meta(tool_use_id, &record.name);
-                    meta.vendor_extensions.insert(
-                        "status".into(),
-                        json!(if is_error { "failed" } else { "completed" }),
-                    );
-                    meta.vendor_extensions
-                        .insert("durationMs".into(), json!(duration_ms));
-                    if is_error {
-                        meta.vendor_extensions.insert("isError".into(), json!(true));
-                    }
-                    self.agent_item_event(AgentItem::ToolCall {
-                        name: record.name.clone(),
-                        args: record.input.clone(),
-                        result: Some(json!(result_text)),
-                        meta,
-                    })
-                }
-            };
-            events.push(event);
+            events.push(self.complete_tool(tool_use_id, block, is_error, &result_text));
         }
         TranslateOutput {
             events,
             permission_route_hint: None,
+        }
+    }
+
+    /// Close the in-flight tool card that `tool_use_id` names; a result
+    /// with no matching call surfaces raw so the trail isn't lost.
+    fn complete_tool(
+        &mut self,
+        tool_use_id: &str,
+        block: &Value,
+        is_error: bool,
+        result_text: &str,
+    ) -> ServerEvent {
+        let Some(record) = self.in_flight_tools.remove(tool_use_id) else {
+            let raw_payload = serde_json::to_string(block).unwrap_or_default();
+            return self.agent_item_event(AgentItem::Raw {
+                raw_kind: "user.tool_result_orphan".into(),
+                raw_payload,
+                meta: AgentItemMeta::default(),
+            });
+        };
+        let duration_ms = now_ms().saturating_sub(record.started_at_ms);
+
+        match record.name.as_str() {
+            "Bash" => {
+                let command = record
+                    .input
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let status = if is_error {
+                    ShellStatus::Failed
+                } else {
+                    ShellStatus::Completed
+                };
+                let exit_code = if is_error { Some(1) } else { Some(0) };
+                self.agent_item_event(AgentItem::Shell {
+                    command,
+                    status,
+                    exit_code,
+                    duration_ms: Some(duration_ms),
+                    meta: tool_meta(tool_use_id, &record.name),
+                })
+            }
+            "Edit" | "Write" | "MultiEdit" => {
+                // Diff already emitted on tool_use; emit a finalized
+                // snapshot so the UI can flip "pending" → "applied".
+                let files = diff_files_from_tool_use(&record.name, &record.input);
+                self.agent_item_event(AgentItem::Diff {
+                    files,
+                    meta: tool_meta(tool_use_id, &record.name),
+                })
+            }
+            _ => {
+                let mut meta = tool_meta(tool_use_id, &record.name);
+                meta.vendor_extensions.insert(
+                    "status".into(),
+                    json!(if is_error { "failed" } else { "completed" }),
+                );
+                meta.vendor_extensions
+                    .insert("durationMs".into(), json!(duration_ms));
+                if is_error {
+                    meta.vendor_extensions.insert("isError".into(), json!(true));
+                }
+                self.agent_item_event(AgentItem::ToolCall {
+                    name: record.name.clone(),
+                    args: record.input.clone(),
+                    result: Some(json!(result_text)),
+                    meta,
+                })
+            }
         }
     }
 
@@ -1066,6 +1084,38 @@ fn synth_patch(old: &str, new: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+/// `(is_error, text)` of a server tool result (`advisor_tool_result`,
+/// `web_search_tool_result`, …). Errors carry a `*_error` content object;
+/// redacted results (advisor) have nothing readable and yield "".
+pub(super) fn server_tool_result(block: &Value) -> (bool, String) {
+    let content = block.get("content");
+    if let Some(obj) = content.filter(|c| c.is_object()) {
+        let kind = obj.get("type").and_then(Value::as_str).unwrap_or("");
+        let text = obj
+            .get("error_code")
+            .or_else(|| obj.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        return (kind.ends_with("_error"), text.to_string());
+    }
+    // Search results list `{title, url}`; everything else reads like tool_result.
+    let links: Vec<String> = content
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|el| {
+            let url = el.get("url").and_then(Value::as_str)?;
+            let title = el.get("title").and_then(Value::as_str).unwrap_or(url);
+            Some(format!("{title} {url}"))
+        })
+        .collect();
+    if links.is_empty() {
+        (false, extract_tool_result_text(block))
+    } else {
+        (false, links.join("\n"))
+    }
 }
 
 /// CC tool_result `content` is either a string OR an array of

@@ -509,6 +509,111 @@ fn unknown_tool_result_preserves_failure_status_and_duration() {
     }
 }
 
+fn assistant_blocks(blocks: serde_json::Value) -> String {
+    json!({
+        "type": "assistant",
+        "session_id": "thread_1",
+        "message": { "id": "msg_1", "content": blocks }
+    })
+    .to_string()
+}
+
+fn only_tool_call(
+    out: &agentdeckd::claude_code::translate::TranslateOutput,
+) -> (&str, Option<&serde_json::Value>, &AgentItemMeta) {
+    assert_eq!(out.events.len(), 1);
+    match &out.events[0] {
+        ServerEvent::AgentItem {
+            item: AgentItem::ToolCall {
+                name, result, meta, ..
+            },
+            ..
+        } => (name.as_str(), result.as_ref(), meta),
+        other => panic!("expected ToolCall, got {other:?}"),
+    }
+}
+
+#[test]
+fn server_tool_use_and_redacted_advisor_result_pair_into_one_tool_card() {
+    let mut t = tr();
+    // Shapes copied from a real CC 2.1 transcript: call and result arrive
+    // as separate assistant lines of the same message.
+    let out = t.translate_line(&assistant_blocks(json!([{
+        "type": "server_tool_use", "id": "srvtoolu_1", "name": "advisor", "input": {}
+    }])));
+    let (name, result, meta) = only_tool_call(&out);
+    assert_eq!(name, "advisor");
+    assert!(result.is_none());
+    assert_eq!(meta.vendor_extensions["toolUseId"], json!("srvtoolu_1"));
+    assert_eq!(meta.vendor_extensions["status"], json!("inProgress"));
+
+    let out = t.translate_line(&assistant_blocks(json!([{
+        "type": "advisor_tool_result",
+        "tool_use_id": "srvtoolu_1",
+        "content": { "type": "advisor_redacted_result", "encrypted_content": "EtcT..." }
+    }])));
+    let (name, result, meta) = only_tool_call(&out);
+    assert_eq!(name, "advisor");
+    assert_eq!(result, Some(&json!("")));
+    assert_eq!(meta.vendor_extensions["toolUseId"], json!("srvtoolu_1"));
+    assert_eq!(meta.vendor_extensions["status"], json!("completed"));
+}
+
+#[test]
+fn server_tool_errors_fail_the_card_and_orphans_stay_visible() {
+    let mut t = tr();
+    t.translate_line(&assistant_blocks(json!([{
+        "type": "server_tool_use", "id": "srvtoolu_2", "name": "advisor", "input": {}
+    }])));
+    let out = t.translate_line(&assistant_blocks(json!([{
+        "type": "advisor_tool_result",
+        "tool_use_id": "srvtoolu_2",
+        "content": { "type": "advisor_tool_result_error", "error_code": "unavailable" }
+    }])));
+    let (_, result, meta) = only_tool_call(&out);
+    assert_eq!(result, Some(&json!("unavailable")));
+    assert_eq!(meta.vendor_extensions["status"], json!("failed"));
+    assert_eq!(meta.vendor_extensions["isError"], json!(true));
+
+    let out = t.translate_line(&assistant_blocks(json!([{
+        "type": "web_search_tool_result",
+        "tool_use_id": "srvtoolu_missing",
+        "content": []
+    }])));
+    assert_eq!(out.events.len(), 1);
+    match &out.events[0] {
+        ServerEvent::AgentItem {
+            item: AgentItem::Raw { raw_kind, .. },
+            ..
+        } => assert_eq!(raw_kind, "user.tool_result_orphan"),
+        other => panic!("expected orphan Raw, got {other:?}"),
+    }
+}
+
+#[test]
+fn web_search_results_list_titles_and_urls() {
+    let mut t = tr();
+    t.translate_line(&assistant_blocks(json!([{
+        "type": "server_tool_use", "id": "srvtoolu_3", "name": "web_search", "input": { "query": "gpui" }
+    }])));
+    let out = t.translate_line(&assistant_blocks(json!([{
+        "type": "web_search_tool_result",
+        "tool_use_id": "srvtoolu_3",
+        "content": [
+            { "type": "web_search_result", "title": "GPUI", "url": "https://gpui.rs", "encrypted_content": "x" },
+            { "type": "web_search_result", "url": "https://zed.dev" }
+        ]
+    }])));
+    let (_, result, meta) = only_tool_call(&out);
+    assert_eq!(
+        result,
+        Some(&json!(
+            "GPUI https://gpui.rs\nhttps://zed.dev https://zed.dev"
+        ))
+    );
+    assert_eq!(meta.vendor_extensions["status"], json!("completed"));
+}
+
 #[test]
 fn result_message_becomes_turn_finished_with_usage() {
     let mut t = tr();
