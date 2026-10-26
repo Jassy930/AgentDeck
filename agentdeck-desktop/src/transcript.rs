@@ -30,7 +30,8 @@ use gpui_component::{
     v_flex,
 };
 
-/// 单条内容的展示上限；历史里的工具结果可能是几十 KB 的整页文本。
+/// 过程块正文的展示上限；历史里的工具结果可能是几十 KB 的整页文本。
+/// 对话消息不受限，用户需要看到全文。
 const BODY_LIMIT: usize = 2_000;
 /// 折叠摘要的字符上限。
 const SUMMARY_LIMIT: usize = 120;
@@ -63,11 +64,11 @@ pub struct Block {
 
 impl Block {
     fn message(label: &'static str, body: &str, markdown: bool) -> Self {
-        let body = truncate(body.trim());
+        let body = body.trim();
         let body = if markdown {
-            markdown_fallback::images_as_links(&body)
+            markdown_fallback::images_as_links(body)
         } else {
-            body
+            body.to_string()
         };
         Self {
             label,
@@ -1025,7 +1026,7 @@ mod tests {
                     "暂不支持的内容",
                     "类型：futureItem\n当前 AgentDeck 无法展示此内容，请检查更新".to_string()
                 ),
-                ("你", format!("{}…（已截断）", "字".repeat(BODY_LIMIT))),
+                ("你", "字".repeat(BODY_LIMIT + 1)),
             ]
         );
         assert!(blocks.iter().all(|b| b.summary.is_none()));
