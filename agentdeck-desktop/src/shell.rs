@@ -100,8 +100,9 @@ pub enum Stage {
 /// 虚拟列表在可见区上下额外排版的高度，避免快速滚动时出现空白。
 const TRANSCRIPT_OVERDRAW: f32 = 1000.;
 
+/// 读完历史后的首帧量出全部行高，滚动条才按整段会话算长度；之后增量 splice 不再全量测。
 fn transcript_list() -> ListState {
-    ListState::new(0, ListAlignment::Top, px(TRANSCRIPT_OVERDRAW))
+    ListState::new(0, ListAlignment::Top, px(TRANSCRIPT_OVERDRAW)).measure_all()
 }
 
 /// 选中会话的记录加载状态。

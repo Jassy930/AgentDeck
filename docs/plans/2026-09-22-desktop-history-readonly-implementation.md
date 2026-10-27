@@ -562,6 +562,17 @@ macOS 进程组存在性查询在组仅剩僵尸进程时可能返回 `EPERM`；
   搜索后正文保留、机器页切换至远端小会话及重新打开长会话时默认折叠。
   未运行真实 vendor E2E，也未量化帧耗时。
 
+## 2026-10-27：滚动条修正、轮次 rail 与回到最新
+
+- 根因：`ListState` 只按已测量条目计算总高，而每次块变化（含流式 delta）都整表 `reset`，
+  已测行高全部清零，总高约等于视口加 overdraw，滑块几乎占满或被隐藏。
+- 列表改用 `measure_all()`：读完历史的首帧量出全部行高；`VisibleRows::sync` 返回首个变动块之后的
+  行区间，交给 `ListState::splice` 只重排尾部，前面的行高与滚动锚点保留。
+- 参照 AppKit 版 turn rail（`2026-05-20-conversation-turn-rail-design.md`）做了精简版：右侧每条用户消息一个点，
+  当前轮高亮、tooltip 摘要、点击跳转；不在底部时右下角显示“回到最新”按钮。
+  未做 Dock 式放大和 rail 上滚轮按轮跳转；几百轮时点会压缩到 2px。
+- desktop 测试、selfcheck、真实 bundle verify 通过；真实窗口目视与超长会话首帧耗时待验证。
+
 ## 2026-09-29：同 ID 会话的侧栏交互隔离
 
 - 侧栏按钮 ID 使用机器、agentKind 与 threadId，两个 agent 的同 ID 会话独立响应点击。

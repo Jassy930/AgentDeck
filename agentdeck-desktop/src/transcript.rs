@@ -5,6 +5,7 @@
 //! 助手、思考与过程块正文按 Markdown 渲染（代码走围栏高亮）；用户消息仍是纯文本。
 
 use std::collections::HashSet;
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -506,11 +507,20 @@ impl VisibleRows {
     }
 
     /// 块内容变了（live 追加或流式快照）：保留已展开的组重算可见行。
-    /// 返回 true 表示调用方要重置列表。
-    fn sync(&mut self, blocks: &Rc<[Block]>) -> bool {
+    /// 返回要交给 `ListState::splice` 的旧行区间和新行数；`None` 表示没变。
+    /// 只重排从第一个不同块开始的尾部：前面的行高保留，滚动条总高才不会每次归零。
+    fn sync(&mut self, blocks: &Rc<[Block]>) -> Option<(Range<usize>, usize)> {
         if Rc::ptr_eq(&self.source, blocks) {
-            return false;
+            return None;
         }
+        let same = self
+            .source
+            .iter()
+            .zip(blocks.iter())
+            .take_while(|(old, new)| old == new)
+            .count();
+        let row = self.indices.partition_point(|&ix| ix < same);
+        let old_rows = self.indices.len();
         self.source = blocks.clone();
         self.indices = blocks
             .iter()
@@ -522,7 +532,7 @@ impl VisibleRows {
                     .then_some(ix)
             })
             .collect();
-        true
+        Some((row..old_rows, self.indices.len() - row))
     }
 
     fn toggle_group(&mut self, row: usize, start: usize, len: usize, list: &ListState) {
@@ -539,9 +549,20 @@ impl VisibleRows {
     }
 }
 
-/// 块所在的可见行：块本身可见就是它那行，被折叠时落到包含它的组首行。
-fn row_for_block(indices: &[usize], block: usize) -> usize {
-    indices.partition_point(|&ix| ix <= block).saturating_sub(1)
+/// 停在底部才跟随新内容；往上翻看时保持原位置。
+/// max_offset_for_scrollbar 不含列表上下内边距，真实滚动上限要再加回来；
+/// 它为 0 时内容不足一屏（最多能滚动内边距那点距离），视为在底部。
+fn at_bottom(state: &ListState) -> bool {
+    let max = state.max_offset_for_scrollbar().height;
+    max == px(0.)
+        || -state.scroll_px_offset_for_scrollbar().y >= max + px(EDGE_FADE_HEIGHT * 2.) - px(1.)
+}
+
+fn scroll_to_end(state: &ListState) {
+    state.scroll_to(ListOffset {
+        item_ix: state.item_count(),
+        offset_in_item: px(0.),
+    });
 }
 
 /// 组摘要：步数加按首次出现顺序的各类计数，如“5 步 · 命令 3 · 思考 2”；另返回失败数。
@@ -675,42 +696,38 @@ pub fn render(
         |_, _| VisibleRows::new(&blocks),
     );
     visible.update(cx, |rows, _| {
-        // 行号会随折叠重算而变，滚动锚点按原始块下标记，sync 后再换回行号。
-        let mut anchor = state.logical_scroll_top();
-        let anchor_block = rows.indices.get(anchor.item_ix).copied();
-        // 读完历史时列表按历史块数重置过，这时可能已拼上了运行中的 live 轮次。
-        if rows.sync(&blocks) || state.item_count() != rows.indices.len() {
-            // 原本停在底部才跟随新内容；往上翻看时保持原位置。按旧行高判断，须在 reset 之前。
-            // max_offset_for_scrollbar 不含列表上下内边距，真实滚动上限要再加回来；
-            // 它为 0 时内容不足一屏（最多能滚动内边距那点距离），视为在底部。
-            let max = state.max_offset_for_scrollbar().height;
-            let at_bottom = max == px(0.)
-                || -state.scroll_px_offset_for_scrollbar().y
-                    >= max + px(EDGE_FADE_HEIGHT * 2.) - px(1.);
-            if let Some(block) = anchor_block {
-                let row = row_for_block(&rows.indices, block);
-                if rows.indices.get(row) != Some(&block) {
-                    // 锚点块被并进了组，停在组首行顶部。
-                    anchor.offset_in_item = px(0.);
-                }
-                anchor.item_ix = row;
-            }
-            let count = rows.indices.len();
-            // reset 会清空行高和滚动位置；定位到末尾后，布局会从底部往上填满视口。
-            state.reset(count);
-            state.scroll_to(if at_bottom {
-                ListOffset {
-                    item_ix: count,
-                    offset_in_item: px(0.),
-                }
-            } else {
-                anchor
-            });
+        let splice = rows.sync(&blocks);
+        if splice.is_none() && state.item_count() == rows.indices.len() {
+            return;
+        }
+        // 按旧行高判断是否跟随，须在 splice/reset 之前。
+        let follow = at_bottom(&state);
+        match splice {
+            // splice 保住前面行的已测高度，锚点在重排区之前时原地不动。
+            Some((range, count)) if range.end == state.item_count() => state.splice(range, count),
+            // 读完历史时列表按历史块数重置过，这时可能已拼上了运行中的 live 轮次。
+            _ => state.reset(rows.indices.len()),
+        }
+        if follow {
+            // 定位到末尾后，布局会从底部往上填满视口。
+            scroll_to_end(&state);
         }
     });
     let list_state = state.clone();
     // 常驻显示：长会话需要随时看到当前位置，不跟随系统的自动隐藏。
     let scrollbar = Scrollbar::vertical(&state).scrollbar_show(ScrollbarShow::Always);
+    let rail = turn_rail(&blocks, &visible.read(cx).indices, &state, cx);
+    let latest = (!at_bottom(&state)).then(|| {
+        let state = state.clone();
+        Button::new("transcript-latest")
+            .icon(Icon::empty().path(crate::CHEVRON_DOWN_ICON))
+            .rounded_full()
+            .tooltip("回到最新")
+            .on_click(move |_, window, _| {
+                scroll_to_end(&state);
+                window.refresh();
+            })
+    });
     let rows = list(state, move |row, window, cx| {
         let ix = visible.read(cx).indices[row];
         let block = &blocks[ix];
@@ -931,6 +948,73 @@ pub fn render(
         .child(edge_fade(false, cx))
         // Scrollbar 自身是绝对定位但不带 inset，直接放在列表后面会落到列表下方。
         .child(div().absolute().inset_0().child(scrollbar))
+        .children(rail)
+        .children(latest.map(|button| div().absolute().right(px(36.)).bottom_4().child(button)))
+}
+
+/// 右侧轮次导航：每条用户消息一个点，当前阅读的轮次高亮，hover 看摘要，点击跳过去。
+fn turn_rail(
+    blocks: &[Block],
+    indices: &[usize],
+    state: &ListState,
+    cx: &gpui::App,
+) -> Option<gpui::Div> {
+    let turns: Vec<(usize, &Block)> = indices
+        .iter()
+        .enumerate()
+        .filter(|(_, ix)| blocks[**ix].label == "你")
+        .map(|(row, ix)| (row, &blocks[*ix]))
+        .collect();
+    if turns.len() < 2 {
+        return None;
+    }
+    let top = state.logical_scroll_top().item_ix;
+    let current = turns
+        .partition_point(|(row, _)| *row <= top)
+        .saturating_sub(1);
+    let (muted, accent) = (cx.theme().muted_foreground, cx.theme().primary);
+    // ponytail: 点高度随轮数压缩到 2px，几百轮时点击区很小；真有这种会话再做可视窗口。
+    Some(
+        v_flex()
+            .absolute()
+            .right(px(16.))
+            .top(px(EDGE_FADE_HEIGHT))
+            .bottom(px(EDGE_FADE_HEIGHT))
+            .w(px(16.))
+            .justify_center()
+            .overflow_hidden()
+            .children(turns.into_iter().enumerate().map(|(n, (row, block))| {
+                let state = state.clone();
+                let tip: SharedString =
+                    format!("第 {} 轮 · {}", n + 1, one_line(&block.body)).into();
+                let active = n == current;
+                div()
+                    .id(ElementId::NamedInteger("transcript-turn".into(), n as u64))
+                    .h(px(14.))
+                    .min_h(px(2.))
+                    .flex_shrink()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .size(px(if active { 8. } else { 6. }))
+                            .rounded_full()
+                            .bg(if active { accent } else { muted.opacity(0.5) }),
+                    )
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                    })
+                    .on_click(move |_, window, _| {
+                        state.scroll_to(ListOffset {
+                            item_ix: row,
+                            offset_in_item: px(0.),
+                        });
+                        window.refresh();
+                    })
+            })),
+    )
 }
 
 fn edge_fade(top: bool, cx: &gpui::App) -> gpui::Div {
@@ -952,7 +1036,7 @@ fn edge_fade(top: bool, cx: &gpui::App) -> gpui::Div {
 mod tests {
     use super::{
         BODY_LIMIT, Block, CONTEXT_KIND_KEY, VisibleRows, append, collapsed_indices, copy_text,
-        describe, fence, is_binary, prepare, prepare_live, row_for_block, truncate,
+        describe, fence, is_binary, prepare, prepare_live, truncate,
     };
     use agentdeck_protocol::{
         AgentItem, AgentItemMeta, HistoryTurn, PlanStep, PlanStepStatus, ShellStatus,
@@ -1402,15 +1486,6 @@ mod tests {
     }
 
     #[test]
-    fn scroll_anchor_follows_block_across_regrouping() {
-        // 块 3 原本单独成行，重算后并进了从 2 开始的组。
-        assert_eq!(row_for_block(&[0, 1, 2, 3, 6], 3), 3);
-        assert_eq!(row_for_block(&[0, 1, 2, 6], 3), 2);
-        assert_eq!(row_for_block(&[0, 1, 2, 6], 6), 3);
-        assert_eq!(row_for_block(&[0, 4], 0), 0);
-    }
-
-    #[test]
     fn appended_live_blocks_shift_groups_and_keep_expanded_history_groups() {
         let process = || AgentItem::Reasoning {
             text: "步骤".into(),
@@ -1428,14 +1503,20 @@ mod tests {
         let mut rows = VisibleRows::new(&history);
         let list = ListState::new(rows.indices.len(), ListAlignment::Top, px(1000.));
         rows.toggle_group(1, 1, 2, &list);
-        assert!(!rows.sync(&history), "same blocks need no reset");
+        assert_eq!(rows.sync(&history), None, "same blocks need no reset");
 
         let live = prepare(vec![HistoryTurn {
             items: vec![message("新"), process(), process()],
         }]);
         let combined: Rc<[Block]> = append(&history, live).into();
         assert_eq!(combined[4].group, Some((4, 2)));
-        assert!(rows.sync(&combined));
+        // 历史 3 行原样保留，只追加 live 的 2 行。
+        assert_eq!(rows.sync(&combined), Some((3..3, 2)));
         assert_eq!(rows.indices, [0, 1, 2, 3, 4]);
+
+        // 流式更新只改了末尾的组（组首摘要随成员变化）：只重排最后一行。
+        let mut streamed = combined.to_vec();
+        streamed[4].summary = Some("更新".into());
+        assert_eq!(rows.sync(&streamed.into()), Some((4..5, 1)));
     }
 }
