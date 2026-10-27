@@ -250,7 +250,9 @@ desktop live 测试（开始前本地、开始后事件驱动）；经 daemon �
 
 - 入口：主页每张 agent 卡片右上角的“+”（卡片本身仍是筛选），daemon 协议不支持交互时禁用。
 - 复用会话页：`Stage::Session { draft: true }`，记录为空，thread id 是 `draft-<n>` 占位，不发 history read。
-  输入栏上方显示工作目录输入框，默认取该机器该 agent 最近一次会话的 cwd，本机无历史时取 `$HOME`，远端无历史时留空必填。
+  默认工作目录取该机器该 agent 最近一次会话的 cwd，本机无历史时取 `$HOME`，远端无历史时留空必填。
+  2026-10-26 改为输入栏内的项目按钮：只显示目录名，下拉为同机器最近项目（来自已加载的历史，去重、最多 8 个）+ 本机“浏览…”（GPUI `prompt_for_paths`，只选目录）+“输入路径…”；
+  远端目录浏览需要 daemon 列目录命令，未做。
 - 首发时 `LiveSession.draft` 带上侧栏条目，`SessionStart.resumeThreadId = None`；会话没起来时下次发送仍按新会话启动。
 - `SessionStarted.threadId` 到达后 `adopt_thread` 把 live key 换成真实 id，Shell 同步替换当前会话页、侧栏游标，并把条目插到侧栏顶部。
   刷新该来源时，`replace_source_sessions` 保留历史尚未返回但仍有 `session_id` 的活动侧栏会话，按完整 `SessionKey`（机器、agent、threadId）去重，历史返回的元数据优先。

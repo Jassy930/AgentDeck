@@ -5,6 +5,7 @@
 //! 事件流回到 `live` 状态，渲染在历史记录之后。
 
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -207,6 +208,59 @@ pub fn project_name(item: &HistoryListItem) -> String {
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| item.cwd.display().to_string())
+}
+
+/// 某台机器上出现过的工作目录，按最近活动倒序去重，最多 `limit` 个；不区分 agent。
+fn recent_projects(sessions: &[Session], host: &Host, limit: usize) -> Vec<PathBuf> {
+    let mut items: Vec<_> = sessions
+        .iter()
+        .filter(|session| session.host == *host && !session.item.cwd.as_os_str().is_empty())
+        .map(|session| (session.item.last_active_ms, &session.item.cwd))
+        .collect();
+    items.sort_by_key(|item| std::cmp::Reverse(item.0));
+    let mut projects: Vec<PathBuf> = Vec::new();
+    for (_, cwd) in items {
+        if !projects.contains(cwd) {
+            projects.push(cwd.clone());
+            if projects.len() == limit {
+                break;
+            }
+        }
+    }
+    projects
+}
+
+/// 目录名，用作项目按钮和菜单项的主文字。
+fn dir_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// 超长名字保留首尾、中间省略，免得项目按钮挤占输入框；结尾常是日期或版本，比开头更能区分。
+fn middle_ellipsis(name: &str, max: usize) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() <= max {
+        return name.to_string();
+    }
+    let tail = (max - 1) / 2;
+    let head = max - 1 - tail;
+    let mut short: String = chars[..head].iter().collect();
+    short.push('…');
+    short.extend(&chars[chars.len() - tail..]);
+    short
+}
+
+/// 上级目录的简短提示：用户目录缩写成 `~`，用来区分同名项目。
+fn parent_hint(path: &Path, home: Option<&Path>) -> String {
+    let Some(parent) = path.parent() else {
+        return String::new();
+    };
+    match home.and_then(|home| parent.strip_prefix(home).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => parent.display().to_string(),
+    }
 }
 
 /// agent 展示名：直接由中立 `AgentKind` 的 wire 名派生，不按 vendor 分支。
@@ -691,6 +745,8 @@ pub struct Shell {
     attach_error: Option<String>,
     /// 新建会话的工作目录。
     cwd_input: Entity<InputState>,
+    /// 新会话正在手填路径（选了“输入路径…”或没有可选的最近项目）。
+    cwd_manual: bool,
     /// 选了“跳过所有权限”，等待二次确认。
     bypass_armed: bool,
     /// 提问卡的键盘焦点；每次新提问自动聚焦一次，按键在卡片上处理。
@@ -785,6 +841,7 @@ impl Shell {
             attachments: Vec::new(),
             attach_error: None,
             cwd_input,
+            cwd_manual: false,
             bypass_armed: false,
             question_focus: cx.focus_handle(),
             question_scroll: ScrollHandle::new(),
@@ -1885,6 +1942,43 @@ impl Shell {
         .detach();
     }
 
+    /// 弹出系统目录选择器，选中后回填新会话的工作目录。
+    fn pick_cwd(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("选择".into()),
+        });
+        cx.spawn_in(window, async move |shell, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            shell
+                .update_in(cx, |shell, window, cx| shell.set_cwd(&path, window, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    fn set_cwd(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        self.cwd_manual = false;
+        self.cwd_input.update(cx, |input, cx| {
+            input.set_value(path.display().to_string(), window, cx)
+        });
+        cx.notify();
+    }
+
+    fn edit_cwd(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cwd_manual = true;
+        self.cwd_input
+            .update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
     /// 在某台机器的某个 agent 上新建会话；工作目录默认取它最近一次会话的。
     pub fn start_draft(
         &mut self,
@@ -1905,6 +1999,7 @@ impl Shell {
                     .map(|home| home.display().to_string())
             })
             .unwrap_or_default();
+        self.cwd_manual = cwd.is_empty();
         self.cwd_input
             .update(cx, |input, cx| input.set_value(cwd, window, cx));
         self.composer
@@ -2114,7 +2209,7 @@ impl Shell {
                 .into_any_element(),
             Transcript::Ready { blocks, .. } if blocks.is_empty() => placeholder(
                 if draft {
-                    "确认工作目录，发出第一条消息开始新会话"
+                    "选择项目，发出第一条消息开始新会话"
                 } else {
                     "这个会话没有可显示的记录"
                 },
@@ -2273,6 +2368,79 @@ impl Shell {
 
     /// 底部续聊区：待决审批、跳过权限确认、最近错误、权限模式、输入框和发送/停止按钮；
     /// 固定高度，不被记录挤压。
+    /// 新会话的项目按钮：只显示目录名，完整路径放悬停提示；下拉列出这台机器的最近项目。
+    fn render_project_picker(
+        &self,
+        session: &Session,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let cwd = PathBuf::from(self.cwd_input.read(cx).value().trim());
+        let empty = cwd.as_os_str().is_empty();
+        let local = session.host.is_none();
+        let home = local.then(crate::platform::home_dir).flatten();
+        let projects = recent_projects(&self.sessions, &session.host, 8);
+        let muted = cx.theme().muted_foreground;
+        let shell = cx.entity().downgrade();
+        Button::new("project-picker")
+            .small()
+            .ghost()
+            .icon(Icon::empty().xsmall().path(crate::FOLDER_ICON))
+            .label(if empty {
+                "选择项目".into()
+            } else {
+                middle_ellipsis(&dir_name(&cwd), 20)
+            })
+            .child(Icon::empty().xsmall().path(crate::CHEVRON_DOWN_ICON))
+            .when(!empty, |button| button.tooltip(cwd.display().to_string()))
+            .dropdown_menu_with_anchor(gpui::Corner::BottomLeft, move |menu, _, _| {
+                let mut menu = menu.min_w(px(240.)).max_w(px(360.));
+                if !projects.is_empty() {
+                    menu = menu.label("最近项目");
+                }
+                for path in &projects {
+                    let name = dir_name(path);
+                    let hint = parent_hint(path, home.as_deref());
+                    let shell = shell.clone();
+                    let target = path.clone();
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, _| {
+                            v_flex()
+                                .min_w_0()
+                                .child(div().truncate().child(name.clone()))
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(hint.clone()),
+                                )
+                        })
+                        .checked(*path == cwd)
+                        .on_click(move |_, window, cx| {
+                            let _ =
+                                shell.update(cx, |shell, cx| shell.set_cwd(&target, window, cx));
+                        }),
+                    );
+                }
+                if !projects.is_empty() {
+                    menu = menu.separator();
+                }
+                // 原生选择器只能浏览本机目录，远端机器只能手填。
+                if local {
+                    let shell = shell.clone();
+                    menu = menu.item(PopupMenuItem::new("浏览…").on_click(move |_, window, cx| {
+                        let _ = shell.update(cx, |shell, cx| shell.pick_cwd(window, cx));
+                    }));
+                }
+                let shell = shell.clone();
+                menu.item(
+                    PopupMenuItem::new("输入路径…").on_click(move |_, window, cx| {
+                        let _ = shell.update(cx, |shell, cx| shell.edit_cwd(window, cx));
+                    }),
+                )
+            })
+    }
+
     fn render_composer(
         &self,
         session: &Session,
@@ -2318,6 +2486,7 @@ impl Shell {
         let can_send =
             can_send && !(editing_cwd && self.cwd_input.read(cx).value().trim().is_empty());
         let can_cancel = compatible && live.is_some_and(|live| live.cancel().is_some());
+        let project_picker = editing_cwd.then(|| self.render_project_picker(session, cx));
         let retry_capabilities = initial_result
             .filter(|result| result.is_err())
             .and_then(|_| {
@@ -2386,7 +2555,7 @@ impl Shell {
                         })),
                 )
             })
-            .when(editing_cwd, |section| {
+            .when(editing_cwd && self.cwd_manual, |section| {
                 section.child(
                     h_flex()
                         .w_full()
@@ -2502,6 +2671,7 @@ impl Shell {
                     .border_1()
                     .border_color(border)
                     .bg(surface)
+                    .when_some(project_picker, |row, picker| row.child(picker))
                     .when(!modes.is_empty(), |row| {
                         row.child(
                             Button::new("permission-mode")
@@ -3411,9 +3581,11 @@ mod tests {
         Transcript, agent_label, day_group, empty_hint, local_time, project_name,
         scroll_sidebar_to, session_matches, session_title, sidebar_rows, transcript_list,
     };
+    use super::{middle_ellipsis, parent_hint, recent_projects};
     use crate::daemon;
     use agentdeck_protocol::{AgentKind, HistoryListItem, HistoryWarning, ThreadId};
     use gpui::{ScrollStrategy, UniformListScrollHandle};
+    use std::path::{Path, PathBuf};
 
     fn warning() -> HistoryWarning {
         HistoryWarning {
@@ -4072,6 +4244,53 @@ mod tests {
         assert_eq!(session_title(&item(None)), "7330efa6");
         assert_eq!(session_title(&item(Some("   "))), "7330efa6");
         assert_eq!(session_title(&item(Some("第一行\n第二行"))), "第一行");
+    }
+
+    #[test]
+    fn recent_projects_are_per_host_newest_first_and_deduped() {
+        let at = |cwd: &str, ms| HistoryListItem {
+            cwd: cwd.into(),
+            last_active_ms: ms,
+            ..item(None)
+        };
+        let sessions = [
+            local(at("/a", 1)),
+            local(at("/b", 3)),
+            local(at("/a", 2)),
+            local(at("", 9)),
+            remote(at("/r", 5)),
+        ];
+        let paths = |v: Vec<PathBuf>| {
+            v.into_iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(paths(recent_projects(&sessions, &None, 8)), ["/b", "/a"]);
+        assert_eq!(paths(recent_projects(&sessions, &None, 1)), ["/b"]);
+        assert_eq!(
+            paths(recent_projects(&sessions, &sessions[4].host, 8)),
+            ["/r"]
+        );
+    }
+
+    #[test]
+    fn middle_ellipsis_keeps_head_and_tail() {
+        assert_eq!(middle_ellipsis("AgentDeck", 20), "AgentDeck");
+        let short = middle_ellipsis("accounts-backup-20260713-152226", 20);
+        assert_eq!(short, "accounts-b…13-152226");
+        assert_eq!(short.chars().count(), 20);
+    }
+
+    #[test]
+    fn parent_hint_abbreviates_home() {
+        let home = Some(Path::new("/Users/dev"));
+        assert_eq!(
+            parent_hint(Path::new("/Users/dev/Documents/x"), home),
+            "~/Documents"
+        );
+        assert_eq!(parent_hint(Path::new("/Users/dev/x"), home), "~");
+        assert_eq!(parent_hint(Path::new("/srv/x"), home), "/srv");
+        assert_eq!(parent_hint(Path::new("/srv/x"), None), "/srv");
     }
 
     #[test]
