@@ -549,6 +549,15 @@ impl VisibleRows {
     }
 }
 
+/// 把锚点换到块现在所在的行：块本身可见就保留行内偏移，被并进组时停在组首行顶部。
+fn remap_anchor(mut anchor: ListOffset, block: usize, indices: &[usize]) -> ListOffset {
+    anchor.item_ix = indices.partition_point(|&ix| ix <= block).saturating_sub(1);
+    if indices.get(anchor.item_ix) != Some(&block) {
+        anchor.offset_in_item = px(0.);
+    }
+    anchor
+}
+
 /// 停在底部才跟随新内容；往上翻看时保持原位置。
 /// max_offset_for_scrollbar 不含列表上下内边距，真实滚动上限要再加回来；
 /// 它为 0 时内容不足一屏（最多能滚动内边距那点距离），视为在底部。
@@ -696,21 +705,33 @@ pub fn render(
         |_, _| VisibleRows::new(&blocks),
     );
     visible.update(cx, |rows, _| {
+        // 行号会随折叠重算而变，滚动锚点按原始块下标记，重排后再换回行号。
+        let anchor = state.logical_scroll_top();
+        let anchor_block = rows.indices.get(anchor.item_ix).copied();
         let splice = rows.sync(&blocks);
         if splice.is_none() && state.item_count() == rows.indices.len() {
             return;
         }
         // 按旧行高判断是否跟随，须在 splice/reset 之前。
         let follow = at_bottom(&state);
-        match splice {
-            // splice 保住前面行的已测高度，锚点在重排区之前时原地不动。
-            Some((range, count)) if range.end == state.item_count() => state.splice(range, count),
+        let moved = match splice {
+            // splice 保住前面行的已测高度；锚点在重排区之前时原地不动，
+            // 落在重排区内（比如正往上翻看流式中的长消息）时 splice 会把偏移清零，要按块恢复。
+            Some((range, count)) if range.end == state.item_count() => {
+                state.splice(range.clone(), count);
+                range.contains(&anchor.item_ix)
+            }
             // 读完历史时列表按历史块数重置过，这时可能已拼上了运行中的 live 轮次。
-            _ => state.reset(rows.indices.len()),
-        }
+            _ => {
+                state.reset(rows.indices.len());
+                true
+            }
+        };
         if follow {
             // 定位到末尾后，布局会从底部往上填满视口。
             scroll_to_end(&state);
+        } else if moved && let Some(block) = anchor_block {
+            state.scroll_to(remap_anchor(anchor, block, &rows.indices));
         }
     });
     let list_state = state.clone();
@@ -1036,7 +1057,7 @@ fn edge_fade(top: bool, cx: &gpui::App) -> gpui::Div {
 mod tests {
     use super::{
         BODY_LIMIT, Block, CONTEXT_KIND_KEY, VisibleRows, append, collapsed_indices, copy_text,
-        describe, fence, is_binary, prepare, prepare_live, truncate,
+        describe, fence, is_binary, prepare, prepare_live, remap_anchor, truncate,
     };
     use agentdeck_protocol::{
         AgentItem, AgentItemMeta, HistoryTurn, PlanStep, PlanStepStatus, ShellStatus,
@@ -1518,5 +1539,18 @@ mod tests {
         let mut streamed = combined.to_vec();
         streamed[4].summary = Some("更新".into());
         assert_eq!(rows.sync(&streamed.into()), Some((4..5, 1)));
+
+        // 往上翻看流式中的那一行：重排后行内偏移保留；块被并进组时停在组首行顶部。
+        let anchor = ListOffset {
+            item_ix: 4,
+            offset_in_item: px(30.),
+        };
+        let kept = remap_anchor(anchor, 4, &rows.indices);
+        assert_eq!((kept.item_ix, kept.offset_in_item), (4, px(30.)));
+        assert_eq!(remap_anchor(anchor, 5, &rows.indices).item_ix, 4);
+        assert_eq!(
+            remap_anchor(anchor, 5, &rows.indices).offset_in_item,
+            px(0.)
+        );
     }
 }
