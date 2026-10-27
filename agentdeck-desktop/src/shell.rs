@@ -237,6 +237,20 @@ fn dir_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// 超长名字保留首尾、中间省略，免得项目按钮挤占输入框；结尾常是日期或版本，比开头更能区分。
+fn middle_ellipsis(name: &str, max: usize) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() <= max {
+        return name.to_string();
+    }
+    let tail = (max - 1) / 2;
+    let head = max - 1 - tail;
+    let mut short: String = chars[..head].iter().collect();
+    short.push('…');
+    short.extend(&chars[chars.len() - tail..]);
+    short
+}
+
 /// 上级目录的简短提示：用户目录缩写成 `~`，用来区分同名项目。
 fn parent_hint(path: &Path, home: Option<&Path>) -> String {
     let Some(parent) = path.parent() else {
@@ -2374,7 +2388,7 @@ impl Shell {
             .label(if empty {
                 "选择项目".into()
             } else {
-                dir_name(&cwd)
+                middle_ellipsis(&dir_name(&cwd), 20)
             })
             .child(Icon::empty().xsmall().path(crate::CHEVRON_DOWN_ICON))
             .when(!empty, |button| button.tooltip(cwd.display().to_string()))
@@ -3567,7 +3581,7 @@ mod tests {
         Transcript, agent_label, day_group, empty_hint, local_time, project_name,
         scroll_sidebar_to, session_matches, session_title, sidebar_rows, transcript_list,
     };
-    use super::{parent_hint, recent_projects};
+    use super::{middle_ellipsis, parent_hint, recent_projects};
     use crate::daemon;
     use agentdeck_protocol::{AgentKind, HistoryListItem, HistoryWarning, ThreadId};
     use gpui::{ScrollStrategy, UniformListScrollHandle};
@@ -4257,6 +4271,14 @@ mod tests {
             paths(recent_projects(&sessions, &sessions[4].host, 8)),
             ["/r"]
         );
+    }
+
+    #[test]
+    fn middle_ellipsis_keeps_head_and_tail() {
+        assert_eq!(middle_ellipsis("AgentDeck", 20), "AgentDeck");
+        let short = middle_ellipsis("accounts-backup-20260713-152226", 20);
+        assert_eq!(short, "accounts-b…13-152226");
+        assert_eq!(short.chars().count(), 20);
     }
 
     #[test]
