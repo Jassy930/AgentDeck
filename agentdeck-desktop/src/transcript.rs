@@ -737,7 +737,8 @@ pub fn render(
     let list_state = state.clone();
     // 常驻显示：长会话需要随时看到当前位置，不跟随系统的自动隐藏。
     let scrollbar = Scrollbar::vertical(&state).scrollbar_show(ScrollbarShow::Always);
-    let rail = turn_rail(&blocks, &visible.read(cx).indices, &state, cx);
+    let indices = visible.read(cx).indices.clone();
+    let rail = turn_rail(&blocks, &indices, &state, read_id, window, cx);
     let latest = (!at_bottom(&state)).then(|| {
         let state = state.clone();
         Button::new("transcript-latest")
@@ -973,13 +974,57 @@ pub fn render(
         .children(latest.map(|button| div().absolute().right(px(36.)).bottom_4().child(button)))
 }
 
-/// 右侧轮次导航：每条用户消息一个点，当前阅读的轮次高亮，hover 看摘要，点击跳过去。
+/// 轮次点未放大时的间距；轮数多到放不下时整体压缩。
+const RAIL_SPACING: f32 = 14.;
+/// 光标正下方的点额外占的高度，Dock 式放大让密集的点也能点中。
+const RAIL_GROW: f32 = 14.;
+const RAIL_DOT: f32 = 6.;
+const RAIL_DOT_GROW: f32 = 8.;
+
+/// 光标在 rail 上的位置（相对 rail 顶部）；rail 尺寸取上一帧的布局结果。
+#[derive(Default)]
+struct RailHover {
+    y: Option<f32>,
+    bounds: gpui::Bounds<gpui::Pixels>,
+}
+
+/// 每个点的 `(中心 y, 占位高度, 放大权重 0..=1)`，坐标相对 rail 顶部。
+/// 光标附近的间距按余弦曲线拉开，位移向上下两侧累积：光标处的点不动，两端被推开。
+fn rail_layout(count: usize, height: f32, hover: Option<f32>) -> Vec<(f32, f32, f32)> {
+    use std::f32::consts::PI;
+    let spacing = RAIL_SPACING.min(height / count as f32).max(1.);
+    let top = (height - spacing * count as f32) / 2.;
+    // 影响半径按点数计：点再密，也是光标附近几个点被拉开。
+    let radius = spacing * 4.;
+    (0..count)
+        .map(|i| {
+            let y = top + (i as f32 + 0.5) * spacing;
+            let Some(mouse) = hover else {
+                return (y, spacing, 0.);
+            };
+            let d = (y - mouse).abs().min(radius);
+            let weight = (1. + (PI * d / radius).cos()) / 2.;
+            // weight 从光标积分到该点：两者之间多出来的总高度。
+            let shift =
+                RAIL_GROW / spacing * (d / 2. + radius / (2. * PI) * (PI * d / radius).sin());
+            (
+                y + shift.copysign(y - mouse),
+                spacing + RAIL_GROW * weight,
+                weight,
+            )
+        })
+        .collect()
+}
+
+/// 右侧轮次导航：每条用户消息一个点，当前阅读的轮次高亮，hover 跟随放大并看摘要，点击跳过去。
 fn turn_rail(
     blocks: &[Block],
     indices: &[usize],
     state: &ListState,
-    cx: &gpui::App,
-) -> Option<gpui::Div> {
+    read_id: u64,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) -> Option<gpui::Stateful<gpui::Div>> {
     let turns: Vec<(usize, &Block)> = indices
         .iter()
         .enumerate()
@@ -994,47 +1039,90 @@ fn turn_rail(
         .partition_point(|(row, _)| *row <= top)
         .saturating_sub(1);
     let (muted, accent) = (cx.theme().muted_foreground, cx.theme().primary);
-    // ponytail: 点高度随轮数压缩到 2px，几百轮时点击区很小；真有这种会话再做可视窗口。
+    let hover = window.use_keyed_state(
+        SharedString::from(format!("transcript-rail-{read_id}")),
+        cx,
+        |_, _| RailHover::default(),
+    );
+    let (mouse, bounds) = {
+        let hover = hover.read(cx);
+        (hover.y, hover.bounds)
+    };
+    let layout = rail_layout(turns.len(), f32::from(bounds.size.height), mouse);
+    let (measure, track, leave) = (hover.clone(), hover.clone(), hover);
     Some(
-        v_flex()
+        div()
+            .id("transcript-rail")
             .absolute()
-            .right(px(16.))
+            .right(px(14.))
             .top(px(EDGE_FADE_HEIGHT))
             .bottom(px(EDGE_FADE_HEIGHT))
-            .w(px(16.))
-            .justify_center()
-            .overflow_hidden()
-            .children(turns.into_iter().enumerate().map(|(n, (row, block))| {
-                let state = state.clone();
-                let tip: SharedString =
-                    format!("第 {} 轮 · {}", n + 1, one_line(&block.body)).into();
-                let active = n == current;
-                div()
-                    .id(ElementId::NamedInteger("transcript-turn".into(), n as u64))
-                    .h(px(14.))
-                    .min_h(px(2.))
-                    .flex_shrink()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .child(
-                        div()
-                            .size(px(if active { 8. } else { 6. }))
-                            .rounded_full()
-                            .bg(if active { accent } else { muted.opacity(0.5) }),
-                    )
-                    .tooltip(move |window, cx| {
-                        gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+            .w(px(20.))
+            // 窗口尺寸变了要按新高度重排，多画一帧。
+            .child(
+                gpui::canvas(
+                    move |bounds, window, cx| {
+                        measure.update(cx, |hover, _| {
+                            if hover.bounds != bounds {
+                                hover.bounds = bounds;
+                                window.refresh();
+                            }
+                        })
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .on_mouse_move(move |event, _, cx| {
+                track.update(cx, |hover, cx| {
+                    hover.y = Some(f32::from(event.position.y - hover.bounds.origin.y));
+                    cx.notify();
+                })
+            })
+            .on_hover(move |hovered, _, cx| {
+                if !hovered {
+                    leave.update(cx, |hover, cx| {
+                        hover.y = None;
+                        cx.notify();
                     })
-                    .on_click(move |_, window, _| {
-                        state.scroll_to(ListOffset {
-                            item_ix: row,
-                            offset_in_item: px(0.),
-                        });
-                        window.refresh();
-                    })
-            })),
+                }
+            })
+            .children(turns.into_iter().zip(layout).enumerate().map(
+                |(n, ((row, block), (center, slot, weight)))| {
+                    let state = state.clone();
+                    let tip: SharedString =
+                        format!("第 {} 轮 · {}", n + 1, one_line(&block.body)).into();
+                    let active = n == current;
+                    let dot = RAIL_DOT + if active { 2. } else { 0. } + RAIL_DOT_GROW * weight;
+                    div()
+                        .id(ElementId::NamedInteger("transcript-turn".into(), n as u64))
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .top(px(center - slot / 2.))
+                        .h(px(slot))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .child(div().size(px(dot)).rounded_full().bg(if active {
+                            accent
+                        } else {
+                            muted.opacity(0.5 + 0.5 * weight)
+                        }))
+                        .tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                        })
+                        .on_click(move |_, window, _| {
+                            state.scroll_to(ListOffset {
+                                item_ix: row,
+                                offset_in_item: px(0.),
+                            });
+                            window.refresh();
+                        })
+                },
+            )),
     )
 }
 
@@ -1057,7 +1145,7 @@ fn edge_fade(top: bool, cx: &gpui::App) -> gpui::Div {
 mod tests {
     use super::{
         BODY_LIMIT, Block, CONTEXT_KIND_KEY, VisibleRows, append, collapsed_indices, copy_text,
-        describe, fence, is_binary, prepare, prepare_live, remap_anchor, truncate,
+        describe, fence, is_binary, prepare, prepare_live, rail_layout, remap_anchor, truncate,
     };
     use agentdeck_protocol::{
         AgentItem, AgentItemMeta, HistoryTurn, PlanStep, PlanStepStatus, ShellStatus,
@@ -1504,6 +1592,28 @@ mod tests {
         let labels: Vec<_> = blocks.iter().map(|b| (b.label, b.images.len())).collect();
         assert_eq!(labels, [("你", 1), ("助手", 0), ("你", 0), ("助手", 0)]);
         assert_eq!(blocks[0].images[0], image);
+    }
+
+    #[test]
+    fn rail_magnifies_around_the_cursor_and_keeps_order() {
+        let calm = rail_layout(5, 200., None);
+        assert!(
+            calm.iter()
+                .all(|&(_, slot, weight)| slot == 14. && weight == 0.)
+        );
+        assert_eq!(calm[2].0, 100.);
+
+        // 光标正对中间的点：它不动且放到最大，两侧对称推开，顺序不乱。
+        let hovered = rail_layout(5, 200., Some(100.));
+        assert_eq!(hovered[2], (100., 28., 1.));
+        assert!((hovered[1].0 + hovered[3].0 - 200.).abs() < 1e-3);
+        assert!(hovered.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert!(hovered[0].0 < calm[0].0 && hovered[4].0 > calm[4].0);
+
+        // 几百轮压缩到 1px 间距时，光标处的点仍有可点的高度。
+        let crowded = rail_layout(400, 400., Some(200.));
+        let near = crowded.iter().map(|&(_, slot, _)| slot).fold(0., f32::max);
+        assert!(near > 14.);
     }
 
     #[test]
