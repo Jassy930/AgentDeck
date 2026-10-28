@@ -31,7 +31,9 @@
   - X11 上 gpui 请求服务端装饰，标题栏和关闭按钮由窗口管理器绘制。
   - GNOME Wayland 不支持服务端装饰，gpui 会退回客户端装饰，而桌面端目前没有绘制，所以窗口没有标题栏和控制按钮。这种情况下只能用 Super+拖动移动窗口，用 Alt+F4 或 Ctrl+Q 关闭。待定。
 
-## 中文输入法崩溃（X11 + ibus，已修复）
+## 中文输入法崩溃（X11 + ibus / fcitx4，已修复）
+
+2026-10-28 反馈问题的用户用修复后的版本在真实 Ubuntu 桌面上确认已不再崩溃。
 
 **现象**：Ubuntu 上用 ibus 输入中文时，一出现预编辑文本，桌面端就退出。backtrace 停在
 `zed-xim-0.4.0-zed/src/client.rs:237`，报错信息是 `Encoding Error: UnsupportedEncoding`。
