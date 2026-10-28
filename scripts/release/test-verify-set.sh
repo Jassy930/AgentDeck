@@ -57,6 +57,9 @@ for target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu
   make_archive "$target" desktop
   make_archive "$target" daemon
 done
+for target in aarch64-apple-darwin x86_64-apple-darwin; do
+  printf 'dmg\n' > "$fixture/assets/AgentDeck-$target.dmg"
+done
 for target in aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
   make_archive "$target" daemon
 done
@@ -68,6 +71,9 @@ asset=AgentDeck-aarch64-unknown-linux-gnu.tar.gz
 mv "$fixture/assets/$asset" "$fixture/$asset"
 expect_failure 'a missing target' "$verify" "$fixture/assets"
 mv "$fixture/$asset" "$fixture/assets/$asset"
+mv "$fixture/assets/AgentDeck-x86_64-apple-darwin.dmg" "$fixture/x.dmg"
+expect_failure 'a missing macOS DMG' "$verify" "$fixture/assets"
+mv "$fixture/x.dmg" "$fixture/assets/AgentDeck-x86_64-apple-darwin.dmg"
 touch "$fixture/assets/AgentDeck-windows.zip"
 expect_failure 'an extra target' "$verify" "$fixture/assets"
 rm "$fixture/assets/AgentDeck-windows.zip"

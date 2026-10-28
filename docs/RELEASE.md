@@ -8,15 +8,16 @@ PR 中的 Actions artifacts 是候选产物，不代表已正式发布或完成�
 
 | 平台与基线 | 桌面归档 | 独立 daemon 归档 |
 | --- | --- | --- |
-| macOS 15+，Apple Silicon | `AgentDeck-aarch64-apple-darwin.tar.gz` | `agentdeckd-aarch64-apple-darwin.tar.gz` |
-| macOS 15+，Intel | `AgentDeck-x86_64-apple-darwin.tar.gz` | `agentdeckd-x86_64-apple-darwin.tar.gz` |
+| macOS 15+，Apple Silicon | `AgentDeck-aarch64-apple-darwin.dmg` / `.tar.gz` | `agentdeckd-aarch64-apple-darwin.tar.gz` |
+| macOS 15+，Intel | `AgentDeck-x86_64-apple-darwin.dmg` / `.tar.gz` | `agentdeckd-x86_64-apple-darwin.tar.gz` |
 | Ubuntu 24.04，x86_64 | `AgentDeck-x86_64-unknown-linux-gnu.tar.gz` | `agentdeckd-x86_64-unknown-linux-gnu.tar.gz` |
 | Ubuntu 24.04，ARM64 | `AgentDeck-aarch64-unknown-linux-gnu.tar.gz` | `agentdeckd-aarch64-unknown-linux-gnu.tar.gz` |
 | Windows，x64（MSVC；CI 为 Windows Server 2025） | `AgentDeck-x86_64-pc-windows-msvc.zip` | `agentdeckd-x86_64-pc-windows-msvc.zip` |
 | Linux，x86_64，musl 静态 daemon | — | `agentdeckd-x86_64-unknown-linux-musl.tar.gz` |
 | Linux，ARM64，musl 静态 daemon | — | `agentdeckd-aarch64-unknown-linux-musl.tar.gz` |
 
-完整发布包含这 12 个归档和 `SHA256SUMS`。桌面归档携带同版本、同架构的 daemon，
+完整发布包含这 14 个产物（12 个归档加 2 个 macOS DMG）和 `SHA256SUMS`。
+macOS DMG 与同目标 `tar.gz` 内的 `AgentDeck.app` 相同，另含 `/Applications` 链接便于拖拽安装。桌面归档携带同版本、同架构的 daemon，
 Linux GNU 桌面包携带 GNU daemon。Linux 远端自动安装继续选择 musl daemon；macOS
 远端按 `uname -sm` 选择 Darwin 目标。第二期增加 ARM64 GNU 桌面和 Windows x64 包。
 Windows ARM64 不在当前矩阵中；Ubuntu 以外发行版、其他 GPU 和 Wayland 组合须单独验收。
@@ -70,7 +71,8 @@ if ((Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash -ine $expected) 
 ## macOS 桌面
 
 选择机器本身的架构：Apple Silicon 为 `aarch64-apple-darwin`，Intel 为
-`x86_64-apple-darwin`。校验后解包：
+`x86_64-apple-darwin`。校验后打开 `AgentDeck-<target>.dmg`，把 `AgentDeck.app` 拖到
+`Applications`；DMG 与 `tar.gz` 只是封装不同，签名与公证状态一样。也可以解包 `tar.gz`：
 
 ```bash
 tar -xzf AgentDeck-aarch64-apple-darwin.tar.gz
@@ -262,13 +264,15 @@ Windows 烟测隔离 `HOME`、`USERPROFILE`、`APPDATA`、`LOCALAPPDATA`、PATH 
 
 打包入口使用 `cargo build --release --locked`，独立于会停止并启动开发应用的
 `script/build_and_run.sh`。烟测解包实际归档，隔离 HOME 和数据目录，验证架构、版本、
-daemon 自检与诊断报告、桌面隐藏窗口 selfcheck。它不启动真实模型会话、不读取用户历史。
+daemon 自检与诊断报告、桌面隐藏窗口 selfcheck。macOS 另以只读方式挂载 DMG，核对其中
+`AgentDeck.app` 的签名、二进制与 `tar.gz` 一致以及 `/Applications` 链接。它不启动真实模型会话、不读取用户历史。
 
 ## CI 与发布门禁
 
 `Release packages` 在 PR 和手动触发时只构建、测试、烟测和上传 Actions artifacts。
 `build` 使用 7 个原生 target 组合，分别上传 `package-<target>`；`collect` 要求精确包含
-上述 12 个归档，校验版本、target 与提交 SHA 一致并生成 `SHA256SUMS`，完整候选集上传为
+上述 14 个产物，校验归档的版本、target 与提交 SHA 一致（DMG 在 Linux 上无法读取，只校验
+存在，内容由 macOS 烟测保证）并生成 `SHA256SUMS`，完整候选集上传为
 `release-assets`。
 
 `v*` tag 必须与 workspace 版本严格相等，例如版本 `0.1.2` 对应 `v0.1.2`。

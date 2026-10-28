@@ -113,6 +113,13 @@ DESKTOP
   fi
   COPYFILE_DISABLE=1 tar -czf "$stage/AgentDeck-$target.tar.gz" -C "$stage/desktop" "$desktop_root"
   mv "$stage/AgentDeck-$target.tar.gz" "$output_dir/"
+  if [[ "$target" == *-apple-darwin ]]; then
+    # DMG 与 tar.gz 内容相同，额外放 /Applications 链接供 Finder 拖拽安装。
+    ln -s /Applications "$stage/desktop/Applications"
+    /usr/bin/hdiutil create -quiet -volname AgentDeck -srcfolder "$stage/desktop" -format UDZO \
+      "$stage/AgentDeck-$target.dmg"
+    mv "$stage/AgentDeck-$target.dmg" "$output_dir/"
+  fi
 fi
 COPYFILE_DISABLE=1 tar -czf "$stage/agentdeckd-$target.tar.gz" -C "$stage/daemon" agentdeckd RELEASE-VERSION RELEASE-INFO.txt LICENSE
 mv "$stage/agentdeckd-$target.tar.gz" "$output_dir/"

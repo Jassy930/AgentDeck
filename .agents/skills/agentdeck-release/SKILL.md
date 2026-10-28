@@ -5,7 +5,7 @@ description: AgentDeck 发版流程：检查 master 与 CI、升 workspace 版�
 
 # AgentDeck 发版
 
-打 `v*` tag 后，`.github/workflows/release.yml`（Release packages）会在原生 runner 上构建 7 个目标、生成 12 个归档和 `SHA256SUMS`，重跑 Offline CI，为归档生成 build provenance，全部通过后再发布 GitHub Release。打包细节、平台矩阵和证据边界见 `docs/RELEASE.md`，这里只写发版操作。
+打 `v*` tag 后，`.github/workflows/release.yml`（Release packages）会在原生 runner 上构建 7 个目标、生成 12 个归档、2 个 macOS DMG 和 `SHA256SUMS`，重跑 Offline CI，为归档生成 build provenance，全部通过后再发布 GitHub Release。打包细节、平台矩阵和证据边界见 `docs/RELEASE.md`，这里只写发版操作。
 
 推送 master 和推送 tag 都是对外操作，第 5 步之前必须先让用户确认。
 
@@ -87,7 +87,7 @@ gh run view <run-id> --json conclusion,jobs --jq '{conclusion, jobs: [.jobs[] | 
 ## 8. 验收
 
 ```bash
-gh release view vX.Y.Z --json isDraft,assets --jq '{isDraft, n: (.assets | length)}'   # 期望 false 和 13
+gh release view vX.Y.Z --json isDraft,assets --jq '{isDraft, n: (.assets | length)}'   # 期望 false 和 15
 dir=$(mktemp -d)
 gh release download vX.Y.Z --pattern 'agentdeckd-x86_64-unknown-linux-musl.tar.gz' --dir "$dir"
 gh attestation verify "$dir/agentdeckd-x86_64-unknown-linux-musl.tar.gz" --repo Jassy930/AgentDeck --format json \

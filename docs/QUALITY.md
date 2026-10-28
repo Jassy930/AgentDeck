@@ -72,7 +72,7 @@ Ubuntu 24.04 x86_64 / ARM64 桌面与 GNU daemon、Windows x64 桌面与 daemon�
 
 构建必须使用 `--release --locked`；烟测从实际归档解包，检查架构、workspace/二进制/归档
 版本一致，隔离 HOME 与数据目录运行 daemon selfcheck/diagnostics 和桌面隐藏窗口 selfcheck。
-macOS 另核对 bundle 图标、最低系统版本和代码签名完整性；签名完整性不等于 Developer ID
+macOS 另核对 bundle 图标、最低系统版本和代码签名完整性，并挂载 DMG 核对与 tar.gz 一致；签名完整性不等于 Developer ID
 签名或公证验收。Linux CI 使用 Xvfb 和软件 Vulkan，不代表硬件 GPU / Wayland 全面兼容。
 Windows 在 `windows-2025`（Windows Server 2025）上原生构建，验证 x64 PE、系统 DLL
 依赖、静态 CRT 和未签名状态；PowerShell smoke 从 ZIP 解包，隔离用户环境并使用原生 EXE
@@ -84,7 +84,7 @@ tripwire。Windows 路径、native IPC 与 Job 进程树 fixture 必须实际执
 CI 隐藏窗口启动不代表 Windows 10/11 GUI、SmartScreen、Authenticode、
 真实 SSH 或 vendor 会话已验收。
 
-完整集合必须精确包含 12 个归档，生成并回验 `SHA256SUMS`。只有 v* tag 的版本匹配、
+完整集合必须精确包含 12 个归档和 2 个 macOS DMG，生成并回验 `SHA256SUMS`。只有 v* tag 的版本匹配、
 全部原生目标和离线门禁成功后，统一 publish 才能上传 draft、回验并公开。
 PR/手动运行不得创建实际 Release。验收分别记录静态检查、实际构建、归档启动烟测、
 人工 GUI 和签名/公证结果；没有运行的项目明确写未运行。
