@@ -14,6 +14,7 @@ mod sidebar;
 mod theme;
 mod theme_tokens;
 mod transcript;
+mod update;
 mod versions;
 
 use std::borrow::Cow;

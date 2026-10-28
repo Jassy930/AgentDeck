@@ -37,6 +37,7 @@ use crate::remotes;
 use crate::session_router::SessionRouter;
 use crate::sidebar;
 use crate::transcript;
+use crate::update;
 use crate::versions;
 
 gpui::actions!(questions, [NextQuestion, PreviousQuestion]);
@@ -757,6 +758,11 @@ pub struct Shell {
     question_focused: Option<(String, u64)>,
     /// 下一帧要聚焦的“其他”输入框（题号）；输入框实体只在渲染时拿得到。
     focus_other: Option<usize>,
+    /// 正式 Release 的安装根；本地构建为 None，不检查更新。
+    update_root: Option<PathBuf>,
+    pub(crate) update: update::Status,
+    /// 自更新重启前停留的会话，等历史列表里出现后自动打开。
+    reopen: Option<SessionKey>,
 }
 
 impl Shell {
@@ -848,11 +854,20 @@ impl Shell {
             question_scroll: ScrollHandle::new(),
             question_focused: None,
             focus_other: None,
+            update_root: None,
+            update: update::Status::Idle,
+            reopen: None,
         };
         if connect_daemon {
             shell.add_machine(None, cx);
             for host in remotes::load() {
                 shell.add_machine(Some(host.into()), cx);
+            }
+            shell.reopen = update::reopen_arg();
+            shell.update_root = update::install_root();
+            if let Some(root) = &shell.update_root {
+                update::cleanup(root);
+                shell.check_updates(cx);
             }
         }
         if dev_mode {
@@ -1624,11 +1639,131 @@ impl Shell {
                         agent.loaded = loaded;
                     }
                     shell.rebuild_rows(cx);
+                    shell.reopen_after_update(cx);
                 }
             })
             .ok();
         })
         .detach();
+    }
+
+    fn reopen_after_update(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = &self.reopen else {
+            return;
+        };
+        if !matches!(self.stage, Stage::Empty) {
+            self.reopen = None;
+            return;
+        }
+        if let Some(session) = self.sessions.iter().find(|session| session.is(key)) {
+            self.reopen = None;
+            self.open_session(session.clone(), cx);
+        }
+    }
+
+    /// 启动时查一次，之后每 6 小时查一次；失败静默，离线很正常。
+    fn check_updates(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                let latest = cx
+                    .background_executor()
+                    .spawn(async { update::fetch_latest() })
+                    .await;
+                let alive = this.update(cx, |shell, cx| {
+                    if let Ok(latest) = latest
+                        && update::is_newer(&latest)
+                        && matches!(
+                            shell.update,
+                            update::Status::Idle | update::Status::Available(_)
+                        )
+                    {
+                        shell.update = update::Status::Available(latest);
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_secs(6 * 60 * 60))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    /// 侧栏更新按钮：下载安装 → 重启（有会话在跑就等空闲）→ 再点一次立即重启。
+    pub fn click_app_update(&mut self, cx: &mut Context<Self>) {
+        use update::Status::*;
+        let Some(root) = self.update_root.clone() else {
+            return;
+        };
+        match self.update.clone() {
+            Available(version) | Failed(version, _) => {
+                self.update = Installing(version.clone());
+                cx.spawn(async move |this, cx| {
+                    let installed = cx
+                        .background_executor()
+                        .spawn({
+                            let version = version.clone();
+                            async move { update::install(&root, &version) }
+                        })
+                        .await;
+                    this.update(cx, |shell, cx| {
+                        shell.update = match installed {
+                            Ok(()) => Ready(version),
+                            Err(error) => Failed(version, error),
+                        };
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            Ready(version) if self.busy() => {
+                self.update = Waiting(version);
+                cx.spawn(async move |this, cx| {
+                    loop {
+                        cx.background_executor().timer(Duration::from_secs(2)).await;
+                        let waiting = this.update(cx, |shell, cx| {
+                            let waiting = matches!(shell.update, Waiting(_));
+                            if waiting && !shell.busy() {
+                                shell.restart(cx);
+                            }
+                            waiting
+                        });
+                        if !matches!(waiting, Ok(true)) {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
+            Ready(_) | Waiting(_) => self.restart(cx),
+            Idle | Installing(_) => return,
+        }
+        cx.notify();
+    }
+
+    fn busy(&self) -> bool {
+        self.live.iter().any(|live| live.activity().is_some())
+    }
+
+    fn restart(&mut self, cx: &mut Context<Self>) {
+        let (Some(root), Some(version)) = (&self.update_root, self.update.version()) else {
+            return;
+        };
+        let reopen = match &self.stage {
+            Stage::Session { session, .. } => Some(session.key()),
+            _ => None,
+        };
+        match update::relaunch(root, reopen.as_ref()) {
+            Ok(()) => cx.quit(),
+            Err(error) => {
+                self.update = update::Status::Failed(version, format!("重启失败：{error}"));
+                cx.notify();
+            }
+        }
     }
 
     pub fn retry_machine(&mut self, id: u64, cx: &mut Context<Self>) {

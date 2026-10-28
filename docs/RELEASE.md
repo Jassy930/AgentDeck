@@ -127,8 +127,8 @@ ARM64 使用 `AgentDeck-aarch64-unknown-linux-gnu.tar.gz`，其余目录布局�
 `AgentDeck/` 放在 `~/.local/opt/AgentDeck/`，将桌面二进制链接到 `~/.local/bin/agentdeck-desktop`，
 并确认该目录在图形会话的 PATH 中；把包内 `agentdeck.desktop` 安装到
 `~/.local/share/applications/`，把 `agentdeck.png` 安装到
-`~/.local/share/icons/hicolor/256x256/apps/agentdeck.png`。升级前由用户退出旧版本，再替换整个目录，
-避免桌面和 daemon 版本混用。
+`~/.local/share/icons/hicolor/256x256/apps/agentdeck.png`。可用应用内自动更新（见下文）；手动升级时
+由用户退出旧版本，再替换整个目录，避免桌面和 daemon 版本混用。
 
 若启动报告缺库，可用 `ldd ./AgentDeck/agentdeck-desktop` 检查 `not found` 项，按系统包名
 补齐。CI 安装的构建与图形烟测依赖见 `.github/workflows/release.yml`；无头 CI 使用
@@ -147,7 +147,7 @@ Expand-Archive -LiteralPath AgentDeck-x86_64-pc-windows-msvc.zip -DestinationPat
 ```
 
 保持 `AgentDeck.exe` 与 `agentdeckd.exe` 在同一目录，可把整个 `AgentDeck/` 移到用户选择的
-位置，并为 `AgentDeck.exe` 创建快捷方式。升级前先退出旧版本，再替换整个目录。
+位置，并为 `AgentDeck.exe` 创建快捷方式。可用应用内自动更新（见下文）；手动升级时先退出旧版本，再替换整个目录。
 桌面使用 Direct3D 11 图形后端；release 将 FXC 编译的 shader 嵌入二进制，使用静态 CRT，
 打包门禁拒绝未捆绑的非系统 DLL 依赖。用户运行包不需要安装 Rust、Windows SDK 或 FXC。
 GPUI 使用 Windows 自带的 `icuuc.dll`；打包时同时核对允许的系统库名称与 System32 中的
@@ -183,6 +183,28 @@ Unix `bash`、`uname` 和 tar，因此 Windows 主机作为 SSH 目标不在当�
 Windows 用户目录优先取非空 `USERPROFILE`，缺失时回退 `HOME`；`LOCALAPPDATA` 缺失时使用
 该用户目录下的 `AppData\Local`。`AGENTDECK_DATA_DIR` 显式覆盖优先，`AGENTDECK_PROFILE=dev`
 将默认应用目录名改为 `AgentDeck-Dev`，这些设置不改变 vendor 的登录状态或原始历史。
+
+## 应用内自动更新
+
+只有从 Release 归档安装的桌面端启用（安装根带 `RELEASE-VERSION`：macOS 为
+`AgentDeck.app/Contents/Resources/`，Linux / Windows 为 `AgentDeck/` 目录）；本地
+`build_and_run.sh` 构建和单独拷走的二进制不检查更新。
+
+- 检测：启动时及之后每 6 小时请求一次 `releases/latest`，只读 302 跳转里的 tag，不调用
+  GitHub API；失败静默。有新版本时侧栏「机器」入口上方出现「更新到 vX」。
+- 安装：点击后下载本平台桌面归档和 `SHA256SUMS`，校验通过才在安装根旁的
+  `.agentdeck-update-<pid>/` 里解压，再替换安装根：macOS / Linux 整目录改名交换，
+  Windows 逐个文件改名（运行中的 EXE 只能改名不能覆盖）。旧文件留在该暂存目录，
+  下次启动时删除，在此之前可手动挪回回滚。安装位置不可写时提示手动下载。
+- 重启：按钮变为「重启以更新」；有会话在工作或待确认时先等它们空闲，再点一次立即重启。
+  新版本启动后自动打开重启前停留的会话（续聊照常使用原 thread）。重启会结束 daemon 及
+  其 vendor 子进程，进行中的轮次会被打断。
+- 安全边界：`SHA256SUMS` 与归档出自同一个 Release，只能发现下载损坏，不能防止 Release
+  本身被篡改；需要核验来源时按上文手动下载并用 `gh attestation verify`。macOS 包为
+  ad-hoc 签名，更新后本地网络等系统授权可能需要重新确认。
+- 远端机器的 `agentdeckd` 不随桌面端自动更新，仍在机器页按桌面配套版本升级。
+- 测试时可用 `AGENTDECK_UPDATE_URL` 把 Release 根地址（默认
+  `https://github.com/Jassy930/AgentDeck/releases`）指向本地服务。
 
 ## 独立 agentdeckd
 

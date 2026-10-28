@@ -253,6 +253,7 @@ pub fn render(
                         }),
                 ),
         )
+        .children(update_button(shell, cx))
         .child(
             // 底部页面入口：一排图标按钮，后续设置、信息页在此并列。
             h_flex()
@@ -303,6 +304,50 @@ pub fn render(
                         ),
                 ),
         )
+}
+
+/// 有新版本时机器入口上方多一行；本地构建和已是最新时不占位。
+fn update_button(shell: &Shell, cx: &mut Context<Shell>) -> Option<impl IntoElement + use<>> {
+    use crate::update::Status::*;
+    let (label, tooltip) = match &shell.update {
+        Idle => return None,
+        Available(version) => (
+            format!("更新到 v{version}"),
+            "下载并安装，完成后再重启".into(),
+        ),
+        Installing(version) => (format!("正在下载 v{version}…"), String::new()),
+        Ready(version) => (
+            format!("重启以更新到 v{version}"),
+            "有会话在工作时会等它们空闲再重启".into(),
+        ),
+        Waiting(_) => ("等会话空闲后重启…".into(), "再点一次立即重启".into()),
+        Failed(_, error) => ("更新失败，点击重试".into(), error.clone()),
+    };
+    let failed = matches!(shell.update, Failed(..));
+    let button = Button::new("update-app")
+        .small()
+        .w_full()
+        .justify_start()
+        .icon(Icon::empty().path(crate::REFRESH_ICON))
+        .label(label)
+        .loading(matches!(shell.update, Installing(_)))
+        .on_click(cx.listener(|shell, _, _, cx| shell.click_app_update(cx)));
+    let button = if failed {
+        button.danger()
+    } else {
+        button.primary()
+    };
+    Some(
+        div()
+            .flex_shrink_0()
+            .mx_3()
+            .pt_3()
+            .child(if tooltip.is_empty() {
+                button
+            } else {
+                button.tooltip(tooltip)
+            }),
+    )
 }
 
 /// 透明标题栏下的顶部留白：给红绿灯让位，并接管标题栏双击行为。
