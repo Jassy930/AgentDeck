@@ -24,6 +24,8 @@ const DEFAULT_URL: &str = "https://github.com/Jassy930/AgentDeck/releases";
 const STAGING_PREFIX: &str = ".agentdeck-update-";
 /// 重启后自动打开的会话：`--reopen <host>\t<kind>\t<thread>`，本机 host 为空。
 const REOPEN_ARG: &str = "--reopen";
+/// 自更新拉起的新实例带这个参数，跳过本次清理，旧版本留到下次手动启动前可回滚。
+const UPDATED_ARG: &str = "--updated";
 
 const TARGET: &str = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
     "aarch64-apple-darwin"
@@ -109,7 +111,11 @@ pub fn install_root() -> Option<PathBuf> {
 }
 
 /// 删掉上次更新留下的暂存目录（旧版本文件）；老进程可能还没退，失败就留到下次。
+/// 刚由自更新拉起时不删，保留回滚窗口。
 pub fn cleanup(root: &Path) {
+    if std::env::args().any(|arg| arg == UPDATED_ARG) {
+        return;
+    }
     let Some(entries) = root.parent().and_then(|parent| fs::read_dir(parent).ok()) else {
         return;
     };
@@ -291,9 +297,10 @@ fn swap_entries(root: &Path, new: &Path, old: &Path) -> io::Result<()> {
 
 /// 启动替换后的新版本；调用方随后退出。stdio 置空，免得父进程退出后子进程写管道被杀。
 pub fn relaunch(root: &Path, reopen: Option<&SessionKey>) -> io::Result<()> {
-    let args: Vec<String> = reopen
-        .map(|key| vec![REOPEN_ARG.to_string(), encode_key(key)])
-        .unwrap_or_default();
+    let mut args = vec![UPDATED_ARG.to_string()];
+    if let Some(key) = reopen {
+        args.extend([REOPEN_ARG.to_string(), encode_key(key)]);
+    }
     let mut command = if cfg!(target_os = "macos") {
         let mut open = Command::new("open");
         open.arg("-n").arg(root).arg("--args");

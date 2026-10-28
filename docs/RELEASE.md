@@ -195,7 +195,8 @@ Windows 用户目录优先取非空 `USERPROFILE`，缺失时回退 `HOME`；`LO
 - 安装：点击后下载本平台桌面归档和 `SHA256SUMS`，校验通过才在安装根旁的
   `.agentdeck-update-<pid>/` 里解压，再替换安装根：macOS / Linux 整目录改名交换，
   Windows 逐个文件改名（运行中的 EXE 只能改名不能覆盖）。旧文件留在该暂存目录，
-  下次启动时删除，在此之前可手动挪回回滚。安装位置不可写时提示手动下载。
+  更新后自动重启的那次不清理，用户下次手动启动时才删除，在此之前可手动挪回回滚。
+  安装位置不可写时提示手动下载。
 - 重启：按钮变为「重启以更新」；有会话在工作或待确认时先等它们空闲，再点一次立即重启。
   新版本启动后自动打开重启前停留的会话（续聊照常使用原 thread）。重启会结束 daemon 及
   其 vendor 子进程，进行中的轮次会被打断。
@@ -204,7 +205,8 @@ Windows 用户目录优先取非空 `USERPROFILE`，缺失时回退 `HOME`；`LO
   ad-hoc 签名，更新后本地网络等系统授权可能需要重新确认。
 - 远端机器的 `agentdeckd` 不随桌面端自动更新，仍在机器页按桌面配套版本升级。
 - 测试时可用 `AGENTDECK_UPDATE_URL` 把 Release 根地址（默认
-  `https://github.com/Jassy930/AgentDeck/releases`）指向本地服务。
+  `https://github.com/Jassy930/AgentDeck/releases`）指向本地服务；被测安装根同样需要
+  `RELEASE-VERSION`，本地服务要对 `HEAD /latest` 返回指向 `…/tag/v<版本>` 的 302。
 
 ## 独立 agentdeckd
 
