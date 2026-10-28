@@ -47,6 +47,7 @@
 **不受影响的情况**：
 
 - fcitx5 走 XIM 时发送 UTF-8 段（`ESC % G`），所以不会崩。
+- fcitx4（搜狗输入法 Linux 版基于它）的 XIM 前端和 ibus 一样按 locale 编码，修复前同样崩溃。
 - Wayland 会话下，gpui 走 text-input-v3，不经过 XIM，也不会崩。
 
 **修复**：
@@ -75,7 +76,7 @@ cargo test -p xim-ctext
 
 | 脚本 | 会话 | 按键注入 | 截图 |
 |---|---|---|---|
-| `x11.sh <ibus\|fcitx5> [display]` | Xvfb + XIM | xdotool | ImageMagick `import`，每步一张 |
+| `x11.sh <ibus\|fcitx5\|fcitx4> [display]` | Xvfb + XIM | xdotool | ImageMagick `import`，每步一张 |
 | `wayland.sh [名称]` | `gnome-shell --headless --no-x11` + ibus | Mutter RemoteDesktop D-Bus | Mutter ScreenCast + PipeWire，每秒一帧 |
 
 ```bash
@@ -84,6 +85,13 @@ cargo build -p agentdeck-desktop
 LANG=zh_CN.UTF-8 scripts/linux-ime/x11.sh ibus 90      # 输出 ALIVE 或 APP DIED at step N
 LANG=zh_CN.UTF-8 scripts/linux-ime/x11.sh fcitx5 91
 LANG=zh_CN.UTF-8 scripts/linux-ime/wayland.sh zh
+```
+
+fcitx4 不装在 dt 主机上（避免和主机的 fcitx5/ibus 配置互相影响），放在容器里跑（镜像 `agentdeck-ime-fcitx4`，`scripts/linux-ime/fcitx4.Dockerfile`）：
+
+```bash
+docker run --rm -v ~/agentdeck-ime:/work -v /tmp/ime-out:/out -e LANG=zh_CN.UTF-8 \
+  -e OUT_DIR=/out/fcitx4 agentdeck-ime-fcitx4 /work/scripts/linux-ime/x11.sh fcitx4 95
 ```
 
 坑点：
@@ -104,3 +112,5 @@ LANG=zh_CN.UTF-8 scripts/linux-ime/wayland.sh zh
 
 - **未打补丁的 master**：zh_CN + ibus 在第 3 步（第一次出现中文预编辑）就崩溃；en_US + ibus 在第 5 步崩溃。
 - **打补丁后**：zh_CN 和 en_US 下，ibus 和 fcitx5 的 X11 组合，以及 zh_CN 下 ibus 的 Wayland 组合，都跑完了全部步骤，截图里的预编辑和上屏文字正确。
+
+2026-10-28 在 dt 上用 fcitx4 + fcitx-pinyin（容器）补测：未打补丁时 zh_CN 在第 3 步、en_US 在第 5 步崩溃（`client.rs:237`，和 ibus 完全一致）；当前 master 两个 locale 都跑完全部步骤，文字正确。

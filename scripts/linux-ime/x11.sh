@@ -2,18 +2,19 @@
 # Linux 桌面端中文输入法无头回归（X11/XIM）。在带 ibus / fcitx5 的 Linux 主机（如 dt）上运行，
 # 不触碰真实桌面会话：Xvfb 独立 display + 私有 dbus 会话 + 独立 HOME，输入法和应用都只活在其中。
 #
-# 用法：scripts/linux-ime/x11.sh <ibus|fcitx5> [display号] [步骤...]
+# 用法：scripts/linux-ime/x11.sh <ibus|fcitx5|fcitx4> [display号] [步骤...]
 #   步骤：type:<文本>  key:<xdotool 键名>  sleep:<秒>；省略时使用默认拼音序列。
 # 环境变量：
 #   APP_BIN  桌面端二进制，默认 target/debug/agentdeck-desktop
 #   LANG     影响 ibus-x11 的 COMPOUND_TEXT 字符集（zh_CN.UTF-8 → GB2312），务必覆盖 zh_CN
+#   FCITX4_IM  fcitx4 的引擎名，默认 pinyin；搜狗为 sogoupinyin
 #   OUT_DIR  输出目录，默认 /tmp/agentdeck-ime-<im>-<display>
 # 输出：$OUT_DIR/result（ALIVE 或 APP DIED at step N）、app.log（含 panic backtrace）、im.log、每步截图。
 #
 # 依赖（Ubuntu 24.04）：xvfb xdotool imagemagick mesa-vulkan-drivers dbus ibus-libpinyin
 #   fcitx5 fcitx5-chinese-addons。Xvfb 没有 DRI3，必须用 lavapipe 软件 Vulkan（VK_DRIVER_FILES）。
 set -u
-IM=${1:?用法: $0 <ibus|fcitx5> [display] [步骤...]}
+IM=${1:?用法: $0 <ibus|fcitx5|fcitx4> [display] [步骤...]}
 D=${2:-91}
 shift $(($# >= 2 ? 2 : 1))
 STEPS=${*:-type:nihao key:space type:zhongwenshurufa key:space type:ni key:BackSpace key:BackSpace type:hao key:Escape type:ceshi key:Return type:wo key:Left key:space key:ctrl+a type:ni key:1}
@@ -27,7 +28,7 @@ mkdir -p "$OUT/home" "$OUT/run"
 chmod 700 "$OUT/run"
 export HOME=$OUT/home XDG_CONFIG_HOME=$OUT/home/.config XDG_DATA_HOME=$OUT/home/.local/share \
   XDG_CACHE_HOME=$OUT/home/.cache XDG_RUNTIME_DIR=$OUT/run DISPLAY=:$D
-export IM OUT APP_BIN STEPS LVP
+export IM OUT APP_BIN STEPS LVP FCITX4_IM=${FCITX4_IM:-pinyin}
 
 Xvfb ":$D" -screen 0 1600x1000x24 >"$OUT/xvfb.log" 2>&1 &
 XVFB=$!
@@ -40,6 +41,13 @@ if [ "$IM" = ibus ]; then
   ibus-daemon --xim --panel disable -r >"$OUT/im.log" 2>&1 &
   sleep 3
   ibus engine libpinyin
+elif [ "$IM" = fcitx4 ]; then
+  export XMODIFIERS=@im=fcitx GTK_IM_MODULE=fcitx QT_IM_MODULE=fcitx
+  mkdir -p "$XDG_CONFIG_HOME/fcitx"
+  printf "[Profile]\nIMName=$FCITX4_IM\nEnabledIMList=fcitx-keyboard-us:True,$FCITX4_IM:True\n" >"$XDG_CONFIG_HOME/fcitx/profile"
+  printf "[Program]\nDefaultInputMethodState=Active\nShareStateAmongWindow=All\n" >"$XDG_CONFIG_HOME/fcitx/config"
+  fcitx -d >"$OUT/im.log" 2>&1
+  sleep 5
 else
   export XMODIFIERS=@im=fcitx GTK_IM_MODULE=fcitx QT_IM_MODULE=fcitx
   mkdir -p "$XDG_CONFIG_HOME/fcitx5"
