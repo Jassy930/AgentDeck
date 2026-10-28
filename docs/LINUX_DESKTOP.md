@@ -48,6 +48,7 @@
 
 - fcitx5 走 XIM 时发送 UTF-8 段（`ESC % G`），所以不会崩。
 - fcitx4（搜狗输入法 Linux 版基于它）的 XIM 前端和 ibus 一样按 locale 编码，修复前同样崩溃。
+  搜狗把预编辑画在自己的候选窗里、不经 XIM，所以它在**选词上屏**时才崩（`client.rs:190`），不是一出预编辑就崩。
 - Wayland 会话下，gpui 走 text-input-v3，不经过 XIM，也不会崩。
 
 **修复**：
@@ -114,3 +115,15 @@ docker run --rm -v ~/agentdeck-ime:/work -v /tmp/ime-out:/out -e LANG=zh_CN.UTF-
 - **打补丁后**：zh_CN 和 en_US 下，ibus 和 fcitx5 的 X11 组合，以及 zh_CN 下 ibus 的 Wayland 组合，都跑完了全部步骤，截图里的预编辑和上屏文字正确。
 
 2026-10-28 在 dt 上用 fcitx4 + fcitx-pinyin（容器）补测：未打补丁时 zh_CN 在第 3 步、en_US 在第 5 步崩溃（`client.rs:237`，和 ibus 完全一致）；当前 master 两个 locale 都跑完全部步骤，文字正确。
+
+同日用搜狗输入法 4.2.1.145（官方 amd64 deb，下载页有验证码，需手动下载）补测。镜像在 `agentdeck-ime-fcitx4` 之上派生，Ubuntu 上 postinst 会挪走搜狗自带的 Qt5，要装系统 Qt5：
+
+```dockerfile
+FROM agentdeck-ime-fcitx4
+COPY sogou.deb /tmp/sogou.deb
+RUN apt-get update && apt-get install -y --no-install-recommends /tmp/sogou.deb fcitx-module-dbus \
+      libqt5qml5 libqt5quick5 libqt5quickwidgets5 qml-module-qtquick2 libgsettings-qt1 \
+      libqt5svg5 librsvg2-2 libasound2t64 libpulse0 libxss1
+```
+
+运行时加 `-e FCITX4_IM=sogoupinyin`。结果：未打补丁时 zh_CN 在第 4 步（首次选词上屏）、en_US 在第 17 步崩溃，均为 `client.rs:190`；当前 master 两个 locale 都跑完全部步骤，截图里搜狗状态栏和上屏文字正确。
