@@ -5,6 +5,7 @@
 //! 助手、思考与过程块正文按 Markdown 渲染（代码走围栏高亮）；用户消息仍是纯文本。
 
 use std::collections::HashSet;
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -506,11 +507,20 @@ impl VisibleRows {
     }
 
     /// 块内容变了（live 追加或流式快照）：保留已展开的组重算可见行。
-    /// 返回 true 表示调用方要重置列表。
-    fn sync(&mut self, blocks: &Rc<[Block]>) -> bool {
+    /// 返回要交给 `ListState::splice` 的旧行区间和新行数；`None` 表示没变。
+    /// 只重排从第一个不同块开始的尾部：前面的行高保留，滚动条总高才不会每次归零。
+    fn sync(&mut self, blocks: &Rc<[Block]>) -> Option<(Range<usize>, usize)> {
         if Rc::ptr_eq(&self.source, blocks) {
-            return false;
+            return None;
         }
+        let same = self
+            .source
+            .iter()
+            .zip(blocks.iter())
+            .take_while(|(old, new)| old == new)
+            .count();
+        let row = self.indices.partition_point(|&ix| ix < same);
+        let old_rows = self.indices.len();
         self.source = blocks.clone();
         self.indices = blocks
             .iter()
@@ -522,7 +532,7 @@ impl VisibleRows {
                     .then_some(ix)
             })
             .collect();
-        true
+        Some((row..old_rows, self.indices.len() - row))
     }
 
     fn toggle_group(&mut self, row: usize, start: usize, len: usize, list: &ListState) {
@@ -539,9 +549,29 @@ impl VisibleRows {
     }
 }
 
-/// 块所在的可见行：块本身可见就是它那行，被折叠时落到包含它的组首行。
-fn row_for_block(indices: &[usize], block: usize) -> usize {
-    indices.partition_point(|&ix| ix <= block).saturating_sub(1)
+/// 把锚点换到块现在所在的行：块本身可见就保留行内偏移，被并进组时停在组首行顶部。
+fn remap_anchor(mut anchor: ListOffset, block: usize, indices: &[usize]) -> ListOffset {
+    anchor.item_ix = indices.partition_point(|&ix| ix <= block).saturating_sub(1);
+    if indices.get(anchor.item_ix) != Some(&block) {
+        anchor.offset_in_item = px(0.);
+    }
+    anchor
+}
+
+/// 停在底部才跟随新内容；往上翻看时保持原位置。
+/// max_offset_for_scrollbar 不含列表上下内边距，真实滚动上限要再加回来；
+/// 它为 0 时内容不足一屏（最多能滚动内边距那点距离），视为在底部。
+fn at_bottom(state: &ListState) -> bool {
+    let max = state.max_offset_for_scrollbar().height;
+    max == px(0.)
+        || -state.scroll_px_offset_for_scrollbar().y >= max + px(EDGE_FADE_HEIGHT * 2.) - px(1.)
+}
+
+fn scroll_to_end(state: &ListState) {
+    state.scroll_to(ListOffset {
+        item_ix: state.item_count(),
+        offset_in_item: px(0.),
+    });
 }
 
 /// 组摘要：步数加按首次出现顺序的各类计数，如“5 步 · 命令 3 · 思考 2”；另返回失败数。
@@ -675,42 +705,51 @@ pub fn render(
         |_, _| VisibleRows::new(&blocks),
     );
     visible.update(cx, |rows, _| {
-        // 行号会随折叠重算而变，滚动锚点按原始块下标记，sync 后再换回行号。
-        let mut anchor = state.logical_scroll_top();
+        // 行号会随折叠重算而变，滚动锚点按原始块下标记，重排后再换回行号。
+        let anchor = state.logical_scroll_top();
         let anchor_block = rows.indices.get(anchor.item_ix).copied();
-        // 读完历史时列表按历史块数重置过，这时可能已拼上了运行中的 live 轮次。
-        if rows.sync(&blocks) || state.item_count() != rows.indices.len() {
-            // 原本停在底部才跟随新内容；往上翻看时保持原位置。按旧行高判断，须在 reset 之前。
-            // max_offset_for_scrollbar 不含列表上下内边距，真实滚动上限要再加回来；
-            // 它为 0 时内容不足一屏（最多能滚动内边距那点距离），视为在底部。
-            let max = state.max_offset_for_scrollbar().height;
-            let at_bottom = max == px(0.)
-                || -state.scroll_px_offset_for_scrollbar().y
-                    >= max + px(EDGE_FADE_HEIGHT * 2.) - px(1.);
-            if let Some(block) = anchor_block {
-                let row = row_for_block(&rows.indices, block);
-                if rows.indices.get(row) != Some(&block) {
-                    // 锚点块被并进了组，停在组首行顶部。
-                    anchor.offset_in_item = px(0.);
-                }
-                anchor.item_ix = row;
+        let splice = rows.sync(&blocks);
+        if splice.is_none() && state.item_count() == rows.indices.len() {
+            return;
+        }
+        // 按旧行高判断是否跟随，须在 splice/reset 之前。
+        let follow = at_bottom(&state);
+        let moved = match splice {
+            // splice 保住前面行的已测高度；锚点在重排区之前时原地不动，
+            // 落在重排区内（比如正往上翻看流式中的长消息）时 splice 会把偏移清零，要按块恢复。
+            Some((range, count)) if range.end == state.item_count() => {
+                state.splice(range.clone(), count);
+                range.contains(&anchor.item_ix)
             }
-            let count = rows.indices.len();
-            // reset 会清空行高和滚动位置；定位到末尾后，布局会从底部往上填满视口。
-            state.reset(count);
-            state.scroll_to(if at_bottom {
-                ListOffset {
-                    item_ix: count,
-                    offset_in_item: px(0.),
-                }
-            } else {
-                anchor
-            });
+            // 读完历史时列表按历史块数重置过，这时可能已拼上了运行中的 live 轮次。
+            _ => {
+                state.reset(rows.indices.len());
+                true
+            }
+        };
+        if follow {
+            // 定位到末尾后，布局会从底部往上填满视口。
+            scroll_to_end(&state);
+        } else if moved && let Some(block) = anchor_block {
+            state.scroll_to(remap_anchor(anchor, block, &rows.indices));
         }
     });
     let list_state = state.clone();
     // 常驻显示：长会话需要随时看到当前位置，不跟随系统的自动隐藏。
     let scrollbar = Scrollbar::vertical(&state).scrollbar_show(ScrollbarShow::Always);
+    let indices = visible.read(cx).indices.clone();
+    let rail = turn_rail(&blocks, &indices, &state, read_id, window, cx);
+    let latest = (!at_bottom(&state)).then(|| {
+        let state = state.clone();
+        Button::new("transcript-latest")
+            .icon(Icon::empty().path(crate::CHEVRON_DOWN_ICON))
+            .rounded_full()
+            .tooltip("回到最新")
+            .on_click(move |_, window, _| {
+                scroll_to_end(&state);
+                window.refresh();
+            })
+    });
     let rows = list(state, move |row, window, cx| {
         let ix = visible.read(cx).indices[row];
         let block = &blocks[ix];
@@ -931,6 +970,160 @@ pub fn render(
         .child(edge_fade(false, cx))
         // Scrollbar 自身是绝对定位但不带 inset，直接放在列表后面会落到列表下方。
         .child(div().absolute().inset_0().child(scrollbar))
+        .children(rail)
+        .children(latest.map(|button| div().absolute().right(px(36.)).bottom_4().child(button)))
+}
+
+/// 轮次点未放大时的间距；轮数多到放不下时整体压缩。
+const RAIL_SPACING: f32 = 14.;
+/// 光标正下方的点额外占的高度，Dock 式放大让密集的点也能点中。
+const RAIL_GROW: f32 = 14.;
+const RAIL_DOT: f32 = 6.;
+const RAIL_DOT_GROW: f32 = 8.;
+
+/// 光标在 rail 上的位置（相对 rail 顶部）；rail 尺寸取上一帧的布局结果。
+#[derive(Default)]
+struct RailHover {
+    y: Option<f32>,
+    bounds: gpui::Bounds<gpui::Pixels>,
+}
+
+/// 每个点的 `(中心 y, 占位高度, 放大权重 0..=1)`，坐标相对 rail 顶部。
+/// 光标附近的间距按余弦曲线拉开，位移向上下两侧累积：光标处的点不动，两端被推开。
+fn rail_layout(count: usize, height: f32, hover: Option<f32>) -> Vec<(f32, f32, f32)> {
+    use std::f32::consts::PI;
+    let spacing = RAIL_SPACING.min(height / count as f32).max(1.);
+    let top = (height - spacing * count as f32) / 2.;
+    // 影响半径按点数计：点再密，也是光标附近几个点被拉开。
+    let radius = spacing * 4.;
+    (0..count)
+        .map(|i| {
+            let y = top + (i as f32 + 0.5) * spacing;
+            let Some(mouse) = hover else {
+                return (y, spacing, 0.);
+            };
+            let d = (y - mouse).abs().min(radius);
+            let weight = (1. + (PI * d / radius).cos()) / 2.;
+            // weight 从光标积分到该点：两者之间多出来的总高度。
+            let shift =
+                RAIL_GROW / spacing * (d / 2. + radius / (2. * PI) * (PI * d / radius).sin());
+            (
+                y + shift.copysign(y - mouse),
+                spacing + RAIL_GROW * weight,
+                weight,
+            )
+        })
+        .collect()
+}
+
+/// 右侧轮次导航：每条用户消息一个点，当前阅读的轮次高亮，hover 跟随放大并看摘要，点击跳过去。
+fn turn_rail(
+    blocks: &[Block],
+    indices: &[usize],
+    state: &ListState,
+    read_id: u64,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) -> Option<gpui::Stateful<gpui::Div>> {
+    let turns: Vec<(usize, &Block)> = indices
+        .iter()
+        .enumerate()
+        .filter(|(_, ix)| blocks[**ix].label == "你")
+        .map(|(row, ix)| (row, &blocks[*ix]))
+        .collect();
+    if turns.len() < 2 {
+        return None;
+    }
+    let top = state.logical_scroll_top().item_ix;
+    let current = turns
+        .partition_point(|(row, _)| *row <= top)
+        .saturating_sub(1);
+    let (muted, accent) = (cx.theme().muted_foreground, cx.theme().primary);
+    let hover = window.use_keyed_state(
+        SharedString::from(format!("transcript-rail-{read_id}")),
+        cx,
+        |_, _| RailHover::default(),
+    );
+    let (mouse, bounds) = {
+        let hover = hover.read(cx);
+        (hover.y, hover.bounds)
+    };
+    let layout = rail_layout(turns.len(), f32::from(bounds.size.height), mouse);
+    let (measure, track, leave) = (hover.clone(), hover.clone(), hover);
+    Some(
+        div()
+            .id("transcript-rail")
+            .absolute()
+            .right(px(14.))
+            .top(px(EDGE_FADE_HEIGHT))
+            .bottom(px(EDGE_FADE_HEIGHT))
+            .w(px(20.))
+            // 窗口尺寸变了要按新高度重排，多画一帧。
+            .child(
+                gpui::canvas(
+                    move |bounds, window, cx| {
+                        measure.update(cx, |hover, _| {
+                            if hover.bounds != bounds {
+                                hover.bounds = bounds;
+                                window.refresh();
+                            }
+                        })
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .on_mouse_move(move |event, _, cx| {
+                track.update(cx, |hover, cx| {
+                    hover.y = Some(f32::from(event.position.y - hover.bounds.origin.y));
+                    cx.notify();
+                })
+            })
+            .on_hover(move |hovered, _, cx| {
+                if !hovered {
+                    leave.update(cx, |hover, cx| {
+                        hover.y = None;
+                        cx.notify();
+                    })
+                }
+            })
+            .children(turns.into_iter().zip(layout).enumerate().map(
+                |(n, ((row, block), (center, slot, weight)))| {
+                    let state = state.clone();
+                    let tip: SharedString =
+                        format!("第 {} 轮 · {}", n + 1, one_line(&block.body)).into();
+                    let active = n == current;
+                    let dot = RAIL_DOT + if active { 2. } else { 0. } + RAIL_DOT_GROW * weight;
+                    div()
+                        .id(ElementId::NamedInteger("transcript-turn".into(), n as u64))
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .top(px(center - slot / 2.))
+                        .h(px(slot))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .child(div().size(px(dot)).rounded_full().bg(if active {
+                            accent
+                        } else {
+                            muted.opacity(0.5 + 0.5 * weight)
+                        }))
+                        .tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                        })
+                        .on_click(move |_, window, _| {
+                            state.scroll_to(ListOffset {
+                                item_ix: row,
+                                offset_in_item: px(0.),
+                            });
+                            window.refresh();
+                        })
+                },
+            )),
+    )
 }
 
 fn edge_fade(top: bool, cx: &gpui::App) -> gpui::Div {
@@ -952,7 +1145,7 @@ fn edge_fade(top: bool, cx: &gpui::App) -> gpui::Div {
 mod tests {
     use super::{
         BODY_LIMIT, Block, CONTEXT_KIND_KEY, VisibleRows, append, collapsed_indices, copy_text,
-        describe, fence, is_binary, prepare, prepare_live, row_for_block, truncate,
+        describe, fence, is_binary, prepare, prepare_live, rail_layout, remap_anchor, truncate,
     };
     use agentdeck_protocol::{
         AgentItem, AgentItemMeta, HistoryTurn, PlanStep, PlanStepStatus, ShellStatus,
@@ -1402,12 +1595,25 @@ mod tests {
     }
 
     #[test]
-    fn scroll_anchor_follows_block_across_regrouping() {
-        // 块 3 原本单独成行，重算后并进了从 2 开始的组。
-        assert_eq!(row_for_block(&[0, 1, 2, 3, 6], 3), 3);
-        assert_eq!(row_for_block(&[0, 1, 2, 6], 3), 2);
-        assert_eq!(row_for_block(&[0, 1, 2, 6], 6), 3);
-        assert_eq!(row_for_block(&[0, 4], 0), 0);
+    fn rail_magnifies_around_the_cursor_and_keeps_order() {
+        let calm = rail_layout(5, 200., None);
+        assert!(
+            calm.iter()
+                .all(|&(_, slot, weight)| slot == 14. && weight == 0.)
+        );
+        assert_eq!(calm[2].0, 100.);
+
+        // 光标正对中间的点：它不动且放到最大，两侧对称推开，顺序不乱。
+        let hovered = rail_layout(5, 200., Some(100.));
+        assert_eq!(hovered[2], (100., 28., 1.));
+        assert!((hovered[1].0 + hovered[3].0 - 200.).abs() < 1e-3);
+        assert!(hovered.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert!(hovered[0].0 < calm[0].0 && hovered[4].0 > calm[4].0);
+
+        // 几百轮压缩到 1px 间距时，光标处的点仍有可点的高度。
+        let crowded = rail_layout(400, 400., Some(200.));
+        let near = crowded.iter().map(|&(_, slot, _)| slot).fold(0., f32::max);
+        assert!(near > 14.);
     }
 
     #[test]
@@ -1428,14 +1634,33 @@ mod tests {
         let mut rows = VisibleRows::new(&history);
         let list = ListState::new(rows.indices.len(), ListAlignment::Top, px(1000.));
         rows.toggle_group(1, 1, 2, &list);
-        assert!(!rows.sync(&history), "same blocks need no reset");
+        assert_eq!(rows.sync(&history), None, "same blocks need no reset");
 
         let live = prepare(vec![HistoryTurn {
             items: vec![message("新"), process(), process()],
         }]);
         let combined: Rc<[Block]> = append(&history, live).into();
         assert_eq!(combined[4].group, Some((4, 2)));
-        assert!(rows.sync(&combined));
+        // 历史 3 行原样保留，只追加 live 的 2 行。
+        assert_eq!(rows.sync(&combined), Some((3..3, 2)));
         assert_eq!(rows.indices, [0, 1, 2, 3, 4]);
+
+        // 流式更新只改了末尾的组（组首摘要随成员变化）：只重排最后一行。
+        let mut streamed = combined.to_vec();
+        streamed[4].summary = Some("更新".into());
+        assert_eq!(rows.sync(&streamed.into()), Some((4..5, 1)));
+
+        // 往上翻看流式中的那一行：重排后行内偏移保留；块被并进组时停在组首行顶部。
+        let anchor = ListOffset {
+            item_ix: 4,
+            offset_in_item: px(30.),
+        };
+        let kept = remap_anchor(anchor, 4, &rows.indices);
+        assert_eq!((kept.item_ix, kept.offset_in_item), (4, px(30.)));
+        assert_eq!(remap_anchor(anchor, 5, &rows.indices).item_ix, 4);
+        assert_eq!(
+            remap_anchor(anchor, 5, &rows.indices).offset_in_item,
+            px(0.)
+        );
     }
 }
