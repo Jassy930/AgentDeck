@@ -237,6 +237,7 @@ jobs:
           path: |
             dist/release/*.tar.gz
             dist/release/*.zip
+            dist/release/*.dmg
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
@@ -298,7 +299,7 @@ jobs:
             cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
           macOS 15+ Apple Silicon / Intel、Ubuntu 24.04 x86_64 / ARM64、Windows x64 桌面包与独立 daemon；保留 Linux x86_64 / ARM64 musl daemon。
 
-          macOS 产物使用 ad-hoc 签名，未经 Apple 公证；不能视为 Developer ID 公证发行版。Windows zip 未作 Authenticode 签名，构建及烟测基线为 Windows Server 2025。Windows ARM64 不在支持范围。
+          macOS 提供 DMG（拖拽安装）与 tar.gz 两种封装，内容相同；macOS 产物使用 ad-hoc 签名，未经 Apple 公证；不能视为 Developer ID 公证发行版。Windows zip 未作 Authenticode 签名，构建及烟测基线为 Windows Server 2025。Windows ARM64 不在支持范围。
 
           安装方法和系统依赖见本 tag 的 docs/RELEASE.md；下载后请使用 SHA256SUMS 校验，可用 gh attestation verify <归档> --repo ${{ github.repository }} 核验构建来源。
           NOTES

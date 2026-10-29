@@ -11,8 +11,10 @@ asset_dir="$(cd "$1" && pwd)"
 version="$("$root/scripts/release/check-version.sh")"
 commit="$(git -C "$root" rev-parse HEAD)"
 assets=(
+  AgentDeck-aarch64-apple-darwin.dmg
   AgentDeck-aarch64-apple-darwin.tar.gz
   AgentDeck-aarch64-unknown-linux-gnu.tar.gz
+  AgentDeck-x86_64-apple-darwin.dmg
   AgentDeck-x86_64-apple-darwin.tar.gz
   AgentDeck-x86_64-pc-windows-msvc.zip
   AgentDeck-x86_64-unknown-linux-gnu.tar.gz
@@ -48,6 +50,8 @@ done
 for asset in "${assets[@]}"; do
   archive="$asset_dir/$asset"
   [[ -f "$archive" && ! -L "$archive" ]] || fail "missing asset: $asset"
+  # Linux 聚合 job 读不了 DMG；内容已由 macOS smoke 挂载核对，这里只要求存在并计入校验和。
+  [[ "$asset" != *.dmg ]] || continue
   target="${asset#*-}"
   target="${target%.tar.gz}"
   target="${target%.zip}"

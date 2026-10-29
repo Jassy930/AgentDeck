@@ -74,6 +74,16 @@ if [[ "$kind" == desktop ]]; then
     done
     cmp "$root/assets/brand/AgentDeck.icns" "$bundle/Contents/Resources/AgentDeck.icns"
     /usr/bin/codesign --verify --deep --strict "$bundle"
+    mount="$scratch/dmg"
+    /usr/bin/hdiutil attach -quiet -readonly -nobrowse -mountpoint "$mount" "$output_dir/AgentDeck-$target.dmg"
+    dmg_status=0
+    /usr/bin/codesign --verify --deep --strict "$mount/AgentDeck.app" \
+      && cmp "$desktop" "$mount/AgentDeck.app/Contents/MacOS/AgentDeck" \
+      && cmp "$daemon" "$mount/AgentDeck.app/Contents/MacOS/agentdeckd" \
+      && [[ "$(readlink "$mount/Applications")" == /Applications ]] \
+      || dmg_status=$?
+    /usr/bin/hdiutil detach -quiet "$mount"
+    [[ "$dmg_status" == 0 ]] || { release_fail 'DMG contents differ from the tar.gz bundle'; exit 1; }
   else
     bundle="$scratch/desktop/AgentDeck"
     desktop="$bundle/agentdeck-desktop"
