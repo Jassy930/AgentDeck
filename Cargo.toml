@@ -6,6 +6,8 @@ members = [
     "agentdeck-desktop",
     "third_party/xim-ctext",
 ]
+# 补丁版 gpui-component 只作依赖，不进 workspace 的 fmt/test。
+exclude = ["third_party/gpui-component"]
 resolver = "3"
 
 [workspace.package]
@@ -36,3 +38,7 @@ debug = 0
 # 上游 gpui 升级到修复版本后可删除此补丁与 third_party/xim-ctext。
 [patch.crates-io]
 xim-ctext = { path = "third_party/xim-ctext" }
+# gpui-component 0.5.1 的 Markdown 列表项正文 div 没有 flex_1/min_w_0：正文按整行宽度折行，
+# 却在减去「• 」「1. 」前缀后的宽度里裁剪，每行末尾被吞掉约一个前缀宽的字。
+# 上游 0.6.0 已修，但 0.6+ 依赖 gpui-pre 0.3；升级 gpui 后可删除此补丁与 third_party/gpui-component。
+gpui-component = { path = "third_party/gpui-component" }
