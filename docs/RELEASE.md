@@ -207,6 +207,12 @@ Windows 用户目录优先取非空 `USERPROFILE`，缺失时回退 `HOME`；`LO
 - 测试时可用 `AGENTDECK_UPDATE_URL` 把 Release 根地址（默认
   `https://github.com/Jassy930/AgentDeck/releases`）指向本地服务；被测安装根同样需要
   `RELEASE-VERSION`，本地服务要对 `HEAD /latest` 返回指向 `…/tag/v<版本>` 的 302。
+- 验证记录（2026-10-29，debug 构建加临时自动点击补丁，补丁不入库）：macOS 本地 302 服务
+  0.1.5→0.1.6；dt（Ubuntu x86_64，Xvfb）本地服务 0.1.5→0.1.6，并确认新实例重新打开原会话；
+  dt 与 bamboo-win（Windows 11 x64）把功能构建标成 0.1.4，从真实 GitHub 升级到正式
+  v0.1.5，SHA256SUMS 校验、替换（Windows 运行中的 EXE 被改名移入暂存目录）、`--updated`
+  重启均通过，Windows 截图确认新版窗口正常显示。未验证：等会话空闲后重启、macOS 真实
+  GitHub 链路、Linux ARM64 / macOS Intel。
 
 ## 独立 agentdeckd
 
