@@ -567,7 +567,7 @@ fn at_bottom(state: &ListState) -> bool {
         || -state.scroll_px_offset_for_scrollbar().y >= max + px(EDGE_FADE_HEIGHT * 2.) - px(1.)
 }
 
-fn scroll_to_end(state: &ListState) {
+pub(crate) fn scroll_to_end(state: &ListState) {
     state.scroll_to(ListOffset {
         item_ix: state.item_count(),
         offset_in_item: px(0.),
