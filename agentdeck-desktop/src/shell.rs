@@ -136,6 +136,8 @@ impl Stage {
             *transcript = match read {
                 Ok((turns, warnings)) => {
                     list.reset(transcript::collapsed_indices(&turns).count());
+                    // 进入会话默认停在最新消息。
+                    transcript::scroll_to_end(list);
                     let history: Rc<[transcript::Block]> = turns.into();
                     Transcript::Ready {
                         blocks: history.clone(),
