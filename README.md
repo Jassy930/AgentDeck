@@ -72,6 +72,7 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
 - 会话态底部是消息输入框（Enter 发送，macOS 为 ⌘Enter 换行，Linux/Windows 为 Ctrl+Enter，运行中切为“停止”）：首次发送使用
   `SessionStart`，已有会话携带原 threadId 续聊，新建会话不带 resumeThreadId；之后同一 daemon 会话内发 `TurnStart`。
   流式条目接在历史记录之后，按 agent 与会话声明的能力启用发送和审批；能力查询失败可就地重试。
+  实时轮次的用户消息由本地输入渲染，Codex app-server 回显的 `userMessage` 条目在实时流中丢弃，避免同一轮显示两遍；读取历史时仍按记录显示用户消息。
   命令与工具卡片行尾统一显示状态与耗时（“运行中 · 30.0s”“失败 · 1.5s”），Claude Code 长时间运行的工具每约 30 秒刷新一次耗时。
   工具审批按到达顺序在输入框上方显示审批卡（命令、patch、写入内容或计划全文；拒绝 / 允许 / 总是允许，计划为
   继续规划 / 开始执行，agent 提问时与 Claude Code TUI 一样一题一页、tab 切换，多题末尾有汇总提交页，支持键盘操作和“其他”自由输入，也可跳过；拒绝时输入框文字作为反馈），错误显示在输入框上方。输入框左侧是权限模式选择器

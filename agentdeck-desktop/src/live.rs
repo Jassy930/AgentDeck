@@ -481,6 +481,11 @@ impl LiveSession {
             ServerEvent::SessionCapabilities { capabilities, .. } => {
                 self.capabilities = Some(capabilities);
             }
+            // Codex 会把本轮输入回显成 userMessage；首条用户消息已由 prompt 渲染。
+            ServerEvent::AgentItem {
+                item: AgentItem::UserMessage { .. },
+                ..
+            } => return false,
             ServerEvent::AgentItem { item_id, item, .. } => {
                 let Some(turn) = self.turns.last_mut() else {
                     return false;
@@ -1236,6 +1241,30 @@ mod tests {
         let (turn, images) = &live.turns()[0];
         assert!(matches!(&turn.items[0], AgentItem::UserMessage { text, .. } if text.is_empty()));
         assert_eq!(images, &vec![thumbnail]);
+    }
+
+    #[test]
+    fn echoed_user_message_is_not_rendered_twice() {
+        let mut live = session();
+        send(&mut live, "pong");
+        let echo = ServerEvent::AgentItem {
+            session_id: SessionId("s".into()),
+            thread_id: ThreadId("thread".into()),
+            agent_kind: AgentKind::Codex,
+            turn_id: TurnId("t".into()),
+            item_id: "u".into(),
+            state: AgentItemState::Completed,
+            item: AgentItem::UserMessage {
+                text: "pong".into(),
+                images: Vec::new(),
+                meta: AgentItemMeta::default(),
+            },
+        };
+        assert!(!live.apply(echo));
+        live.apply(message("m", "ok"));
+        let items = &live.turns()[0].0.items;
+        assert_eq!(items.len(), 2);
+        assert!(matches!(&items[1], AgentItem::AssistantMessage { .. }));
     }
 
     #[test]
