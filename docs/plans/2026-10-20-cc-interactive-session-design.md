@@ -45,6 +45,12 @@ claude --print --input-format stream-json --output-format stream-json \
   --verbose --permission-mode <mode> [--resume <id> | --session-id <uuid>] ...
 ```
 
+子进程环境固定覆盖 `CLAUDE_CODE_ENTRYPOINT=agentdeck`（2026-11-03）：`-p` 默认记为 `sdk-cli`，
+订阅 5 小时窗口按每 token 约 1.7–2.2 倍计入；自定义标签实测与交互 TUI（`cli`）同费率
+（anthropics/claude-code#97074 评论）。必须覆盖而不是只在缺省时设置，因为从 CC 会话里启动的 daemon 会继承 `sdk-cli`。
+这是非官方 workaround；若日后自定义标签也被加权，替代方案是 PTY 驱动 TUI 的 shim（参考 yetone/magpie `internal/claudetui`），
+但它要重做审批、提问卡、中断、切模式和流式输出，需另立设计文档。
+
 新会话由 daemon 生成 `--session-id`，因此 `threadId` 在 `SessionStarted` 里就确定了，后续所有事件都带上它。
 
 ## 协议事实（claude 2.1.304 实测，2026-10-20）

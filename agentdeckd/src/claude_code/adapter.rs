@@ -85,6 +85,13 @@ impl ClaudeCodeAdapter {
         };
 
         let mut cmd = Command::new(crate::platform::executable("claude"));
+        // `-p` defaults to entrypoint `sdk-cli`, which the subscription's 5h
+        // window weights ~1.7–2.2× per token vs the TUI; a custom label is
+        // measured at the TUI rate (anthropics/claude-code#97074). Always
+        // overwrite: a daemon started from a CC session inherits `sdk-cli`.
+        // ponytail: unofficial workaround; if Anthropic re-weights custom
+        // labels, the fallback is a PTY TUI shim (see magpie claudetui).
+        cmd.env("CLAUDE_CODE_ENTRYPOINT", "agentdeck");
         cmd.arg("--print")
             .arg("--output-format")
             .arg("stream-json")
@@ -609,5 +616,32 @@ mod tests {
         for (m, expected) in modes {
             assert_eq!(permission_mode_to_cli(m), expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod entrypoint_tests {
+    use super::*;
+
+    #[test]
+    fn session_command_overrides_entrypoint_label() {
+        let opts: ClaudeCodeSessionOptions =
+            serde_json::from_str(r#"{"permissionMode":"default"}"#).unwrap();
+        let start = SessionStart {
+            session_id: SessionId("s".into()),
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: std::env::temp_dir(),
+            resume_thread_id: None,
+            initial_turn: None,
+            vendor_options: VendorSessionOptions::ClaudeCode(opts),
+            runtime_options: Default::default(),
+        };
+        let (cmd, _, _) = ClaudeCodeAdapter::build_command(&start).unwrap();
+        let env = cmd
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == "CLAUDE_CODE_ENTRYPOINT")
+            .and_then(|(_, v)| v);
+        assert_eq!(env, Some(std::ffi::OsStr::new("agentdeck")));
     }
 }
