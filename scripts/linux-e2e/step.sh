@@ -38,12 +38,19 @@ for step in "$@"; do
   fi
   sleep 1.5
 done
+# caster 每秒写一帧；只认步骤做完之后的新帧，防止采集中途停掉时拿旧帧当证据。
+marker=$OUT/.steps-done
+touch "$marker"
 sleep 3
 # 截图是验收证据：拿不到就以非零退出，不能只凭应用存活报成功。
 if [ "$MODE" = x11 ]; then
   import -window root "$OUT/$NAME.png" || { echo "截图失败"; exit 1; }
 else
-  frame=$(ls "$OUT"/shots/f*.png 2>/dev/null | tail -1)
-  [ -n "$frame" ] && cp "$frame" "$OUT/$NAME.png" || { echo "没有 ScreenCast 帧，见 $OUT/cast.log"; exit 1; }
+  for _ in $(seq 50); do
+    frame=$(find "$OUT/shots" -name 'f*.png' -newer "$marker" | sort | tail -1)
+    [ -n "$frame" ] && break
+    sleep 0.2
+  done
+  [ -n "$frame" ] && cp "$frame" "$OUT/$NAME.png" || { echo "步骤完成后 10 秒内没有新的 ScreenCast 帧，见 $OUT/cast.log"; exit 1; }
 fi
 kill -0 "$(cat "$OUT/app.pid")" 2>/dev/null && echo ALIVE || { echo "APP DIED"; exit 1; }
