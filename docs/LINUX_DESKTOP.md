@@ -2,7 +2,8 @@
 
 发布流水线为 GPUI 桌面端提供 Ubuntu 24.04 x86_64 / ARM64 的归档包和配套 GNU daemon；
 安装与验收边界见 [RELEASE.md](RELEASE.md)。两个架构均使用原生 runner 构建，
-其他发行版、GPU 和 Wayland 组合需要单独验收。平台适配缺口统一记录在 issue #52。
+其他发行版、GPU 和 Wayland 组合需要单独验收。平台适配缺口记录在 issue #63（由 #52 拆出），
+Ubuntu 发行包进度在 issue #53。
 
 ## 当前平台边界
 
@@ -30,6 +31,53 @@
 - **窗口装饰**：
   - X11 上 gpui 请求服务端装饰，标题栏和关闭按钮由窗口管理器绘制。
   - GNOME Wayland 不支持服务端装饰，gpui 会退回客户端装饰，而桌面端目前没有绘制，所以窗口没有标题栏和控制按钮。这种情况下只能用 Super+拖动移动窗口，用 Alt+F4 或 Ctrl+Q 关闭。待定。
+
+## 完整流程验收（dt）
+
+`scripts/linux-e2e/` 在 Linux 主机上起一个隔离、常驻的图形会话，再逐步点击、输入、截图。
+和输入法回归一样，私有 dbus、独立 HOME 与 XDG 目录、独立 display，不触碰真实桌面会话。
+
+- **X11**：Xvfb 加 `gnome-shell --x11`。这是真正的 GNOME 窗口管理器，带服务端装饰；设 `NO_WM=1` 时只起裸 Xvfb。
+- **Wayland**：无头 gnome-shell。截图走 ScreenCast；输入走 RemoteDesktop，由常驻的 `input.py` 从 FIFO 读命令。
+
+```bash
+# 在 dt 的仓库副本里；VENDOR_HOME 默认 $HOME，会把真实的 .claude / .claude.json / .codex 链接进隔离 HOME
+cargo build -p agentdeck-desktop -p agentdeckd
+scripts/linux-e2e/session.sh x11 start
+scripts/linux-e2e/step.sh x11 s1 click:1134,535 type:hello key:Return sleep:20   # 截图 /tmp/agentdeck-e2e-x11/s1.png
+scripts/linux-e2e/session.sh x11 stop
+```
+
+2026-10-30 在 dt（Ubuntu 24.04.4，debug 构建，lavapipe）上按以下流程跑了 X11（GNOME 窗口管理器）和 GNOME Wayland 各一遍：
+
+| 步骤 | X11 | Wayland |
+|---|---|---|
+| 启动，读出真实 Codex / Claude Code 历史 | ✅ | ✅ |
+| 打开历史会话，记录渲染 | ✅ | ✅ |
+| 新建 CC 会话：「输入」路径选 cwd、最近项目下拉 | ✅ | ✅ |
+| 发消息，侧栏「工作中」→「待确认」，权限卡点「允许」后文件真实写入 | ✅（Write） | ✅（Bash） |
+| AskUserQuestion 提问卡，数字键作答 | ✅ | 未测 |
+| 输入框 Ctrl+Enter 换行 | ✅ | — |
+| Codex 新建与续聊 | 见下方 | 见下方 |
+| Ctrl+Q 退出，desktop、daemon、claude、codex 子进程全部退出 | ✅ | ✅ |
+| 标题栏 × 关窗即退出 | ✅ | 无标题栏 |
+| `runs/`、`diagnostic.log` 写在 `~/.local/share/AgentDeck/`，不出现 `~/Library` | ✅ | ✅ |
+
+两轮的 `app.log` 都没有 panic。帧率只有个位数，这是 lavapipe 加 debug 构建的结果，不能当作性能结论。
+
+发现的问题：
+
+- **Codex 用户消息重复显示**：Codex app-server 会把本轮输入回显成 `userMessage` 条目，而 live 轮次本来就用本地 prompt 渲染首条用户消息，结果每轮显示两遍。这个问题和平台无关，现已在 `live.rs` 中丢弃回显，并在 Wayland 续聊中确认只显示一次。
+- **Codex 回合失败**：dt 的 Codex 走一个只放行官方客户端的中转，AgentDeck 以 `clientInfo.name = "agentdeck"` 初始化 app-server，被它以 403 `This account only allows Codex official clients` 拒绝。这属于账号或中转策略，和 Linux 无关；失败提示「Codex reported a failed turn」能正常显示。
+- **Wayland 无窗口装饰**：见上文「窗口装饰」。
+- **Dock 图标**：GNOME Dock 里显示的是通用齿轮图标，因为没有安装 `.desktop` 文件，属于 #53 的打包范围。
+
+坑点：
+
+- **CC 会清理旧会话记录**：链接真实 `~/.claude` 后，`claude` 启动时会按 `cleanupPeriodDays`（默认 30 天）删除过期的会话记录（`~/.claude/.last-cleanup` 记录时间）。2026-10-30 这一轮就删掉了 dt 上 30 天以前的 3 条 CC 记录（最早的是 6 月）。要保留旧记录，先在 `~/.claude/settings.json` 里调大 `cleanupPeriodDays`，或者不链接 vendor 状态（`VENDOR_HOME=`）。
+- **Wayland 指针**：RemoteDesktop 在没有关联 ScreenCast 流时只能发相对位移（`NotifyPointerMotionRelative`）。不能先把指针顶到左上角，那里是 GNOME 热角，会打开概览，所以 `input.py` 先顶到右下角再移回目标位置。
+- **gnome-shell 起来后停在概览**：`session.sh` 会先发一次 Escape。
+- **结束进程**：远程执行 `pkill -f <模式>` 时，模式会匹配到执行这条命令的 shell 自身，导致 ssh 连接被杀。`session.sh stop` 改为按进程组结束。
 
 ## 中文输入法崩溃（X11 + ibus / fcitx4，已修复）
 
