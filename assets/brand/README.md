@@ -2,7 +2,7 @@
 
 正式图形为 04C / Workspace：橙色底、深色双层卡片和米白双栏。
 
-- `agentdeck.png`：1024 × 1024 RGBA，圆角外透明；GPUI 侧栏编译期嵌入。
+- `agentdeck.png`：1024 × 1024 RGBA，圆角外透明；GPUI 侧栏编译期嵌入，README 与 Linux 发行包也使用。
 - `AgentDeck.icns`：macOS bundle 图标，包含 16、32、128、256、512 pt 的 1x / 2x 尺寸。
 - [iOS AppIcon](../../ios/AgentDeckMobile/Assets.xcassets/AppIcon.appiconset/AppIcon.png)：1024 × 1024 不透明满版资源；由系统裁切圆角，Xcode 生成设备尺寸。
 

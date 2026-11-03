@@ -1,4 +1,4 @@
-//! 全高左侧栏：品牌行、新建与搜索、按日期分组的会话列表、底部页面入口（机器管理）。
+//! 全高左侧栏（右缘可拖动调宽）：标题栏行（品牌、新建与刷新）、搜索、按日期分组的会话列表、底部页面入口（机器管理）。
 //!
 //! 会话条目来自各台机器 daemon 的跨 agent 历史列表，点击即读取该会话记录。
 
@@ -24,8 +24,26 @@ use crate::shell::{
     Session, SessionKey, Shell, SidebarRow, Stage, machine_label, project_name, session_title,
 };
 
-/// 侧栏宽度，与 Codex Desktop 的全高侧栏一致。
-const WIDTH: f32 = 248.;
+/// 侧栏默认宽度；右缘可拖动调整。
+pub const DEFAULT_WIDTH: Pixels = px(288.);
+/// 最小宽度：标题栏行要放下红绿灯让位、品牌图标、应用名和两个按钮。
+const MIN_WIDTH: Pixels = px(272.);
+/// 拖宽侧栏时给主区保留的最小宽度。
+const MAIN_MIN_WIDTH: Pixels = px(480.);
+
+/// 拖动侧栏右缘时的拖拽载荷；Shell 根节点按它的 drag move 更新宽度。
+pub struct SidebarResize;
+
+impl Render for SidebarResize {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+/// 把期望宽度限制在 [MIN_WIDTH, 窗口宽 - MAIN_MIN_WIDTH]；窗口太窄时最小宽度优先。
+pub fn clamp_width(width: Pixels, window_width: Pixels) -> Pixels {
+    width.min(window_width - MAIN_MIN_WIDTH).max(MIN_WIDTH)
+}
 const AGENT_ICON_SIZE: f32 = 16.;
 /// 会话行与分组标题共用的行高：uniform_list 按首行测量，两者必须一致。
 const ROW_HEIGHT: f32 = 36.;
@@ -70,6 +88,8 @@ static BRAND_ICON: LazyLock<Arc<Image>> = LazyLock::new(|| {
 
 /// 透明标题栏下给红绿灯留出的顶部空间。
 pub const TRAFFIC_LIGHT_INSET: f32 = 44.;
+/// 标题栏行内容的左缩进：红绿灯从 x=16 起，三个按钮约占 60pt，再留 12pt。
+const TRAFFIC_LIGHT_CLEARANCE: f32 = 88.;
 
 pub fn render(
     shell: &Shell,
@@ -77,7 +97,6 @@ pub fn render(
     cx: &mut Context<Shell>,
 ) -> impl IntoElement + use<> {
     // 行高一致，用 uniform_list 只渲染可见行；行内容在布局阶段回到 Shell 取。
-    let is_new_session = matches!(shell.stage, Stage::Empty);
     let sessions = uniform_list(
         "session-list",
         shell.rows.len(),
@@ -109,6 +128,7 @@ pub fn render(
                                 shell.session_activity(session),
                                 is_selected,
                                 cursor == Some(start + offset),
+                                shell.sidebar_width,
                                 window,
                                 cx,
                             ))
@@ -164,7 +184,8 @@ pub fn render(
     let connecting = shell.machines.iter().any(|machine| machine.connecting);
 
     v_flex()
-        .w(px(WIDTH))
+        .relative()
+        .w(shell.sidebar_width)
         .h_full()
         .flex_shrink_0()
         .pb_3()
@@ -172,56 +193,73 @@ pub fn render(
         .text_color(cx.theme().sidebar_foreground)
         .border_r_1()
         .border_color(cx.theme().sidebar_border)
-        .child(titlebar_area("sidebar-titlebar"))
         .child(
-            v_flex()
-                .px_3()
-                .gap_4()
-                .flex_1()
-                .overflow_hidden()
+            // 标题栏行：红绿灯右侧放品牌，最右是新建与刷新。
+            titlebar_area("sidebar-titlebar")
+                .flex()
+                .items_center()
+                .gap_2()
+                .pl(px(if cfg!(target_os = "macos") {
+                    TRAFFIC_LIGHT_CLEARANCE
+                } else {
+                    16.
+                }))
+                .pr_3()
                 .child(
-                    // 品牌行：对应 Codex Desktop 侧栏顶部的 workspace 切换位，当前不可切换。
-                    h_flex().px_2().pb_1().items_center().child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(img(BRAND_ICON.clone()).size(px(24.)).flex_shrink_0())
-                            .child(div().text_sm().font_semibold().child("AgentDeck")),
-                    ),
+                    img(BRAND_ICON.clone())
+                        .size(px(AGENT_ICON_SIZE))
+                        .flex_shrink_0(),
                 )
+                .child(div().flex_1().text_sm().font_semibold().child("AgentDeck"))
                 .child(
-                    v_flex()
+                    h_flex()
                         .gap_1()
                         .child(
                             Button::new("new-session")
                                 .ghost()
-                                .selected(is_new_session)
-                                .w_full()
-                                .justify_start()
-                                .icon(Icon::empty().path(crate::PLUS_ICON))
-                                .label("新建会话")
+                                .small()
+                                .icon(Icon::empty().path(crate::NEW_SESSION_ICON))
+                                .tooltip_with_action("新建会话", &crate::shell::NewSession, None)
                                 .on_click(cx.listener(|shell, _, _, cx| shell.show_empty(cx))),
                         )
                         .child(
-                            h_flex()
-                                .gap_1()
-                                .child(Input::new(&shell.search).small().cleanable(true).flex_1())
-                                .child(
-                                    Button::new("refresh-sessions")
-                                        .ghost()
-                                        .small()
-                                        .icon(Icon::empty().path(crate::REFRESH_ICON))
-                                        .disabled(!shell.can_refresh_sessions())
-                                        .tooltip(if shell.can_refresh_sessions() {
-                                            "重新读取最新会话列表"
-                                        } else {
-                                            "正在刷新会话列表…"
-                                        })
-                                        .on_click(cx.listener(|shell, _, _, cx| {
-                                            shell.refresh_sessions(cx)
-                                        })),
+                            Button::new("refresh-sessions")
+                                .ghost()
+                                .small()
+                                .icon(Icon::empty().path(crate::REFRESH_ICON))
+                                .disabled(!shell.can_refresh_sessions())
+                                .tooltip(if shell.can_refresh_sessions() {
+                                    "重新读取最新会话列表"
+                                } else {
+                                    "正在刷新会话列表…"
+                                })
+                                .on_click(
+                                    cx.listener(|shell, _, _, cx| shell.refresh_sessions(cx)),
                                 ),
                         ),
+                ),
+        )
+        .child(
+            v_flex()
+                .px_3()
+                .pt_2()
+                .gap_4()
+                .flex_1()
+                .overflow_hidden()
+                .child(
+                    // 透明条目：内边距、图标与文字间距照搬 medium Button（px_4、gap_2），
+                    // 图标列、文字列与会话行对齐。
+                    Input::new(&shell.search)
+                        .appearance(false)
+                        .cleanable(true)
+                        .prefix(
+                            Icon::empty()
+                                .path(crate::SEARCH_ICON)
+                                .text_color(cx.theme().muted_foreground),
+                        )
+                        .px_4()
+                        .gap_2()
+                        .text_base(),
                 )
                 .child(
                     v_flex()
@@ -230,7 +268,7 @@ pub fn render(
                         .overflow_hidden()
                         .children(status.map(|text| {
                             div()
-                                .px_2()
+                                .px_4()
                                 .text_sm()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(text)
@@ -304,6 +342,18 @@ pub fn render(
                         ),
                 ),
         )
+        .child(
+            // 右缘拖动条：贴在边框内侧，避免被后绘制的主区挡住命中。
+            div()
+                .id("sidebar-resize")
+                .absolute()
+                .top_0()
+                .right_0()
+                .h_full()
+                .w(px(5.))
+                .cursor_col_resize()
+                .on_drag(SidebarResize, |_, _, _, cx| cx.new(|_| SidebarResize)),
+        )
 }
 
 /// 有新版本时机器入口上方多一行；本地构建和已是最新时不占位。
@@ -356,7 +406,7 @@ fn update_button(shell: &Shell, cx: &mut Context<Shell>) -> Option<impl IntoElem
 /// `on_hit_test_window_control` 是空实现，`start_window_move` 也只有 trait 默认空实现，
 /// 两者都只对 Windows/Linux 生效。macOS 的窗口拖动仍由系统标题栏区域处理，
 /// 这里只做布局留白，不假装提供 drag hitbox。
-pub fn titlebar_area(id: &'static str) -> impl IntoElement {
+pub fn titlebar_area(id: &'static str) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .h(px(TRAFFIC_LIGHT_INSET))
@@ -366,20 +416,23 @@ pub fn titlebar_area(id: &'static str) -> impl IntoElement {
 }
 
 fn section_label(text: &str, cx: &Context<Shell>) -> impl IntoElement {
+    // px_4 与会话行按钮的内边距一致，标题对齐图标列。
     div()
-        .px_2()
+        .px_4()
         .text_xs()
         .font_semibold()
         .text_color(cx.theme().muted_foreground)
         .child(text.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn session_row(
     session: &Session,
     time: SharedString,
     activity: Option<Activity>,
     selected: bool,
     keyboard_cursor: bool,
+    width: Pixels,
     window: &Window,
     cx: &mut Context<Shell>,
 ) -> impl IntoElement + use<> {
@@ -400,7 +453,7 @@ fn session_row(
     let time_width = if time.len() > 5 { 72. } else { TIME_WIDTH };
     // Button 的内部 label 容器不会收缩，扣除 padding、边框、图标、时间列与两个 gap_2；
     // 远端行再扣主机标签和它的 gap_2。
-    let mut title_width = px(WIDTH - 3. - AGENT_ICON_SIZE - time_width) - window.rem_size() * 4.5;
+    let mut title_width = width - px(3. + AGENT_ICON_SIZE + time_width) - window.rem_size() * 4.5;
     if host_badge.is_some() {
         title_width -= px(HOST_WIDTH) + window.rem_size() * 0.5;
     }
@@ -538,4 +591,20 @@ fn tooltip_title(title: SharedString, width: Pixels, window: &Window, cx: &App) 
             this.child(title)
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MIN_WIDTH, clamp_width};
+    use gpui::px;
+
+    #[test]
+    fn clamp_width_keeps_min_and_main_area() {
+        assert_eq!(clamp_width(px(200.), px(1200.)), MIN_WIDTH);
+        assert_eq!(clamp_width(px(400.), px(1200.)), px(400.));
+        // 主区至少留 480。
+        assert_eq!(clamp_width(px(900.), px(1200.)), px(720.));
+        // 窗口太窄时最小宽度优先。
+        assert_eq!(clamp_width(px(400.), px(600.)), MIN_WIDTH);
+    }
 }
