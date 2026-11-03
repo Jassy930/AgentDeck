@@ -23,10 +23,30 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 OUT=${OUT_DIR:-/tmp/agentdeck-e2e-$MODE}
 
+descendants() {
+  local child
+  for child in $(pgrep -P "$1"); do
+    echo "$child"
+    descendants "$child"
+  done
+}
+
 if [ "$ACTION" = stop ]; then
-  # 每个会话都用 setsid 起在自己的进程组里，按组整体结束。
-  for f in "$OUT"/*.pgid; do [ -f "$f" ] && kill -- -"$(cat "$f")" 2>/dev/null; done
+  # 每个会话都用 setsid 起在自己的进程组里；daemon 又给 vendor 单独开进程组
+  # （process_group(0)），所以先收集全部子孙所在的进程组，再整体结束。
+  groups=$(
+    for f in "$OUT"/*.pgid; do
+      [ -f "$f" ] || continue
+      group=$(tr -d ' \n' <"$f")
+      echo "$group"
+      for pid in $(pgrep -g "$group"); do
+        for p in "$pid" $(descendants "$pid"); do ps -o pgid= -p "$p"; done
+      done
+    done | tr -d ' ' | sort -u
+  )
+  for g in $groups; do kill -- -"$g" 2>/dev/null; done
   sleep 1
+  for g in $groups; do kill -9 -- -"$g" 2>/dev/null; done
   exit 0
 fi
 

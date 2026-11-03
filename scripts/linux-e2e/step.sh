@@ -23,7 +23,7 @@ for step in "$@"; do
       move) xdotool mousemove "${arg%,*}" "${arg#*,}" ;;
       type) xdotool type --delay 80 "$arg" ;;
       key) xdotool key --delay 80 "$arg" ;;
-    esac
+    esac || { echo "步骤失败：$step"; exit 1; }
   else
     # input.py 每读完一次 FIFO 就重新打开；它若已退出，这里的写会一直阻塞。
     case $kind in click | move) arg=${arg/,/ } ;; esac
