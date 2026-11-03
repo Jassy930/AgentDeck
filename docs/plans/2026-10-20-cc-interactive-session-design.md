@@ -48,6 +48,7 @@ claude --print --input-format stream-json --output-format stream-json \
 子进程环境固定覆盖 `CLAUDE_CODE_ENTRYPOINT=agentdeck`（2026-11-03）：`-p` 默认记为 `sdk-cli`，
 订阅 5 小时窗口按每 token 约 1.7–2.2 倍计入；自定义标签实测与交互 TUI（`cli`）同费率
 （anthropics/claude-code#97074 评论）。必须覆盖而不是只在缺省时设置，因为从 CC 会话里启动的 daemon 会继承 `sdk-cli`。
+Claude Desktop 2.2553.1 同样走 Agent SDK 的 stream-json，并把该变量设为 `claude-desktop` / `claude-desktop-3p`（cowork 为 `local-agent`），不驱动 TUI；AgentDeck 用自己的标签，不冒用 `cli` 或 `claude-desktop`。
 这是非官方 workaround；若日后自定义标签也被加权，替代方案是 PTY 驱动 TUI 的 shim（参考 yetone/magpie `internal/claudetui`），
 但它要重做审批、提问卡、中断、切模式和流式输出，需另立设计文档。
 
