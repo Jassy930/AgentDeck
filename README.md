@@ -16,7 +16,7 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
 - 创建 GPUI 桌面窗口，macOS 使用透明标题栏；Linux/Windows 的构建与验收范围见[发布说明](docs/RELEASE.md)。
 - 初始化 `gpui-component` 并挂载 `Root`。
 - 界面固定使用深色，配色来自设计系统 SSOT 生成的 codex 颜色；警告使用与品牌橙区分的琥珀色。
-- 渲染外壳布局：全高左侧栏（品牌行 / 新建会话与搜索框 / 按日期分组的会话列表 /
+- 渲染外壳布局：全高左侧栏（红绿灯右侧的应用名、新建会话（⌘N）与刷新 / 搜索框 / 按日期分组的会话列表 /
   底部页面入口图标）、空态（统计胶囊与居中标题、按已注册 agent 生成的固定列栅格卡片，卡片主体筛选会话、右上角“＋”新建会话，卡片随窗口收窄，内容过高时可纵向滚动），
   会话态（thread header 与 agent / 项目 / 机器标签、用户消息右对齐气泡且每轮首条助手消息标注 agent 身份的会话记录、底部消息输入框与审批条），以及机器管理页。
 - **接入本机及 SSH 远端 `agentdeckd` 的只读历史**：启动时先问各机器的 daemon 注册了哪些 agent，再按
@@ -256,7 +256,7 @@ Unix release 构建使用 `scripts/release/package.sh`，Windows 使用 `package
 只构建和打包，不停止或打开现有应用；
 验证使用解包后的独立 selfcheck，具体命令见[发布与安装说明](docs/RELEASE.md)。
 
-macOS 应用图标和侧栏品牌行使用统一的 04C 图标；iOS companion 使用同款满版
+macOS 应用图标使用统一的 04C 图标；iOS companion 使用同款满版
 AppIcon。正式资源和重新生成 `.icns` 的方式见 [图标资源](assets/brand/README.md)。
 
 Codex 桌面应用里的 Run action 已指向该脚本：

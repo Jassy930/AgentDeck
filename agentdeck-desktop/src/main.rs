@@ -40,6 +40,8 @@ pub const CHEVRON_DOWN_ICON: &str = "icons/chevron-down.svg";
 pub const ALERT_ICON: &str = "icons/triangle-alert.svg";
 pub const REFRESH_ICON: &str = "icons/refresh.svg";
 pub const FOLDER_ICON: &str = "icons/folder.svg";
+pub const SEARCH_ICON: &str = "icons/search.svg";
+pub const NEW_SESSION_ICON: &str = "icons/square-pen.svg";
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
@@ -51,6 +53,8 @@ impl AssetSource for Assets {
             ALERT_ICON => include_bytes!("../../assets/icons/triangle-alert.svg"),
             REFRESH_ICON => include_bytes!("../../assets/icons/refresh.svg"),
             FOLDER_ICON => include_bytes!("../../assets/icons/folder.svg"),
+            SEARCH_ICON => include_bytes!("../../assets/icons/search.svg"),
+            NEW_SESSION_ICON => include_bytes!("../../assets/icons/square-pen.svg"),
             _ => return Ok(None),
         };
         Ok(Some(Cow::Borrowed(bytes)))
@@ -115,12 +119,16 @@ fn main() {
         cx.bind_keys([
             // secondary 在 macOS 是 ⌘，其他平台是 Ctrl；Linux 上 set_menus 不生效，退出只靠快捷键或关窗。
             KeyBinding::new("secondary-q", Quit, None),
+            KeyBinding::new("secondary-n", shell::NewSession, None),
             KeyBinding::new("tab", shell::NextQuestion, Some("QuestionCard")),
             KeyBinding::new("shift-tab", shell::PreviousQuestion, Some("QuestionCard")),
         ]);
         cx.set_menus(vec![Menu {
             name: "AgentDeck".into(),
-            items: vec![MenuItem::action("退出 AgentDeck", Quit)],
+            items: vec![
+                MenuItem::action("新建会话", shell::NewSession),
+                MenuItem::action("退出 AgentDeck", Quit),
+            ],
         }]);
 
         if selfcheck {

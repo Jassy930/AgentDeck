@@ -1,4 +1,4 @@
-//! 全高左侧栏：品牌行、新建与搜索、按日期分组的会话列表、底部页面入口（机器管理）。
+//! 全高左侧栏：标题栏行（应用名、新建与刷新）、搜索、按日期分组的会话列表、底部页面入口（机器管理）。
 //!
 //! 会话条目来自各台机器 daemon 的跨 agent 历史列表，点击即读取该会话记录。
 
@@ -61,15 +61,10 @@ pub fn agent_icon(kind: AgentKind, grayscale: bool) -> impl IntoElement + use<> 
         .flex_shrink_0()
 }
 
-static BRAND_ICON: LazyLock<Arc<Image>> = LazyLock::new(|| {
-    Arc::new(Image::from_bytes(
-        ImageFormat::Png,
-        include_bytes!("../../assets/brand/agentdeck.png").to_vec(),
-    ))
-});
-
 /// 透明标题栏下给红绿灯留出的顶部空间。
 pub const TRAFFIC_LIGHT_INSET: f32 = 44.;
+/// 标题栏行内容的左缩进：红绿灯从 x=16 起，三个按钮约占 60pt，再留 12pt。
+const TRAFFIC_LIGHT_CLEARANCE: f32 = 88.;
 
 pub fn render(
     shell: &Shell,
@@ -77,7 +72,6 @@ pub fn render(
     cx: &mut Context<Shell>,
 ) -> impl IntoElement + use<> {
     // 行高一致，用 uniform_list 只渲染可见行；行内容在布局阶段回到 Shell 取。
-    let is_new_session = matches!(shell.stage, Stage::Empty);
     let sessions = uniform_list(
         "session-list",
         shell.rows.len(),
@@ -172,56 +166,69 @@ pub fn render(
         .text_color(cx.theme().sidebar_foreground)
         .border_r_1()
         .border_color(cx.theme().sidebar_border)
-        .child(titlebar_area("sidebar-titlebar"))
         .child(
-            v_flex()
-                .px_3()
-                .gap_4()
-                .flex_1()
-                .overflow_hidden()
+            // 标题栏行：红绿灯右侧放应用名，最右是新建与刷新。
+            // 侧栏放不下品牌图标：88 + 图标 + 应用名 + 两个按钮会超出 248pt。
+            titlebar_area("sidebar-titlebar")
+                .flex()
+                .items_center()
+                .gap_2()
+                .pl(px(if cfg!(target_os = "macos") {
+                    TRAFFIC_LIGHT_CLEARANCE
+                } else {
+                    16.
+                }))
+                .pr_3()
+                .child(div().flex_1().text_sm().font_semibold().child("AgentDeck"))
                 .child(
-                    // 品牌行：对应 Codex Desktop 侧栏顶部的 workspace 切换位，当前不可切换。
-                    h_flex().px_2().pb_1().items_center().child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(img(BRAND_ICON.clone()).size(px(24.)).flex_shrink_0())
-                            .child(div().text_sm().font_semibold().child("AgentDeck")),
-                    ),
-                )
-                .child(
-                    v_flex()
+                    h_flex()
                         .gap_1()
                         .child(
                             Button::new("new-session")
                                 .ghost()
-                                .selected(is_new_session)
-                                .w_full()
-                                .justify_start()
-                                .icon(Icon::empty().path(crate::PLUS_ICON))
-                                .label("新建会话")
+                                .small()
+                                .icon(Icon::empty().path(crate::NEW_SESSION_ICON))
+                                .tooltip_with_action("新建会话", &crate::shell::NewSession, None)
                                 .on_click(cx.listener(|shell, _, _, cx| shell.show_empty(cx))),
                         )
                         .child(
-                            h_flex()
-                                .gap_1()
-                                .child(Input::new(&shell.search).small().cleanable(true).flex_1())
-                                .child(
-                                    Button::new("refresh-sessions")
-                                        .ghost()
-                                        .small()
-                                        .icon(Icon::empty().path(crate::REFRESH_ICON))
-                                        .disabled(!shell.can_refresh_sessions())
-                                        .tooltip(if shell.can_refresh_sessions() {
-                                            "重新读取最新会话列表"
-                                        } else {
-                                            "正在刷新会话列表…"
-                                        })
-                                        .on_click(cx.listener(|shell, _, _, cx| {
-                                            shell.refresh_sessions(cx)
-                                        })),
+                            Button::new("refresh-sessions")
+                                .ghost()
+                                .small()
+                                .icon(Icon::empty().path(crate::REFRESH_ICON))
+                                .disabled(!shell.can_refresh_sessions())
+                                .tooltip(if shell.can_refresh_sessions() {
+                                    "重新读取最新会话列表"
+                                } else {
+                                    "正在刷新会话列表…"
+                                })
+                                .on_click(
+                                    cx.listener(|shell, _, _, cx| shell.refresh_sessions(cx)),
                                 ),
                         ),
+                ),
+        )
+        .child(
+            v_flex()
+                .px_3()
+                .pt_2()
+                .gap_4()
+                .flex_1()
+                .overflow_hidden()
+                .child(
+                    // 透明条目：内边距、图标与文字间距照搬 medium Button（px_4、gap_2），
+                    // 图标列、文字列与会话行对齐。
+                    Input::new(&shell.search)
+                        .appearance(false)
+                        .cleanable(true)
+                        .prefix(
+                            Icon::empty()
+                                .path(crate::SEARCH_ICON)
+                                .text_color(cx.theme().muted_foreground),
+                        )
+                        .px_4()
+                        .gap_2()
+                        .text_base(),
                 )
                 .child(
                     v_flex()
@@ -230,7 +237,7 @@ pub fn render(
                         .overflow_hidden()
                         .children(status.map(|text| {
                             div()
-                                .px_2()
+                                .px_4()
                                 .text_sm()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(text)
@@ -356,7 +363,7 @@ fn update_button(shell: &Shell, cx: &mut Context<Shell>) -> Option<impl IntoElem
 /// `on_hit_test_window_control` 是空实现，`start_window_move` 也只有 trait 默认空实现，
 /// 两者都只对 Windows/Linux 生效。macOS 的窗口拖动仍由系统标题栏区域处理，
 /// 这里只做布局留白，不假装提供 drag hitbox。
-pub fn titlebar_area(id: &'static str) -> impl IntoElement {
+pub fn titlebar_area(id: &'static str) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .h(px(TRAFFIC_LIGHT_INSET))
@@ -366,8 +373,9 @@ pub fn titlebar_area(id: &'static str) -> impl IntoElement {
 }
 
 fn section_label(text: &str, cx: &Context<Shell>) -> impl IntoElement {
+    // px_4 与会话行按钮的内边距一致，标题对齐图标列。
     div()
-        .px_2()
+        .px_4()
         .text_xs()
         .font_semibold()
         .text_color(cx.theme().muted_foreground)
