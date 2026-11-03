@@ -26,7 +26,14 @@ for step in "$@"; do
   else
     # input.py 每读完一次 FIFO 就重新打开；它若已退出，这里的写会一直阻塞。
     case $kind in click | move) arg=${arg/,/ } ;; esac
+    before=$(grep -c '^done ' "$OUT/input.log")
     timeout 10 bash -c 'echo "$1 $2" >"$3"' _ "$kind" "$arg" "$OUT/cmd" || { echo "input.py 无响应，见 $OUT/input.log"; exit 1; }
+    # 写进 FIFO 只代表 input.py 收到；逐字输入每字符约 0.14 秒，等它打印 done 再计时和截图。
+    for _ in $(seq 600); do
+      [ "$(grep -c '^done ' "$OUT/input.log")" -gt "$before" ] && break
+      sleep 0.2
+    done
+    [ "$(grep -c '^done ' "$OUT/input.log")" -gt "$before" ] || { echo "input.py 120 秒内未完成 $kind，见 $OUT/input.log"; exit 1; }
   fi
   sleep 1.5
 done
