@@ -1,5 +1,6 @@
 #!/bin/bash
-# 在 session.sh 起好的会话里依次执行步骤，最后截图到 $OUT_DIR/<截图名>.png，并报告应用是否存活。
+# 在 session.sh 起好的会话里依次执行步骤，最后截图到 $OUT_DIR/<截图名>.png，并报告应用是否存活；
+# 截图失败或应用已退出时以非零状态退出。
 #
 # 用法：scripts/linux-e2e/step.sh <x11|wayland> <截图名> [步骤...]
 #   步骤：click:X,Y  move:X,Y  type:<文本>  key:<键名，可带 ctrl+ 前缀>  sleep:<秒>
@@ -38,9 +39,11 @@ for step in "$@"; do
   sleep 1.5
 done
 sleep 3
+# 截图是验收证据：拿不到就以非零退出，不能只凭应用存活报成功。
 if [ "$MODE" = x11 ]; then
-  import -window root "$OUT/$NAME.png"
+  import -window root "$OUT/$NAME.png" || { echo "截图失败"; exit 1; }
 else
-  cp "$(ls "$OUT"/shots/f*.png | tail -1)" "$OUT/$NAME.png"
+  frame=$(ls "$OUT"/shots/f*.png 2>/dev/null | tail -1)
+  [ -n "$frame" ] && cp "$frame" "$OUT/$NAME.png" || { echo "没有 ScreenCast 帧，见 $OUT/cast.log"; exit 1; }
 fi
-kill -0 "$(cat "$OUT/app.pid")" 2>/dev/null && echo ALIVE || echo "APP DIED"
+kill -0 "$(cat "$OUT/app.pid")" 2>/dev/null && echo ALIVE || { echo "APP DIED"; exit 1; }
