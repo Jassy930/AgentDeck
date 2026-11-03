@@ -16,9 +16,9 @@ use agentdeck_protocol::{
     ServerEvent, SessionCapabilities, ThreadId,
 };
 use gpui::{
-    App, ClipboardEntry, Context, Entity, FocusHandle, Image, IntoElement, ListAlignment,
-    ListState, ObjectFit, ParentElement, ScrollHandle, ScrollStrategy, SharedString,
-    UniformListScrollHandle, Window, div, img, prelude::*, px,
+    App, ClipboardEntry, Context, DragMoveEvent, Entity, FocusHandle, Image, IntoElement,
+    ListAlignment, ListState, ObjectFit, ParentElement, Pixels, ScrollHandle, ScrollStrategy,
+    SharedString, UniformListScrollHandle, Window, div, img, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme, Colorize, Disableable, Icon, InteractiveElementExt, Selectable, Sizable,
@@ -724,6 +724,8 @@ pub struct Shell {
     /// 过滤并分组后的侧栏行；只在会话、搜索词或过滤变化时重建。
     pub(crate) rows: Vec<SidebarRow>,
     pub(crate) sidebar_focus: FocusHandle,
+    /// 侧栏宽度，拖动右缘调整；渲染时按窗口宽度再夹一次。
+    pub(crate) sidebar_width: Pixels,
     /// 根节点焦点：没有输入框聚焦时 action 只派发到窗口根，⌘N 需要它落在 Shell 上。
     root_focus: FocusHandle,
     pub(crate) sidebar_scroll: UniformListScrollHandle,
@@ -837,6 +839,7 @@ impl Shell {
             sessions: Vec::new(),
             rows: Vec::new(),
             sidebar_focus: cx.focus_handle(),
+            sidebar_width: sidebar::DEFAULT_WIDTH,
             root_focus: cx.focus_handle(),
             sidebar_scroll: UniformListScrollHandle::new(),
             sidebar_cursor: None,
@@ -3687,6 +3690,8 @@ impl Render for Shell {
                 .into_any_element(),
         };
         let selected = self.stage.key();
+        // 窗口缩窄后侧栏跟着让出主区的最小宽度。
+        self.sidebar_width = sidebar::clamp_width(self.sidebar_width, window.viewport_size().width);
 
         let fps = self.frame_stats.as_mut().map(|stats| {
             let (fps, interval) = stats.record(Instant::now());
@@ -3707,6 +3712,13 @@ impl Render for Shell {
         h_flex()
             .track_focus(&self.root_focus)
             .on_action(cx.listener(|shell, _: &NewSession, _, cx| shell.show_empty(cx)))
+            .on_drag_move(cx.listener(
+                |shell, event: &DragMoveEvent<sidebar::SidebarResize>, window, cx| {
+                    shell.sidebar_width =
+                        sidebar::clamp_width(event.event.position.x, window.viewport_size().width);
+                    cx.notify();
+                },
+            ))
             .relative()
             .size_full()
             .bg(cx.theme().background)
